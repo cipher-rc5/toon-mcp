@@ -5,9 +5,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Schema helper: emit `{ "type": "integer" }` without a Go-style `"format"`
+/// annotation (`"uint"`, `"uint64"`, etc.) that AJV does not recognise.
+fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
+    schemars::json_schema!({ "type": "integer" })
+}
 
 use toon_mcp_core::{
     Classifier, CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat,
@@ -34,10 +40,13 @@ pub struct DetectResult {
     /// Detected format: `"json"`, `"jsonl"`, `"csv"`, `"tsv"`, or `"unknown"`.
     pub format: String,
     /// Byte length of the input string.
+    #[schemars(schema_with = "schema_as_integer")]
     pub input_bytes: usize,
     /// Number of non-empty lines (populated for JSONL inputs).
+    #[schemars(schema_with = "schema_as_integer")]
     pub line_count: Option<usize>,
     /// Number of columns in the first header row (populated for CSV/TSV inputs).
+    #[schemars(schema_with = "schema_as_integer")]
     pub column_count: Option<usize>,
 }
 
@@ -123,12 +132,15 @@ pub struct CompressResult {
     /// Classifier shape class.
     pub shape_class: String,
     /// Byte length of the input string.
+    #[schemars(schema_with = "schema_as_integer")]
     pub input_bytes: usize,
     /// Byte length of the output string.
+    #[schemars(schema_with = "schema_as_integer")]
     pub output_bytes: usize,
     /// Fraction of bytes saved (0.0 when not compressed).
     pub savings_pct: f64,
     /// Wall-clock duration in microseconds.
+    #[schemars(schema_with = "schema_as_integer")]
     pub duration_us: u64,
     /// Reason compression was skipped (when `compressed` is false).
     pub pass_reason: Option<String>,
@@ -258,8 +270,10 @@ pub struct StatsResult {
     /// Classifier shape class.
     pub shape_class: String,
     /// Byte length of the input string.
+    #[schemars(schema_with = "schema_as_integer")]
     pub input_bytes: usize,
     /// Estimated output byte length after compression.
+    #[schemars(schema_with = "schema_as_integer")]
     pub estimated_output_bytes: usize,
     /// Estimated fraction of bytes saved.
     pub estimated_savings_pct: f64,
