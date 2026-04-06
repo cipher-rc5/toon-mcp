@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "mcp": {
+    "toon": {
+      "type": "local",
+      "command": [
+        "./target/release/toon-mcp-server"
+      ],
+      "enabled": true,
+      "environment": {
+        "TOON_COMPRESSION_THRESHOLD": "0.85",
+        "TOON_MIN_BYTES": "256",
+        "TOON_KEY_FOLDING": "true",
+        "TOON_DELIMITER": "comma",
+        "TOON_LOG_ENABLED": "true",
+        "TOON_LOG_DIR": "data/logs",
+        "TOON_LOG_FLUSH_INTERVAL_SECS": "300",
+        "TOON_LOG_BUFFER_SIZE": "1000",
+        "TOON_LOG_LEVEL": "info",
+        "TOON_CLIENT_HINT": "opencode"
+      }
+    }
+  }
+}

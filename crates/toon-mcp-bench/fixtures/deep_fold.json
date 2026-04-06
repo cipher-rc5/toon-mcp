@@ -1,0 +1,13 @@
+{
+  "level_a": {
+    "level_b": {
+      "level_c": {
+        "level_d": {
+          "level_e": {
+            "level_f": "leaf_value"
+          }
+        }
+      }
+    }
+  }
+}

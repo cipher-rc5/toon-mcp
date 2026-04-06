@@ -1,0 +1,10 @@
+{
+  "id": 1,
+  "name": "Alice",
+  "email": "alice@example.com",
+  "age": 30,
+  "city": "New York",
+  "country": "USA",
+  "score": 9.5,
+  "active": true
+}
