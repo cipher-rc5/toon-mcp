@@ -14,11 +14,11 @@ fn load_fixture(name: &str) -> String {
         .unwrap_or_else(|_| panic!("fixture {name} must exist in fixtures/"))
 }
 
-/// Default benchmark config with a permissive threshold so all compressible
-/// inputs go through the full encode path.
+/// Default benchmark config with a permissive max_output_ratio so all
+/// compressible inputs go through the full encode path.
 fn bench_config() -> CompressConfig {
     CompressConfig {
-        threshold: 0.99,
+        max_output_ratio: 0.99,
         ..CompressConfig::default()
     }
 }
