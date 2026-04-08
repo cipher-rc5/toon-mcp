@@ -1,7 +1,13 @@
 [package]
-name    = "toon-mcp-logging"
-version = "0.1.0"
-edition.workspace = true
+name        = "toon-mcp-logging"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+authors.workspace     = true
+description = "Async LogSink trait and implementations for toon-mcp"
+keywords    = ["toon", "mcp", "logging", "jsonl"]
+categories  = ["asynchronous"]
 
 [dependencies]
 tokio.workspace        = true
@@ -14,4 +20,4 @@ chrono.workspace       = true
 tracing.workspace      = true
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile.workspace = true

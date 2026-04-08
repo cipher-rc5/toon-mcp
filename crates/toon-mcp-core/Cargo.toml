@@ -1,7 +1,13 @@
 [package]
-name    = "toon-mcp-core"
-version = "0.1.0"
-edition.workspace = true
+name        = "toon-mcp-core"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+authors.workspace     = true
+description = "Pure detection, parsing, classification, and compression pipeline for toon-mcp"
+keywords    = ["toon", "mcp", "compression", "json", "llm"]
+categories  = ["encoding", "parsing"]
 
 [dependencies]
 toon-format.workspace = true
