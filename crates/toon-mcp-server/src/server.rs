@@ -51,10 +51,9 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<DetectParams>,
     ) -> Result<Json<DetectResult>, McpError> {
-        let result =
-            handle_detect_format(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-                .await;
-        Ok(Json(result))
+        handle_detect_format(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
+            .await
+            .map(Json)
     }
 
     /// Compress structured content to TOON format for token efficiency.
@@ -67,10 +66,9 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<CompressParams>,
     ) -> Result<Json<CompressResult>, McpError> {
-        let result =
-            handle_compress_content(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-                .await;
-        Ok(Json(result))
+        handle_compress_content(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
+            .await
+            .map(Json)
     }
 
     /// Preview compression statistics without encoding.
@@ -82,10 +80,9 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<StatsParams>,
     ) -> Result<Json<StatsResult>, McpError> {
-        let result =
-            handle_compression_stats(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-                .await;
-        Ok(Json(result))
+        handle_compression_stats(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
+            .await
+            .map(Json)
     }
 }
 
