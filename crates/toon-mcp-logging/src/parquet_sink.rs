@@ -228,12 +228,15 @@ async fn flush_pending(pending: &mut Vec<LogEvent>, log_dir: &Path) -> Result<()
 
 /// Returns a `YYYY-MM-DD` string from a microsecond Unix timestamp.
 fn day_partition_key(ts_us: i64) -> String {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
     let secs = ts_us / 1_000_000;
-    let nanos = ((ts_us % 1_000_000) * 1_000) as u32;
-    let dt = DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(|| {
-        DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is a valid timestamp")
-    });
+    let nanos = ((ts_us % 1_000_000).unsigned_abs() * 1_000) as u32;
+    // Use timestamp_opt which returns LocalResult; fall back to Unix epoch on
+    // out-of-range values (not expected in practice).
+    let dt: DateTime<Utc> = Utc
+        .timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("epoch is valid"));
     dt.format("%Y-%m-%d").to_string()
 }
 
