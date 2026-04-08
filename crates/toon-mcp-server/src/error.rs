@@ -4,9 +4,6 @@
 use thiserror::Error;
 
 /// Errors that can occur at the server binary level.
-///
-/// Currently used as the primary error type surface for future extension.
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum ServerError {
     /// The logging sink failed to initialise.
