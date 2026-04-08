@@ -195,10 +195,15 @@ impl Classifier {
     fn is_fold_chain(value: &Value, depth: usize, min_depth: usize) -> bool {
         match value {
             Value::Object(map) if map.len() == 1 => {
-                let child = map.values().next().expect("map has exactly one value");
-                match child {
-                    Value::Object(_) => Self::is_fold_chain(child, depth + 1, min_depth),
-                    _ => depth + 1 >= min_depth,
+                // The map.len() == 1 guard above guarantees exactly one entry.
+                if let Some(child) = map.values().next() {
+                    match child {
+                        Value::Object(_) => Self::is_fold_chain(child, depth + 1, min_depth),
+                        _ => depth + 1 >= min_depth,
+                    }
+                } else {
+                    // Unreachable: len == 1 implies values().next() is Some.
+                    depth >= min_depth
                 }
             }
             _ => depth >= min_depth,

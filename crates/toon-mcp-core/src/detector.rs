@@ -63,6 +63,57 @@ impl std::fmt::Display for InputFormat {
 pub struct FormatDetector;
 
 impl FormatDetector {
+    /// Return the number of columns in the first header row for CSV/TSV input,
+    /// or `None` for other formats.
+    ///
+    /// This avoids re-importing the `csv` crate in the server layer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use toon_mcp_core::{FormatDetector, InputFormat};
+    ///
+    /// assert_eq!(
+    ///     FormatDetector::column_count(InputFormat::Csv, "id,name,score\n1,Alice,9.5"),
+    ///     Some(3)
+    /// );
+    /// assert_eq!(FormatDetector::column_count(InputFormat::Json, r#"{"a":1}"#), None);
+    /// ```
+    pub fn column_count(fmt: InputFormat, input: &str) -> Option<usize> {
+        let delim = match fmt {
+            InputFormat::Csv => b',',
+            InputFormat::Tsv => b'\t',
+            _ => return None,
+        };
+        csv::ReaderBuilder::new()
+            .delimiter(delim)
+            .from_reader(input.as_bytes())
+            .headers()
+            .ok()
+            .map(|h| h.len())
+    }
+
+    /// Count non-empty lines in JSONL input, or return `None` for other formats.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use toon_mcp_core::{FormatDetector, InputFormat};
+    ///
+    /// assert_eq!(
+    ///     FormatDetector::jsonl_line_count(InputFormat::Jsonl, "{\"a\":1}\n\n{\"b\":2}"),
+    ///     Some(2)
+    /// );
+    /// assert_eq!(FormatDetector::jsonl_line_count(InputFormat::Json, r#"{"a":1}"#), None);
+    /// ```
+    pub fn jsonl_line_count(fmt: InputFormat, input: &str) -> Option<usize> {
+        if fmt == InputFormat::Jsonl {
+            Some(input.lines().filter(|l| !l.trim().is_empty()).count())
+        } else {
+            None
+        }
+    }
+
     /// Detect the format of `input` without parsing the full document.
     ///
     /// Detection operates solely on the string slice; no I/O is performed.
@@ -78,7 +129,8 @@ impl FormatDetector {
     /// assert_eq!(FormatDetector::detect("plain text"), InputFormat::Unknown);
     /// ```
     pub fn detect(input: &str) -> InputFormat {
-        // 1. JSON probe — cheapest successful path for well-formed JSON.
+        // 1. JSON probe — O(N) full-document parse; runs first so that
+        //    single-line JSON objects do not fall through to the JSONL probe.
         if serde_json::from_str::<serde_json::Value>(input).is_ok() {
             return InputFormat::Json;
         }
