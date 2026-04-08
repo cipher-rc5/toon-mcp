@@ -11,18 +11,22 @@
 # =============================================================================
 # Benchmarks
 # =============================================================================
-/bench/baselines/
 criterion/
+# bench/baselines/ is intentionally tracked — do NOT add it here
 
 # =============================================================================
 # DuckDB runtime files
 # =============================================================================
 *.duckdb
 *.duckdb.wal
-data/*.duckdb
-data/*.duckdb.wal
 
-# Keep the data directory placeholder
+# =============================================================================
+# Runtime data artifacts
+# =============================================================================
+# Ignore all runtime files under data/ except the placeholder.
+# This prevents evaluation files, log partitions, and DuckDB files from
+# being accidentally committed.
+data/**
 !data/.gitkeep
 
 # =============================================================================
