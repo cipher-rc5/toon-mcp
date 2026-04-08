@@ -79,26 +79,36 @@ fn probe_jsonl(input: &str) -> bool {
 
 ### CSV / TSV Probe
 
-The delimited probe reads up to the first three lines and checks two conditions:
+The delimited probe reads the header row and checks two conditions:
 
-1. There are at least two lines (a header plus one data row)
-2. Every line produces the same column count when split by the delimiter
+1. The header row has at least two columns
+2. The first data record has the same column count as the header
 
-This avoids false positives on prose text that happens to contain commas. The probe does not validate field contents — numeric coercion happens in the parser, not the detector.
+This avoids false positives on prose text that happens to contain commas. The
+probe does not validate field contents — numeric coercion happens in the
+parser, not the detector.
 
 ```rust
 fn probe_delimited(input: &str, delimiter: u8) -> bool {
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter)
-        .has_headers(false)
+        .has_headers(true)
         .from_reader(input.as_bytes());
-    let rows: Vec<csv::StringRecord> = rdr.records()
-        .take(3)
-        .filter_map(Result::ok)
-        .collect();
-    if rows.len() < 2 { return false; }
-    let col_count = rows[0].len();
-    col_count > 1 && rows.iter().all(|r| r.len() == col_count)
+
+    let headers = match rdr.headers() {
+        Ok(h) => h.len(),
+        Err(_) => return false,
+    };
+
+    if headers < 2 {
+        return false;
+    }
+
+    // Check that the first data record has the same column count.
+    match rdr.records().next() {
+        Some(Ok(record)) => record.len() == headers,
+        _ => false,
+    }
 }
 ```
 

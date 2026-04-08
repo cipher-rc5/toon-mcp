@@ -66,15 +66,17 @@ All variables are optional. The server runs with sensible defaults without a `.e
 
 | Variable | Default | Description |
 |---|---|---|
-| `TOON_COMPRESSION_THRESHOLD` | `0.85` | Minimum fraction of bytes that must remain after compression (0.0–1.0). A value of `0.85` means output must be ≤ 85% of input size. |
+| `TOON_COMPRESSION_THRESHOLD` | `0.85` | Maximum output-to-input byte ratio accepted as compressed (0.0–1.0). `0.85` means output must be ≤ 85% of input size (at least 15% savings). |
 | `TOON_MIN_BYTES` | `256` | Inputs smaller than this are passed through without attempting compression. |
+| `TOON_MAX_INPUT_BYTES` | `10485760` | Inputs larger than this (default 10 MiB) are rejected immediately without parsing, preventing unbounded memory use. |
+| `TOON_PIPELINE_TIMEOUT_MS` | `30000` | Per-call compression timeout in milliseconds. Calls exceeding this return an error. |
 | `TOON_KEY_FOLDING` | `true` | Enable TOON key-folding mode for deeply nested objects. |
 | `TOON_DELIMITER` | `comma` | TOON output delimiter: `comma`, `tab`, or `pipe`. |
 | `TOON_TABULAR_MIN_ROWS` | `3` | Minimum row count for an array to be classified as tabular. |
 | `TOON_FOLD_MIN_DEPTH` | `3` | Minimum single-key chain depth to trigger fold-chain classification. |
 | `TOON_PRIMITIVE_ARRAY_MIN` | `5` | Minimum element count for a primitive array classification. |
 | `TOON_LOG_ENABLED` | `true` | Enable structured event logging. |
-| `TOON_LOG_DIR` | `data/logs` | Directory for JSONL log partitions. Must be an absolute path when used from Claude Desktop. |
+| `TOON_LOG_DIR` | `data/logs` | Directory for JSONL log partitions. Must be an absolute path when used from Claude Desktop. When used from opencode (project-relative), `data/logs` resolves correctly from the repository root. |
 | `TOON_LOG_BUFFER_SIZE` | `1000` | Number of events buffered before a forced flush. |
 | `TOON_LOG_FLUSH_INTERVAL_SECS` | `300` | Periodic flush interval in seconds. |
 | `TOON_LOG_LEVEL` | `info` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`). |
@@ -304,4 +306,4 @@ cargo fmt && cargo clippy -- -D warnings && cargo test --workspace
 
 ## License
 
-See [LICENSE](LICENSE) if present.
+[MIT](LICENSE)
