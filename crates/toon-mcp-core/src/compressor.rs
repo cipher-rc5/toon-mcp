@@ -6,16 +6,29 @@ use crate::{
     classifier::{Classifier, ClassifyConfig, ShapeClass},
     detector::{FormatDetector, InputFormat},
 };
+
+/// Maximum number of bytes accepted as input. Inputs larger than this are
+/// rejected immediately before any allocation occurs.
+///
+/// Configurable at runtime via `TOON_MAX_INPUT_BYTES` (default: 10 MiB).
+pub const DEFAULT_MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 use toon_format::types::KeyFoldingMode;
 use toon_format::{Delimiter, EncodeOptions};
 
 /// Configuration for the compressor.
 #[derive(Debug, Clone)]
 pub struct CompressConfig {
-    /// Encode only when `toon_bytes < input_bytes * threshold`.
-    pub threshold: f64,
+    /// Maximum output-to-input byte ratio accepted as "compressed".
+    ///
+    /// A value of `0.85` means the TOON output must be at most 85% of the
+    /// original input byte count (i.e., at least 15% savings). A value of
+    /// `1.0` accepts any output that is strictly smaller than the input.
+    pub max_output_ratio: f64,
     /// Skip classification for inputs below this byte count.
     pub min_bytes: usize,
+    /// Reject inputs larger than this byte count without processing.
+    /// Prevents unbounded memory allocation on oversized payloads.
+    pub max_input_bytes: usize,
     /// Whether to enable TOON key folding for FoldChain shapes.
     pub key_folding: bool,
     /// The array delimiter used in TOON output.
@@ -31,8 +44,9 @@ pub struct CompressConfig {
 impl Default for CompressConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.85,
+            max_output_ratio: 0.85,
             min_bytes: 256,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
             key_folding: true,
             delimiter: Delimiter::Comma,
             tabular_min_rows: crate::classifier::TABULAR_MIN_ROWS,
@@ -45,16 +59,23 @@ impl Default for CompressConfig {
 /// The reason content was passed through without compression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PassThroughReason {
+    /// Input byte length exceeded `max_input_bytes`.
+    InputExceedsLimit {
+        /// Actual input byte count.
+        actual: usize,
+        /// Configured limit.
+        limit: usize,
+    },
     /// Input format was not recognised.
     UnknownFormat,
     /// Input byte length was below `min_bytes`.
     BelowMinBytes,
-    /// TOON savings did not meet the threshold.
+    /// TOON output did not meet the `max_output_ratio` threshold.
     InsufficientSavings {
-        /// Observed savings percentage (0.0–1.0).
-        estimated_pct: f64,
-        /// Configured threshold.
-        threshold: f64,
+        /// Observed output-to-input ratio (0.0–1.0; lower is better).
+        output_ratio: f64,
+        /// Configured maximum output ratio.
+        max_output_ratio: f64,
     },
     /// Shape classifier returned `PassThrough`.
     ShapeNotBeneficial,
@@ -70,6 +91,9 @@ pub enum PassThroughReason {
 impl PassThroughReason {
     /// Return a stable lowercase string identifier for logging.
     ///
+    /// Non-parameterised variants return a `&'static str` via `Display`.
+    /// Use `to_string()` or the `Display` impl when a `String` is required.
+    ///
     /// # Examples
     ///
     /// ```
@@ -79,21 +103,28 @@ impl PassThroughReason {
     /// assert_eq!(PassThroughReason::BelowMinBytes.as_str(), "below_min_bytes");
     /// assert_eq!(PassThroughReason::ShapeNotBeneficial.as_str(), "shape_not_beneficial");
     /// ```
-    pub fn as_str(&self) -> String {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            PassThroughReason::UnknownFormat => "unknown_format".into(),
-            PassThroughReason::BelowMinBytes => "below_min_bytes".into(),
-            PassThroughReason::InsufficientSavings { .. } => "insufficient_savings".into(),
-            PassThroughReason::ShapeNotBeneficial => "shape_not_beneficial".into(),
-            PassThroughReason::ParseFailed { .. } => "parse_failed".into(),
+            PassThroughReason::InputExceedsLimit { .. } => "input_exceeds_limit",
+            PassThroughReason::UnknownFormat => "unknown_format",
+            PassThroughReason::BelowMinBytes => "below_min_bytes",
+            PassThroughReason::InsufficientSavings { .. } => "insufficient_savings",
+            PassThroughReason::ShapeNotBeneficial => "shape_not_beneficial",
+            PassThroughReason::ParseFailed { .. } => "parse_failed",
         }
+    }
+}
+
+impl std::fmt::Display for PassThroughReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 /// The outcome of a compression attempt.
 #[derive(Debug, Clone)]
 pub enum CompressDecision {
-    /// Compression was applied and exceeded the savings threshold.
+    /// Compression was applied and the output met the savings threshold.
     Compressed {
         /// The TOON-encoded output string.
         toon: String,
@@ -103,6 +134,10 @@ pub enum CompressDecision {
         toon_bytes: usize,
         /// Fraction of bytes saved (1.0 - toon_bytes / original_bytes).
         savings_pct: f64,
+        /// The detected input format.
+        input_format: InputFormat,
+        /// The classifier shape assigned to the parsed value.
+        shape_class: ShapeClass,
     },
     /// Content was not compressed; the original input should be used as-is.
     PassedThrough {
@@ -143,18 +178,36 @@ impl Compressor {
     ///     Compressor::decide(&prose, &config),
     ///     CompressDecision::PassedThrough { reason: PassThroughReason::UnknownFormat }
     /// ));
+    ///
+    /// // Oversized input is rejected before any allocation.
+    /// let huge = "x".repeat(1000);
+    /// let tiny_limit = CompressConfig { max_input_bytes: 10, ..CompressConfig::default() };
+    /// assert!(matches!(
+    ///     Compressor::decide(&huge, &tiny_limit),
+    ///     CompressDecision::PassedThrough { reason: PassThroughReason::InputExceedsLimit { .. } }
+    /// ));
     /// ```
     pub fn decide(input: &str, config: &CompressConfig) -> CompressDecision {
         let original_bytes = input.len();
 
-        // Step 1: byte-length gate.
+        // Step 1: upper-bound gate — reject oversized inputs before any allocation.
+        if original_bytes > config.max_input_bytes {
+            return CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit {
+                    actual: original_bytes,
+                    limit: config.max_input_bytes,
+                },
+            };
+        }
+
+        // Step 2: lower-bound gate — skip tiny inputs that cannot compress meaningfully.
         if original_bytes < config.min_bytes {
             return CompressDecision::PassedThrough {
                 reason: PassThroughReason::BelowMinBytes,
             };
         }
 
-        // Step 2: detect and parse.
+        // Step 3: detect and parse.
         let (fmt, value) = match FormatDetector::detect_and_parse(input) {
             Ok(pair) => pair,
             Err(crate::error::CoreError::ParseFailed { format, detail, .. }) => {
@@ -178,9 +231,7 @@ impl Compressor {
             }
         };
 
-        let _ = fmt; // format is captured for potential future use
-
-        // Step 3: classify shape.
+        // Step 4: classify shape.
         let classify_config = ClassifyConfig {
             tabular_min_rows: config.tabular_min_rows,
             fold_min_depth: config.fold_min_depth,
@@ -193,7 +244,7 @@ impl Compressor {
             };
         }
 
-        // Step 4: TOON encode.
+        // Step 5: TOON encode.
         let key_folding = if config.key_folding {
             KeyFoldingMode::Safe
         } else {
@@ -217,13 +268,15 @@ impl Compressor {
 
         let toon_bytes = toon.len();
 
-        // Step 5: savings threshold gate.
-        let savings_pct = 1.0 - (toon_bytes as f64 / original_bytes as f64);
-        if savings_pct < (1.0 - config.threshold) {
+        // Step 6: output-ratio gate.
+        // max_output_ratio = 0.85 means output must be ≤ 85% of input bytes.
+        // output_ratio = toon_bytes / original_bytes; pass if output_ratio <= max_output_ratio.
+        let output_ratio = toon_bytes as f64 / original_bytes as f64;
+        if output_ratio > config.max_output_ratio {
             return CompressDecision::PassedThrough {
                 reason: PassThroughReason::InsufficientSavings {
-                    estimated_pct: savings_pct,
-                    threshold: config.threshold,
+                    output_ratio,
+                    max_output_ratio: config.max_output_ratio,
                 },
             };
         }
@@ -232,7 +285,9 @@ impl Compressor {
             toon,
             original_bytes,
             toon_bytes,
-            savings_pct,
+            savings_pct: 1.0 - output_ratio,
+            input_format: fmt,
+            shape_class: shape,
         }
     }
 }
@@ -276,6 +331,25 @@ mod tests {
     }
 
     #[test]
+    fn input_exceeds_limit_passes_through() {
+        let input = "a".repeat(100);
+        let config = CompressConfig {
+            max_input_bytes: 50,
+            ..CompressConfig::default()
+        };
+        match Compressor::decide(&input, &config) {
+            CompressDecision::PassedThrough {
+                reason:
+                    PassThroughReason::InputExceedsLimit {
+                        actual: 100,
+                        limit: 50,
+                    },
+            } => {}
+            other => panic!("expected InputExceedsLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn below_min_bytes_passes_through() {
         let input = r#"{"x":1}"#;
         let config = CompressConfig::default();
@@ -316,7 +390,7 @@ mod tests {
         let input = large_tabular_json();
         assert!(input.len() >= 256);
         let config = CompressConfig {
-            threshold: 0.99,
+            max_output_ratio: 0.99,
             ..CompressConfig::default()
         };
         match Compressor::decide(&input, &config) {
@@ -325,10 +399,14 @@ mod tests {
                 original_bytes,
                 toon_bytes,
                 savings_pct,
+                input_format,
+                shape_class,
             } => {
                 assert!(toon_bytes < original_bytes);
                 assert!(savings_pct > 0.0);
                 assert!(!toon.is_empty());
+                assert_eq!(input_format, InputFormat::Json);
+                assert_eq!(shape_class, ShapeClass::Tabular);
             }
             CompressDecision::PassedThrough { reason } => {
                 panic!("expected Compressed, got PassedThrough({reason:?})");
@@ -341,11 +419,18 @@ mod tests {
         let input = large_jsonl();
         assert!(input.len() >= 256);
         let config = CompressConfig {
-            threshold: 0.99,
+            max_output_ratio: 0.99,
             ..CompressConfig::default()
         };
         match Compressor::decide(&input, &config) {
-            CompressDecision::Compressed { .. } => {}
+            CompressDecision::Compressed {
+                input_format,
+                shape_class,
+                ..
+            } => {
+                assert_eq!(input_format, InputFormat::Jsonl);
+                assert_eq!(shape_class, ShapeClass::Tabular);
+            }
             CompressDecision::PassedThrough { reason } => {
                 panic!("expected Compressed, got PassedThrough({reason:?})");
             }
@@ -363,13 +448,15 @@ mod tests {
         let input = large_csv();
         assert!(input.len() >= 256);
         let config = CompressConfig {
-            threshold: 0.99,
+            max_output_ratio: 0.99,
             ..CompressConfig::default()
         };
         // Either Compressed or InsufficientSavings is acceptable; anything
         // else (UnknownFormat, BelowMinBytes, ParseFailed) is a bug.
         match Compressor::decide(&input, &config) {
-            CompressDecision::Compressed { .. } => {}
+            CompressDecision::Compressed { input_format, .. } => {
+                assert_eq!(input_format, InputFormat::Csv);
+            }
             CompressDecision::PassedThrough {
                 reason: PassThroughReason::InsufficientSavings { .. },
             } => {}
@@ -381,10 +468,10 @@ mod tests {
 
     #[test]
     fn insufficient_savings_passes_through() {
-        // Use a threshold so tight that even good compression fails.
+        // max_output_ratio = 0.0 means output must be 0% of input — impossible.
         let input = large_tabular_json();
         let config = CompressConfig {
-            threshold: 0.0,
+            max_output_ratio: 0.0,
             ..CompressConfig::default()
         };
         match Compressor::decide(&input, &config) {

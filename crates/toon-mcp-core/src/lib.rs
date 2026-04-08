@@ -10,6 +10,8 @@ pub mod parser;
 pub use classifier::{
     Classifier, ClassifyConfig, FOLD_MIN_DEPTH, PRIMITIVE_ARRAY_MIN, ShapeClass, TABULAR_MIN_ROWS,
 };
-pub use compressor::{CompressConfig, CompressDecision, Compressor, PassThroughReason};
+pub use compressor::{
+    CompressConfig, CompressDecision, Compressor, DEFAULT_MAX_INPUT_BYTES, PassThroughReason,
+};
 pub use detector::{FormatDetector, InputFormat};
 pub use error::CoreError;
