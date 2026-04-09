@@ -13,7 +13,8 @@ env:
 jobs:
   ci:
     name: Check / Fmt / Clippy / Test / Doc
-    runs-on: ubuntu-latest
+    # M7: Pinned runner version to prevent silent breakage on image updates.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -23,6 +24,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # M8: Install cargo-llvm-cov for coverage measurement.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache Cargo registry and build artefacts
         uses: actions/cache@v4
@@ -43,6 +48,22 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      # M8: Measure coverage and enforce a 70% line coverage floor.
+      - name: cargo llvm-cov (coverage gate)
+        run: |
+          cargo llvm-cov --workspace \
+            --lcov --output-path lcov.info \
+            --ignore-filename-regex "crates/toon-mcp-bench"
+          cargo llvm-cov report \
+            --ignore-filename-regex "crates/toon-mcp-bench" \
+            --fail-under-lines 70
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-report
+          path: lcov.info
 
       - name: cargo doc --no-deps
         run: cargo doc --no-deps --workspace
