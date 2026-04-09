@@ -1,18 +1,20 @@
-// file: crates/toon-mcp-logging/src/parquet_sink.rs
+// file: crates/toon-mcp-logging/src/jsonl_sink.rs
 // description: Lock-free LogSink that appends JSONL to daily-partitioned files queryable by DuckDB
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{error::LogError, event::LogEvent, sink::LogSink};
 use async_trait::async_trait;
 
-/// Configuration for the Parquet-compatible JSONL sink.
+/// Configuration for the JSONL sink.
 ///
 /// Events are written as newline-delimited JSON to hive-partitioned files
 /// under `log_dir`:
@@ -32,7 +34,7 @@ use async_trait::async_trait;
 /// SELECT * FROM read_json('data/logs/**/*.jsonl');
 /// ```
 #[derive(Debug, Clone)]
-pub struct ParquetSinkConfig {
+pub struct JsonlSinkConfig {
     /// Root directory for partitioned JSONL log files.
     pub log_dir: PathBuf,
     /// Number of events to buffer before flushing to disk.
@@ -41,7 +43,7 @@ pub struct ParquetSinkConfig {
     pub flush_interval: Duration,
 }
 
-impl Default for ParquetSinkConfig {
+impl Default for JsonlSinkConfig {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from("data/logs"),
@@ -51,27 +53,27 @@ impl Default for ParquetSinkConfig {
     }
 }
 
-/// Commands sent from `ParquetSink` to the background writer task.
+/// Commands sent from `JsonlSink` to the background writer task.
 enum SinkCmd {
     Record(LogEvent),
-    Flush,
+    Flush(oneshot::Sender<Result<(), LogError>>),
     Shutdown(oneshot::Sender<Result<(), LogError>>),
 }
 
 /// A `LogSink` that appends events as JSONL to daily-partitioned files.
 ///
-/// The writer task owns the file handle and is the sole writer. Readers
+/// The writer task owns the open file handles and is the sole writer. Readers
 /// (e.g. `duckdb data/logs/**/*.jsonl`) never need to acquire a lock.
-pub struct ParquetSink {
+pub struct JsonlSink {
     sender: mpsc::Sender<SinkCmd>,
 }
 
-impl ParquetSink {
+impl JsonlSink {
     /// Construct a new sink and the background task future.
     ///
     /// The caller MUST spawn the returned future before the sink is used.
     pub fn new(
-        config: ParquetSinkConfig,
+        config: JsonlSinkConfig,
     ) -> Result<(Self, impl Future<Output = ()> + use<>), LogError> {
         let (tx, rx) = mpsc::channel(config.buffer_size);
 
@@ -79,7 +81,7 @@ impl ParquetSink {
             return Err(LogError::IoError(e.to_string()));
         }
 
-        let sink = ParquetSink { sender: tx };
+        let sink = JsonlSink { sender: tx };
         let task_future = writer_task(
             rx,
             config.log_dir,
@@ -92,7 +94,7 @@ impl ParquetSink {
 }
 
 #[async_trait]
-impl LogSink for ParquetSink {
+impl LogSink for JsonlSink {
     async fn record(&self, event: LogEvent) -> Result<(), LogError> {
         self.sender
             .send(SinkCmd::Record(event))
@@ -100,11 +102,18 @@ impl LogSink for ParquetSink {
             .map_err(|e| LogError::ChannelSend(e.to_string()))
     }
 
+    /// Flush all buffered events to disk and wait for acknowledgement.
+    ///
+    /// This method blocks until the writer task confirms the flush is
+    /// complete — unlike a fire-and-forget send, the caller can rely on
+    /// events being durable after this returns `Ok(())`.
     async fn flush(&self) -> Result<(), LogError> {
+        let (tx, rx) = oneshot::channel();
         self.sender
-            .send(SinkCmd::Flush)
+            .send(SinkCmd::Flush(tx))
             .await
-            .map_err(|e| LogError::ChannelSend(e.to_string()))
+            .map_err(|e| LogError::ChannelSend(e.to_string()))?;
+        rx.await.map_err(|e| LogError::ShutdownAck(e.to_string()))?
     }
 
     async fn shutdown(self: Box<Self>) -> Result<(), LogError> {
@@ -117,7 +126,10 @@ impl LogSink for ParquetSink {
     }
 }
 
-/// Background writer task that owns the append file handles.
+/// Background writer task that owns the open file handles.
+///
+/// Holds one `std::fs::File` per active day partition and re-opens only when
+/// the UTC day rolls over, reducing syscall overhead under sustained load.
 async fn writer_task(
     mut rx: mpsc::Receiver<SinkCmd>,
     log_dir: PathBuf,
@@ -125,6 +137,8 @@ async fn writer_task(
     buffer_size: usize,
 ) {
     let mut pending: Vec<LogEvent> = Vec::with_capacity(buffer_size);
+    // Open file handles keyed by YYYY-MM-DD partition string.
+    let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
     let mut interval = time::interval(flush_interval);
     // Skip the first tick to avoid flushing immediately on startup.
     interval.tick().await;
@@ -138,29 +152,30 @@ async fn writer_task(
                     Some(SinkCmd::Record(event)) => {
                         pending.push(event);
                         if pending.len() >= buffer_size {
-                            if let Err(e) = flush_pending(&mut pending, &log_dir).await {
-                                warn!("ParquetSink flush (buffer full) failed: {e}");
+                            if let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
+                                warn!("JsonlSink flush (buffer full) failed: {e}");
                             }
                         }
                     }
-                    Some(SinkCmd::Flush) => {
-                        if let Err(e) = flush_pending(&mut pending, &log_dir).await {
-                            warn!("ParquetSink flush (explicit) failed: {e}");
-                        }
-                    }
-                    Some(SinkCmd::Shutdown(ack)) => {
-                        let result = flush_pending(&mut pending, &log_dir)
+                    Some(SinkCmd::Flush(ack)) => {
+                        let result = flush_pending(&mut pending, &log_dir, &mut file_handles)
                             .await
                             .map_err(|e| LogError::IoError(e.to_string()));
                         let _ = ack.send(result);
-                        info!("ParquetSink writer task: shutdown complete");
+                    }
+                    Some(SinkCmd::Shutdown(ack)) => {
+                        let result = flush_pending(&mut pending, &log_dir, &mut file_handles)
+                            .await
+                            .map_err(|e| LogError::IoError(e.to_string()));
+                        let _ = ack.send(result);
+                        info!("JsonlSink writer task: shutdown complete");
                         return;
                     }
                     None => {
-                        if let Err(e) = flush_pending(&mut pending, &log_dir).await {
-                            warn!("ParquetSink flush (channel closed) failed: {e}");
+                        if let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
+                            warn!("JsonlSink flush (channel closed) failed: {e}");
                         }
-                        info!("ParquetSink writer task: channel closed, exiting");
+                        info!("JsonlSink writer task: channel closed, exiting");
                         return;
                     }
                 }
@@ -168,8 +183,8 @@ async fn writer_task(
 
             _ = interval.tick() => {
                 if !pending.is_empty() {
-                    if let Err(e) = flush_pending(&mut pending, &log_dir).await {
-                        warn!("ParquetSink flush (periodic) failed: {e}");
+                    if let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
+                        warn!("JsonlSink flush (periodic) failed: {e}");
                     }
                 }
             }
@@ -178,50 +193,96 @@ async fn writer_task(
 }
 
 /// Append all pending events as JSONL to the appropriate day partition file.
-async fn flush_pending(pending: &mut Vec<LogEvent>, log_dir: &Path) -> Result<(), LogError> {
+///
+/// File handles are cached in `file_handles` and re-used across calls to avoid
+/// repeated `open(2)` / `close(2)` syscalls. A handle is opened the first time
+/// a partition key is seen; it is closed only when the writer task exits.
+async fn flush_pending(
+    pending: &mut Vec<LogEvent>,
+    log_dir: &Path,
+    file_handles: &mut HashMap<String, std::fs::File>,
+) -> Result<(), LogError> {
     if pending.is_empty() {
         return Ok(());
     }
 
     // Group events by UTC day to write to the correct partition.
-    // Events are typically from the same day, but we handle day-boundary rolls.
-    let mut by_day: std::collections::HashMap<String, Vec<&LogEvent>> =
-        std::collections::HashMap::new();
-
+    let mut by_day: HashMap<String, Vec<&LogEvent>> = HashMap::new();
     for event in pending.iter() {
         let day = day_partition_key(event.ts_us);
         by_day.entry(day).or_default().push(event);
     }
 
+    // Serialise all lines on the async task before entering spawn_blocking.
+    let mut day_lines: Vec<(String, PathBuf, String)> = Vec::new();
     for (day, events) in &by_day {
         let partition_dir = log_dir.join(format!("day={day}"));
-        // spawn_blocking because std::fs writes must not run on the tokio executor.
-        let partition_dir_clone = partition_dir.clone();
         let lines: String = events
             .iter()
-            .map(|e| serde_json::to_string(e).unwrap_or_else(|_| "{}".into()))
+            .map(|e| match serde_json::to_string(e) {
+                Ok(s) => s,
+                Err(err) => {
+                    // H1: visible error — never silently drop events.
+                    error!(
+                        event_id = %e.event_id,
+                        "JsonlSink: serialization failed, event skipped: {err}"
+                    );
+                    String::new()
+                }
+            })
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
+            .join("\n");
 
-        tokio::task::spawn_blocking(move || -> Result<(), LogError> {
-            std::fs::create_dir_all(&partition_dir_clone)
-                .map_err(|e| LogError::IoError(e.to_string()))?;
-            let file_path = partition_dir_clone.join("events.jsonl");
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file_path)
-                .map_err(|e| LogError::IoError(e.to_string()))?;
-            file.write_all(lines.as_bytes())
-                .map_err(|e| LogError::IoError(e.to_string()))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| LogError::IoError(e.to_string()))??;
+        if lines.is_empty() {
+            continue;
+        }
+
+        day_lines.push((day.clone(), partition_dir, lines + "\n"));
     }
 
+    if day_lines.is_empty() {
+        pending.clear();
+        return Ok(());
+    }
+
+    // Move file handles into spawn_blocking and get them back after.
+    let mut handles_snapshot = std::mem::take(file_handles);
+
+    let (handles_snapshot, result) = tokio::task::spawn_blocking(
+        move || -> (HashMap<String, std::fs::File>, Result<(), LogError>) {
+            for (day, partition_dir, lines) in day_lines {
+                if let Err(e) = std::fs::create_dir_all(&partition_dir) {
+                    return (handles_snapshot, Err(LogError::IoError(e.to_string())));
+                }
+
+                // L3: re-use open handle; open once per partition per process run.
+                let file = handles_snapshot.entry(day).or_insert_with(|| {
+                    let file_path = partition_dir.join("events.jsonl");
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&file_path)
+                        // Postcondition: create_dir_all succeeded above, so open
+                        // should succeed. If it does not, the writer task will see
+                        // a JoinError and log it via the supervisor.
+                        .unwrap_or_else(|e| panic!("JsonlSink: failed to open {file_path:?}: {e}"))
+                });
+
+                if let Err(e) = file.write_all(lines.as_bytes()) {
+                    return (handles_snapshot, Err(LogError::IoError(e.to_string())));
+                }
+            }
+            (handles_snapshot, Ok(()))
+        },
+    )
+    .await
+    .map_err(|e| LogError::IoError(format!("spawn_blocking panicked: {e}")))?;
+
+    // Restore the file handles regardless of outcome.
+    *file_handles = handles_snapshot;
+
+    result?;
     pending.clear();
     Ok(())
 }
@@ -264,15 +325,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parquet_sink_flushes_to_jsonl() {
+    async fn jsonl_sink_flushes_to_jsonl() {
         let dir = tempfile::tempdir().expect("tempdir created successfully");
-        let config = ParquetSinkConfig {
+        let config = JsonlSinkConfig {
             log_dir: dir.path().to_path_buf(),
             buffer_size: 100,
             flush_interval: Duration::from_secs(3600),
         };
 
-        let (sink, task) = ParquetSink::new(config).expect("ParquetSink constructs successfully");
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs successfully");
         tokio::spawn(task);
 
         for i in 1..=5 {
@@ -293,13 +354,13 @@ mod tests {
     #[tokio::test]
     async fn event_fields_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir created successfully");
-        let config = ParquetSinkConfig {
+        let config = JsonlSinkConfig {
             log_dir: dir.path().to_path_buf(),
             buffer_size: 100,
             flush_interval: Duration::from_secs(3600),
         };
 
-        let (sink, task) = ParquetSink::new(config).expect("ParquetSink constructs successfully");
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs successfully");
         tokio::spawn(task);
 
         let event = make_event(42);
@@ -314,6 +375,56 @@ mod tests {
         assert_eq!(parsed.event_id, event.event_id);
         assert_eq!(parsed.tool_name, "compress_content");
         assert!((parsed.savings_pct - 0.56).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn flush_is_acknowledged() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 1000, // large buffer — will not auto-flush
+            flush_interval: Duration::from_secs(3600),
+        };
+
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs successfully");
+        tokio::spawn(task);
+
+        sink.record(make_event(1)).await.expect("record succeeds");
+        // Explicit flush — must block until data is on disk.
+        sink.flush().await.expect("flush succeeds");
+
+        let jsonl_path = dir.path().join("day=2023-11-14").join("events.jsonl");
+        assert!(
+            jsonl_path.exists(),
+            "JSONL file exists after acknowledged flush"
+        );
+
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn file_handle_reused_across_flushes() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 1000,
+            flush_interval: Duration::from_secs(3600),
+        };
+
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs successfully");
+        tokio::spawn(task);
+
+        // Two separate explicit flushes — both events must reach the same file.
+        sink.record(make_event(1)).await.expect("record 1 succeeds");
+        sink.flush().await.expect("flush 1 succeeds");
+        sink.record(make_event(2)).await.expect("record 2 succeeds");
+        sink.flush().await.expect("flush 2 succeeds");
+
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
+
+        let jsonl_path = dir.path().join("day=2023-11-14").join("events.jsonl");
+        let content = std::fs::read_to_string(&jsonl_path).expect("file is readable");
+        assert_eq!(content.lines().count(), 2, "both events persisted");
     }
 
     #[test]

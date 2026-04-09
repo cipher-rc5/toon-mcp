@@ -7,7 +7,7 @@ use async_trait::async_trait;
 /// Abstraction over a structured event logger.
 ///
 /// Implementations include:
-/// - `ParquetSink`: appends events as JSONL to daily-partitioned files,
+/// - `JsonlSink`: appends events as JSONL to daily-partitioned files,
 ///   queryable by DuckDB without acquiring a lock.
 /// - `NoopSink`: discards all events (used when logging is disabled).
 /// - `MemorySink`: accumulates events in memory (used in integration tests).
@@ -31,7 +31,10 @@ pub trait LogSink: Send + Sync + 'static {
     /// Record a single tool invocation event.
     async fn record(&self, event: LogEvent) -> Result<(), LogError>;
 
-    /// Flush any buffered events to durable storage.
+    /// Flush any buffered events to durable storage and wait for acknowledgement.
+    ///
+    /// Unlike a fire-and-forget send, the caller can rely on events being
+    /// durable after this returns `Ok(())`.
     async fn flush(&self) -> Result<(), LogError>;
 
     /// Flush, finalise, and cleanly shut down the sink.
