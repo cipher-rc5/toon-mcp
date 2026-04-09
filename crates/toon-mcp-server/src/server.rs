@@ -11,6 +11,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
+use tokio::sync::Semaphore;
 
 use toon_mcp_logging::LogSink;
 
@@ -18,7 +19,7 @@ use crate::{
     config::Config,
     handler::{
         CompressParams, CompressResult, DetectParams, DetectResult, StatsParams, StatsResult,
-        handle_compress_content, handle_compression_stats, handle_detect_format,
+        handle_compress_content_inner, handle_compression_stats, handle_detect_format,
     },
 };
 
@@ -29,6 +30,8 @@ use crate::{
 pub struct ToonMcpServer {
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    /// M1: Global semaphore that caps concurrent blocking pipeline calls.
+    semaphore: Arc<Semaphore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -36,9 +39,11 @@ pub struct ToonMcpServer {
 impl ToonMcpServer {
     /// Construct a new server with the given configuration and log sink.
     pub fn new(config: Config, log_sink: Arc<dyn LogSink>) -> Self {
+        let max_concurrent = config.max_concurrent_calls;
         Self {
             config: Arc::new(config),
             log_sink,
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tool_router: Self::tool_router(),
         }
     }
@@ -51,9 +56,14 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<DetectParams>,
     ) -> Result<Json<DetectResult>, McpError> {
-        handle_detect_format(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-            .await
-            .map(Json)
+        handle_detect_format(
+            params,
+            Arc::clone(&self.config),
+            Arc::clone(&self.log_sink),
+            Arc::clone(&self.semaphore),
+        )
+        .await
+        .map(Json)
     }
 
     /// Compress structured content to TOON format for token efficiency.
@@ -66,9 +76,14 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<CompressParams>,
     ) -> Result<Json<CompressResult>, McpError> {
-        handle_compress_content(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-            .await
-            .map(Json)
+        handle_compress_content_inner(
+            params,
+            Arc::clone(&self.config),
+            Arc::clone(&self.log_sink),
+            Arc::clone(&self.semaphore),
+        )
+        .await
+        .map(Json)
     }
 
     /// Preview compression statistics without encoding.
@@ -80,9 +95,14 @@ impl ToonMcpServer {
         &self,
         rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<StatsParams>,
     ) -> Result<Json<StatsResult>, McpError> {
-        handle_compression_stats(params, Arc::clone(&self.config), Arc::clone(&self.log_sink))
-            .await
-            .map(Json)
+        handle_compression_stats(
+            params,
+            Arc::clone(&self.config),
+            Arc::clone(&self.log_sink),
+            Arc::clone(&self.semaphore),
+        )
+        .await
+        .map(Json)
     }
 }
 

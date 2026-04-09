@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use toon_format::Delimiter;
 use toon_mcp_core::DEFAULT_MAX_INPUT_BYTES;
-use toon_mcp_logging::ParquetSinkConfig;
+use toon_mcp_logging::JsonlSinkConfig;
 
 /// Top-level configuration for the toon-mcp-server binary.
 ///
@@ -46,8 +46,8 @@ pub struct Config {
     /// Whether structured logging is enabled.
     pub logging_enabled: bool,
 
-    /// Parquet sink configuration (only meaningful when `logging_enabled`).
-    pub logging: ParquetSinkConfig,
+    /// JSONL sink configuration (only meaningful when `logging_enabled`).
+    pub logging: JsonlSinkConfig,
 
     /// tracing filter string (e.g. `"info"`, `"debug"`).
     pub log_level: String,
@@ -58,6 +58,13 @@ pub struct Config {
     /// Per-call pipeline timeout in milliseconds. Calls exceeding this
     /// duration return an error rather than blocking indefinitely.
     pub pipeline_timeout_ms: u64,
+
+    /// Maximum number of concurrent blocking pipeline calls.
+    ///
+    /// Controls how many `spawn_blocking` dispatches can be in-flight at
+    /// once. When the limit is reached, new calls wait up to
+    /// `pipeline_timeout_ms` for a permit before returning a busy error.
+    pub max_concurrent_calls: usize,
 }
 
 impl Config {
@@ -77,6 +84,7 @@ impl Config {
         let logging_enabled = env_bool("TOON_LOG_ENABLED", true);
         let log_level = std::env::var("TOON_LOG_LEVEL").unwrap_or_else(|_| "info".into());
         let pipeline_timeout_ms = env_u64("TOON_PIPELINE_TIMEOUT_MS", 30_000);
+        let max_concurrent_calls = env_usize("TOON_MAX_CONCURRENT_CALLS", 8);
         let client_hint = std::env::var("TOON_CLIENT_HINT")
             .ok()
             .filter(|s| !s.is_empty());
@@ -100,6 +108,19 @@ impl Config {
             );
         }
 
+        // M2: Warn on relative log directory paths. Claude Desktop and many
+        // process supervisors have an unpredictable working directory;
+        // a relative path will silently misdirect log files.
+        let log_dir_path = PathBuf::from(&log_dir);
+        if logging_enabled && !log_dir_path.is_absolute() {
+            tracing::warn!(
+                path = log_dir,
+                "TOON_LOG_DIR is a relative path; log files will be created relative to the \
+                 process working directory which may be unexpected. Set an absolute path to \
+                 avoid silent log misdirection (required for Claude Desktop)."
+            );
+        }
+
         Self {
             max_output_ratio,
             min_bytes,
@@ -110,14 +131,15 @@ impl Config {
             fold_min_depth,
             primitive_array_min,
             logging_enabled,
-            logging: ParquetSinkConfig {
-                log_dir: PathBuf::from(log_dir),
+            logging: JsonlSinkConfig {
+                log_dir: log_dir_path,
                 buffer_size,
                 flush_interval: Duration::from_secs(flush_interval_secs),
             },
             log_level,
             client_hint,
             pipeline_timeout_ms,
+            max_concurrent_calls,
         }
     }
 }
@@ -219,45 +241,49 @@ fn env_delimiter(key: &str, default: Delimiter) -> Delimiter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    /// Serialise all config tests to prevent env var pollution across threads.
-    /// All tests that read or write `TOON_*` env vars must lock this before
-    /// calling `Config::load()`.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Helper: run a closure with a single scoped env var, serialised via
-    /// `ENV_LOCK`. The var is removed after `f` returns.
+    /// Helper: run a closure with a single scoped env var.
+    /// Uses the `temp-env` crate for safe, thread-isolated env var overrides.
     fn with_env<F: FnOnce()>(key: &str, val: &str, f: F) {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK is unpoisoned");
-        // SAFETY: We hold ENV_LOCK, so no concurrent thread is reading/writing
-        // env vars in this test binary at the same time.
-        unsafe {
-            std::env::set_var(key, val);
-        }
-        f();
-        unsafe {
-            std::env::remove_var(key);
-        }
+        temp_env::with_var(key, Some(val), f);
     }
 
     #[test]
     fn defaults_with_no_env() {
-        let _guard = ENV_LOCK.lock().expect("ENV_LOCK is unpoisoned");
-        let config = Config::load();
-        assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
-        assert_eq!(config.min_bytes, 256);
-        assert_eq!(config.max_input_bytes, DEFAULT_MAX_INPUT_BYTES);
-        assert!(config.key_folding);
-        assert_eq!(config.tabular_min_rows, 3);
-        assert_eq!(config.fold_min_depth, 3);
-        assert_eq!(config.primitive_array_min, 5);
-        assert!(config.logging_enabled);
-        assert_eq!(config.log_level, "info");
-        assert!(config.client_hint.is_none());
-        assert_eq!(config.pipeline_timeout_ms, 30_000);
+        // Clear all TOON_* vars that could bleed from the environment.
+        temp_env::with_vars(
+            [
+                ("TOON_COMPRESSION_THRESHOLD", None::<&str>),
+                ("TOON_MIN_BYTES", None::<&str>),
+                ("TOON_MAX_INPUT_BYTES", None::<&str>),
+                ("TOON_KEY_FOLDING", None::<&str>),
+                ("TOON_DELIMITER", None::<&str>),
+                ("TOON_TABULAR_MIN_ROWS", None::<&str>),
+                ("TOON_FOLD_MIN_DEPTH", None::<&str>),
+                ("TOON_PRIMITIVE_ARRAY_MIN", None::<&str>),
+                ("TOON_LOG_ENABLED", None::<&str>),
+                ("TOON_LOG_LEVEL", None::<&str>),
+                ("TOON_CLIENT_HINT", None::<&str>),
+                ("TOON_PIPELINE_TIMEOUT_MS", None::<&str>),
+                ("TOON_MAX_CONCURRENT_CALLS", None::<&str>),
+            ],
+            || {
+                let config = Config::load();
+                assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
+                assert_eq!(config.min_bytes, 256);
+                assert_eq!(config.max_input_bytes, DEFAULT_MAX_INPUT_BYTES);
+                assert!(config.key_folding);
+                assert_eq!(config.tabular_min_rows, 3);
+                assert_eq!(config.fold_min_depth, 3);
+                assert_eq!(config.primitive_array_min, 5);
+                assert!(config.logging_enabled);
+                assert_eq!(config.log_level, "info");
+                assert!(config.client_hint.is_none());
+                assert_eq!(config.pipeline_timeout_ms, 30_000);
+                assert_eq!(config.max_concurrent_calls, 8);
+            },
+        );
     }
 
     #[test]
@@ -334,6 +360,13 @@ mod tests {
     fn max_input_bytes_override() {
         with_env("TOON_MAX_INPUT_BYTES", "1048576", || {
             assert_eq!(Config::load().max_input_bytes, 1_048_576);
+        });
+    }
+
+    #[test]
+    fn max_concurrent_calls_override() {
+        with_env("TOON_MAX_CONCURRENT_CALLS", "16", || {
+            assert_eq!(Config::load().max_concurrent_calls, 16);
         });
     }
 }

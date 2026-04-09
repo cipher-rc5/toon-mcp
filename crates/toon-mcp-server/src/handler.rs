@@ -8,6 +8,7 @@ use chrono::Utc;
 use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 /// Schema helper: emit `{ "type": "integer" }` without a Go-style `"format"`
@@ -16,13 +17,13 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
     schemars::json_schema!({ "type": "integer" })
 }
 
-use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector};
+use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat};
 use toon_mcp_logging::{LogEvent, LogSink};
 
 use crate::config::Config;
 
 // ---------------------------------------------------------------------------
-// Config → CompressConfig conversion (eliminates L3 DRY violation)
+// Config → CompressConfig conversion
 // ---------------------------------------------------------------------------
 
 impl From<&Config> for CompressConfig {
@@ -38,6 +39,21 @@ impl From<&Config> for CompressConfig {
             primitive_array_min: c.primitive_array_min,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Named outcome struct for compress pipeline (L2)
+// ---------------------------------------------------------------------------
+
+/// Intermediate result derived from a `CompressDecision` for use in handlers.
+struct CompressOutcome {
+    output: String,
+    compressed: bool,
+    format_str: String,
+    shape_str: String,
+    output_bytes: usize,
+    savings_pct: f64,
+    pass_reason_str: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +88,9 @@ pub async fn handle_detect_format(
     params: DetectParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
 ) -> Result<DetectResult, McpError> {
-    let input = &params.input;
+    let input = params.input;
     let input_bytes = input.len();
 
     // Guard against oversized input before any allocation.
@@ -88,17 +105,50 @@ pub async fn handle_detect_format(
         ));
     }
 
-    let start = Instant::now();
-    let fmt = FormatDetector::detect(input);
+    // M1: Acquire concurrency permit before dispatching to spawn_blocking.
+    let _permit = semaphore
+        .try_acquire()
+        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
 
-    // Use core helpers — no csv import needed in the server layer.
-    let line_count = FormatDetector::jsonl_line_count(fmt, input);
-    let column_count = FormatDetector::column_count(fmt, input);
+    let event_id = Uuid::new_v4().to_string();
+
+    // M6: Emit event_id into tracing span for correlation with LogEvent.
+    let span = tracing::info_span!("detect_format", event_id = %event_id);
+    let _enter = span.enter();
+
+    // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
+    // performs a full serde_json::from_str and CSV allocation which must not
+    // run on the tokio executor.
+    let timeout = Duration::from_millis(config.pipeline_timeout_ms);
+    let start = Instant::now();
+    let (fmt, line_count, column_count) = tokio::time::timeout(timeout, async {
+        tokio::task::spawn_blocking(move || {
+            let fmt = FormatDetector::detect(&input);
+            let line_count = FormatDetector::jsonl_line_count(fmt, &input);
+            let column_count = FormatDetector::column_count(fmt, &input);
+            (fmt, line_count, column_count)
+        })
+        .await
+    })
+    .await
+    .map_err(|_| {
+        McpError::invalid_params(
+            format!(
+                "pipeline_timeout: detection did not complete within {}ms \
+                 (TOON_PIPELINE_TIMEOUT_MS)",
+                config.pipeline_timeout_ms
+            ),
+            None,
+        )
+    })?
+    // H2: JoinError from a panicking task is an internal server error, not a
+    // bad client request.
+    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
 
     let duration_us = start.elapsed().as_micros() as u64;
 
     let event = LogEvent {
-        event_id: Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
         ts_us: Utc::now().timestamp_micros(),
         tool_name: "detect_format".into(),
         input_format: fmt.as_str().into(),
@@ -163,15 +213,19 @@ pub struct CompressResult {
 }
 
 /// Handle the `compress_content` MCP tool.
-pub async fn handle_compress_content(
+///
+/// Returns both the (possibly compressed) output and the original input when
+/// passing through, by moving `input` into `spawn_blocking` and returning it
+/// together with the `CompressDecision`.
+pub(crate) async fn handle_compress_content_inner(
     params: CompressParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
 ) -> Result<CompressResult, McpError> {
     let input = params.input;
     let input_bytes = input.len();
 
-    // Guard against oversized input before any allocation.
     if input_bytes > config.max_input_bytes {
         return Err(McpError::invalid_params(
             format!(
@@ -183,17 +237,25 @@ pub async fn handle_compress_content(
         ));
     }
 
-    let compress_config = CompressConfig::from(config.as_ref());
+    let _permit = semaphore
+        .try_acquire()
+        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
 
-    // Run the compression pipeline with a per-call timeout.
+    let event_id = Uuid::new_v4().to_string();
+    let span = tracing::info_span!("compress_content", event_id = %event_id);
+    let _enter = span.enter();
+
+    let compress_config = CompressConfig::from(config.as_ref());
     let timeout = Duration::from_millis(config.pipeline_timeout_ms);
     let start = Instant::now();
-    let decision = tokio::time::timeout(timeout, async {
-        // Compressor::decide is synchronous; wrap in spawn_blocking so we
-        // do not hold the tokio thread for large inputs.
-        let input_clone = input.clone();
-        tokio::task::spawn_blocking(move || Compressor::decide(&input_clone, &compress_config))
-            .await
+
+    // L1: Return (input, decision) so input is available for pass-through output.
+    let (input, decision) = tokio::time::timeout(timeout, async {
+        tokio::task::spawn_blocking(move || {
+            let decision = Compressor::decide(&input, &compress_config);
+            (input, decision)
+        })
+        .await
     })
     .await
     .map_err(|_| {
@@ -206,22 +268,12 @@ pub async fn handle_compress_content(
             None,
         )
     })?
-    .map_err(|e| McpError::invalid_params(format!("spawn_blocking failed: {e}"), None))?;
+    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
 
     let duration_us = start.elapsed().as_micros() as u64;
 
-    // Derive structured fields from the decision.
-    // CompressDecision::Compressed now carries input_format and shape_class,
-    // eliminating the previous double-parse.
-    let (output, compressed, format_str, shape_str, output_bytes, savings_pct, pass_reason_str): (
-        String,
-        bool,
-        String,
-        String,
-        usize,
-        f64,
-        Option<String>,
-    ) = match &decision {
+    // L2 + H3: named struct, no second detect call.
+    let outcome = match &decision {
         CompressDecision::Compressed {
             toon,
             toon_bytes,
@@ -229,58 +281,57 @@ pub async fn handle_compress_content(
             input_format,
             shape_class,
             ..
-        } => (
-            toon.clone(),
-            true,
-            input_format.as_str().into(),
-            shape_class.as_str().into(),
-            *toon_bytes,
-            *savings_pct,
-            None,
-        ),
-        CompressDecision::PassedThrough { reason } => {
-            let fmt: String = FormatDetector::detect(&input).as_str().into();
-            let reason_str: String = reason.as_str().into();
-            (
-                input.clone(),
-                false,
-                fmt,
-                toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-                input_bytes,
-                0.0,
-                Some(reason_str),
-            )
-        }
+        } => CompressOutcome {
+            output: toon.clone(),
+            compressed: true,
+            format_str: input_format.as_str().into(),
+            shape_str: shape_class.as_str().into(),
+            output_bytes: *toon_bytes,
+            savings_pct: *savings_pct,
+            pass_reason_str: None,
+        },
+        CompressDecision::PassedThrough {
+            reason,
+            input_format,
+        } => CompressOutcome {
+            output: input.clone(),
+            compressed: false,
+            format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+            shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+            output_bytes: input_bytes,
+            savings_pct: 0.0,
+            pass_reason_str: Some(reason.as_str().into()),
+        },
     };
 
     let event = LogEvent {
-        event_id: Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
         ts_us: Utc::now().timestamp_micros(),
         tool_name: "compress_content".into(),
-        input_format: format_str.clone(),
-        shape_class: shape_str.clone(),
+        input_format: outcome.format_str.clone(),
+        shape_class: outcome.shape_str.clone(),
         input_bytes: input_bytes as u64,
-        output_bytes: output_bytes as u64,
-        compressed,
-        savings_pct,
+        output_bytes: outcome.output_bytes as u64,
+        compressed: outcome.compressed,
+        savings_pct: outcome.savings_pct,
         threshold_used: config.max_output_ratio,
         duration_us,
-        pass_reason: pass_reason_str.clone(),
+        pass_reason: outcome.pass_reason_str.clone(),
         client_hint: config.client_hint.clone(),
     };
 
     let _ = log_sink.record(event).await;
 
     Ok(CompressResult {
-        output,
-        compressed,
-        format: format_str,
-        shape_class: shape_str,
+        output: outcome.output,
+        compressed: outcome.compressed,
+        format: outcome.format_str,
+        shape_class: outcome.shape_str,
         input_bytes,
-        output_bytes,
-        savings_pct,
+        output_bytes: outcome.output_bytes,
+        savings_pct: outcome.savings_pct,
         duration_us,
-        pass_reason: pass_reason_str,
+        pass_reason: outcome.pass_reason_str,
     })
 }
 
@@ -326,11 +377,11 @@ pub async fn handle_compression_stats(
     params: StatsParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
 ) -> Result<StatsResult, McpError> {
     let input = params.input;
     let input_bytes = input.len();
 
-    // Guard against oversized input before any allocation.
     if input_bytes > config.max_input_bytes {
         return Err(McpError::invalid_params(
             format!(
@@ -342,14 +393,25 @@ pub async fn handle_compression_stats(
         ));
     }
 
-    let compress_config = CompressConfig::from(config.as_ref());
+    let _permit = semaphore
+        .try_acquire()
+        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
 
+    let event_id = Uuid::new_v4().to_string();
+    let span = tracing::info_span!("compression_stats", event_id = %event_id);
+    let _enter = span.enter();
+
+    let compress_config = CompressConfig::from(config.as_ref());
     let timeout = Duration::from_millis(config.pipeline_timeout_ms);
     let start = Instant::now();
-    let decision = tokio::time::timeout(timeout, async {
-        let input_clone = input.clone();
-        tokio::task::spawn_blocking(move || Compressor::decide(&input_clone, &compress_config))
-            .await
+
+    // L1: Return (input, decision) — no clone needed.
+    let (_input, decision) = tokio::time::timeout(timeout, async {
+        tokio::task::spawn_blocking(move || {
+            let decision = Compressor::decide(&input, &compress_config);
+            (input, decision)
+        })
+        .await
     })
     .await
     .map_err(|_| {
@@ -362,67 +424,68 @@ pub async fn handle_compression_stats(
             None,
         )
     })?
-    .map_err(|e| McpError::invalid_params(format!("spawn_blocking failed: {e}"), None))?;
+    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
 
     let duration_us = start.elapsed().as_micros() as u64;
 
-    // Derive format for pass-through paths where CompressDecision does not carry it.
-    let fmt = FormatDetector::detect(&input);
-
-    let (would_compress, shape_str, estimated_output_bytes, estimated_savings_pct, pass_reason_str):
-        (bool, String, usize, f64, Option<String>) =
-        match &decision {
-            CompressDecision::Compressed {
-                toon_bytes,
-                savings_pct,
-                shape_class,
-                ..
-            } => (
-                true,
-                shape_class.as_str().into(),
-                *toon_bytes,
-                *savings_pct,
-                None,
-            ),
-            CompressDecision::PassedThrough { reason } => {
-                let reason_str: String = reason.as_str().into();
-                (
-                    false,
-                    toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-                    input_bytes,
-                    0.0,
-                    Some(reason_str),
-                )
-            }
-        };
+    // L2 + H3: named struct, no second detect call.
+    let outcome = match &decision {
+        CompressDecision::Compressed {
+            toon_bytes,
+            savings_pct,
+            input_format,
+            shape_class,
+            ..
+        } => CompressOutcome {
+            output: String::new(), // not used for stats
+            compressed: true,
+            format_str: input_format.as_str().into(),
+            shape_str: shape_class.as_str().into(),
+            output_bytes: *toon_bytes,
+            savings_pct: *savings_pct,
+            pass_reason_str: None,
+        },
+        CompressDecision::PassedThrough {
+            reason,
+            input_format,
+        } => CompressOutcome {
+            output: String::new(),
+            compressed: false,
+            format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+            shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+            output_bytes: input_bytes,
+            savings_pct: 0.0,
+            pass_reason_str: Some(reason.as_str().into()),
+        },
+    };
 
     let event = LogEvent {
-        event_id: Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
         ts_us: Utc::now().timestamp_micros(),
         tool_name: "compression_stats".into(),
-        input_format: fmt.as_str().into(),
-        shape_class: shape_str.clone(),
+        input_format: outcome.format_str.clone(),
+        shape_class: outcome.shape_str.clone(),
         input_bytes: input_bytes as u64,
-        output_bytes: estimated_output_bytes as u64,
-        compressed: would_compress,
-        savings_pct: estimated_savings_pct,
+        output_bytes: outcome.output_bytes as u64,
+        compressed: outcome.compressed,
+        savings_pct: outcome.savings_pct,
         threshold_used: config.max_output_ratio,
         duration_us,
-        pass_reason: pass_reason_str.clone(),
+        pass_reason: outcome.pass_reason_str.clone(),
         client_hint: config.client_hint.clone(),
     };
 
     let _ = log_sink.record(event).await;
 
     Ok(StatsResult {
-        would_compress,
-        format: fmt.as_str().into(),
-        shape_class: shape_str,
+        would_compress: outcome.compressed,
+        format: outcome.format_str,
+        shape_class: outcome.shape_str,
         input_bytes,
-        estimated_output_bytes,
-        estimated_savings_pct,
+        estimated_output_bytes: outcome.output_bytes,
+        estimated_savings_pct: outcome.savings_pct,
         threshold: config.max_output_ratio,
-        pass_reason: pass_reason_str,
+        pass_reason: outcome.pass_reason_str,
     })
 }
 
@@ -448,10 +511,11 @@ mod tests {
             fold_min_depth: 3,
             primitive_array_min: 5,
             logging_enabled: false,
-            logging: toon_mcp_logging::ParquetSinkConfig::default(),
+            logging: toon_mcp_logging::JsonlSinkConfig::default(),
             log_level: "info".into(),
             client_hint: None,
             pipeline_timeout_ms: 30_000,
+            max_concurrent_calls: 8,
         })
     }
 
@@ -459,16 +523,23 @@ mod tests {
         Arc::new(NoopSink)
     }
 
+    fn test_semaphore(config: &Config) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(config.max_concurrent_calls))
+    }
+
     // --- detect_format ---
 
     #[tokio::test]
     async fn detect_format_json() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let result = handle_detect_format(
             DetectParams {
                 input: r#"{"key":"value"}"#.into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -480,12 +551,15 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_jsonl_has_line_count() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let result = handle_detect_format(
             DetectParams {
                 input: "{\"a\":1}\n{\"b\":2}\n{\"c\":3}".into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -496,12 +570,15 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_csv_has_column_count() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let result = handle_detect_format(
             DetectParams {
                 input: "id,name,score\n1,Alice,9.5".into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -512,12 +589,15 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_unknown() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let result = handle_detect_format(
             DetectParams {
                 input: "this is plain text".into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -526,16 +606,18 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_rejects_oversized_input() {
-        let config = Arc::new(Config {
+        let cfg = Arc::new(Config {
             max_input_bytes: 10,
             ..(*test_config()).clone()
         });
+        let sem = test_semaphore(&cfg);
         let result = handle_detect_format(
             DetectParams {
                 input: "x".repeat(100),
             },
-            config,
+            cfg,
             noop_sink(),
+            sem,
         )
         .await;
         assert!(result.is_err());
@@ -547,12 +629,15 @@ mod tests {
 
     #[tokio::test]
     async fn compress_below_threshold_passes_through() {
-        let result = handle_compress_content(
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let result = handle_compress_content_inner(
             CompressParams {
                 input: r#"{"x":1}"#.into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -563,16 +648,18 @@ mod tests {
 
     #[tokio::test]
     async fn compress_rejects_oversized_input() {
-        let config = Arc::new(Config {
+        let cfg = Arc::new(Config {
             max_input_bytes: 10,
             ..(*test_config()).clone()
         });
-        let result = handle_compress_content(
+        let sem = test_semaphore(&cfg);
+        let result = handle_compress_content_inner(
             CompressParams {
                 input: "x".repeat(100),
             },
-            config,
+            cfg,
             noop_sink(),
+            sem,
         )
         .await;
         assert!(result.is_err());
@@ -591,11 +678,12 @@ mod tests {
             .collect();
         let input = format!("[{}]", rows.join(","));
 
-        let config = Arc::new(Config {
+        let cfg = Arc::new(Config {
             max_output_ratio: 0.99,
             ..(*test_config()).clone()
         });
-        let result = handle_compress_content(CompressParams { input }, config, noop_sink())
+        let sem = test_semaphore(&cfg);
+        let result = handle_compress_content_inner(CompressParams { input }, cfg, noop_sink(), sem)
             .await
             .unwrap();
         assert!(result.compressed);
@@ -608,12 +696,15 @@ mod tests {
 
     #[tokio::test]
     async fn compression_stats_below_threshold() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let result = handle_compression_stats(
             StatsParams {
                 input: r#"{"x":1}"#.into(),
             },
-            test_config(),
+            cfg,
             noop_sink(),
+            sem,
         )
         .await
         .unwrap();
@@ -623,22 +714,24 @@ mod tests {
 
     #[tokio::test]
     async fn compression_stats_rejects_oversized_input() {
-        let config = Arc::new(Config {
+        let cfg = Arc::new(Config {
             max_input_bytes: 10,
             ..(*test_config()).clone()
         });
+        let sem = test_semaphore(&cfg);
         let result = handle_compression_stats(
             StatsParams {
                 input: "x".repeat(100),
             },
-            config,
+            cfg,
             noop_sink(),
+            sem,
         )
         .await;
         assert!(result.is_err());
     }
 
-    // --- MemorySink integration tests (M5) ---
+    // --- MemorySink integration tests ---
 
     fn memory_sink() -> (Arc<dyn LogSink>, Arc<Mutex<Vec<LogEvent>>>) {
         let (sink, events) = MemorySink::new();
@@ -647,13 +740,16 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_emits_correct_log_event() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let (sink, events) = memory_sink();
         handle_detect_format(
             DetectParams {
                 input: r#"{"key":"value"}"#.into(),
             },
-            test_config(),
+            cfg,
             sink,
+            sem,
         )
         .await
         .unwrap();
@@ -672,13 +768,16 @@ mod tests {
 
     #[tokio::test]
     async fn compress_content_emits_correct_log_event_on_pass_through() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let (sink, events) = memory_sink();
-        handle_compress_content(
+        handle_compress_content_inner(
             CompressParams {
                 input: r#"{"x":1}"#.into(),
             },
-            test_config(),
+            cfg,
             sink,
+            sem,
         )
         .await
         .unwrap();
@@ -705,12 +804,13 @@ mod tests {
             .collect();
         let input = format!("[{}]", rows.join(","));
 
-        let config = Arc::new(Config {
+        let cfg = Arc::new(Config {
             max_output_ratio: 0.99,
             ..(*test_config()).clone()
         });
+        let sem = test_semaphore(&cfg);
         let (sink, events) = memory_sink();
-        handle_compress_content(CompressParams { input }, config, sink)
+        handle_compress_content_inner(CompressParams { input }, cfg, sink, sem)
             .await
             .unwrap();
 
@@ -727,13 +827,16 @@ mod tests {
 
     #[tokio::test]
     async fn compression_stats_emits_correct_log_event() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         let (sink, events) = memory_sink();
         handle_compression_stats(
             StatsParams {
                 input: r#"{"x":1}"#.into(),
             },
-            test_config(),
+            cfg,
             sink,
+            sem,
         )
         .await
         .unwrap();
