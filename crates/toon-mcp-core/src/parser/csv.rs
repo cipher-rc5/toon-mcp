@@ -131,4 +131,43 @@ mod tests {
         assert_eq!(v[0]["tag"], "hello");
         assert_eq!(v[0]["value"], "world");
     }
+
+    // --- L6: edge-case tests ---
+
+    #[test]
+    fn header_only_csv_returns_empty_array() {
+        // A CSV with only a header row and no data rows should parse to an
+        // empty array (no records).
+        let input = "id,name,score";
+        let p = CsvParser::csv();
+        let v = p.parse(input).unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn csv_with_unicode_values_parses() {
+        let input = "name,city\nAlice,東京\nBob,大阪";
+        let p = CsvParser::csv();
+        let v = p.parse(input).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["city"], "東京");
+        assert_eq!(arr[1]["name"], "Bob");
+    }
+
+    #[test]
+    fn infinity_and_nan_fields_become_strings() {
+        // f64::INFINITY and f64::NAN cannot be represented as serde_json::Number,
+        // so the parser should fall back to a string for those fields.
+        let input = "x,y\ninf,nan\n1,2";
+        let p = CsvParser::csv();
+        let v = p.parse(input).unwrap();
+        let arr = v.as_array().unwrap();
+        // "inf" parses as f64::INFINITY which is non-finite, so becomes a String.
+        assert!(arr[0]["x"].is_string(), "inf should become a string");
+        // "nan" also parses as NaN which is non-finite.
+        assert!(arr[0]["y"].is_string(), "nan should become a string");
+        // Normal numeric fields still coerce.
+        assert!(arr[1]["x"].is_number());
+    }
 }

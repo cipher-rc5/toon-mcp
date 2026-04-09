@@ -298,4 +298,94 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
     }
+
+    // --- L5: detect_and_parse round-trip tests for JSONL, CSV, TSV ---
+
+    #[test]
+    fn detect_and_parse_jsonl_returns_array() {
+        let input = "{\"id\":1,\"name\":\"Alice\"}\n{\"id\":2,\"name\":\"Bob\"}";
+        let (fmt, val) = FormatDetector::detect_and_parse(input).unwrap();
+        assert_eq!(fmt, InputFormat::Jsonl);
+        let arr = val.as_array().expect("value must be an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], 1);
+        assert_eq!(arr[1]["name"], "Bob");
+    }
+
+    #[test]
+    fn detect_and_parse_csv_returns_array_of_objects() {
+        let input = "id,name,score\n1,Alice,9.5\n2,Bob,8.0";
+        let (fmt, val) = FormatDetector::detect_and_parse(input).unwrap();
+        assert_eq!(fmt, InputFormat::Csv);
+        let arr = val.as_array().expect("value must be an array");
+        assert_eq!(arr.len(), 2);
+        // Numeric coercion: id should be a number.
+        assert!(
+            arr[0]["id"].is_number(),
+            "id should be numeric after coercion"
+        );
+        assert_eq!(arr[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn detect_and_parse_tsv_returns_array_of_objects() {
+        let input = "id\tname\tscore\n1\tAlice\t9.5\n2\tBob\t8.0";
+        let (fmt, val) = FormatDetector::detect_and_parse(input).unwrap();
+        assert_eq!(fmt, InputFormat::Tsv);
+        let arr = val.as_array().expect("value must be an array");
+        assert_eq!(arr.len(), 2);
+        assert!(
+            arr[0]["id"].is_number(),
+            "id should be numeric after coercion"
+        );
+        assert_eq!(arr[1]["name"], "Bob");
+    }
+
+    // --- L6: edge-case tests ---
+
+    #[test]
+    fn detect_empty_string_is_unknown() {
+        assert_eq!(FormatDetector::detect(""), InputFormat::Unknown);
+    }
+
+    #[test]
+    fn detect_whitespace_only_is_unknown() {
+        assert_eq!(FormatDetector::detect("   \t\n  "), InputFormat::Unknown);
+    }
+
+    #[test]
+    fn detect_single_jsonl_line_is_not_jsonl() {
+        // JSONL requires at least two non-empty lines.
+        let input = r#"{"id":1}"#;
+        // A single JSON object is detected as JSON, not JSONL.
+        assert_eq!(FormatDetector::detect(input), InputFormat::Json);
+    }
+
+    #[test]
+    fn detect_csv_header_only_is_not_csv() {
+        // A single-row CSV has no data rows — column count probe fails.
+        let input = "id,name,score";
+        // With no data row the probe returns false (only headers, no record).
+        // It should fall through to Unknown.
+        let fmt = FormatDetector::detect(input);
+        assert_ne!(fmt, InputFormat::Csv, "single header row should not be Csv");
+    }
+
+    #[test]
+    fn detect_unicode_json() {
+        let input = r#"{"name":"日本語","value":42}"#;
+        assert_eq!(FormatDetector::detect(input), InputFormat::Json);
+    }
+
+    #[test]
+    fn detect_unicode_jsonl() {
+        let input = "{\"city\":\"Tōkyō\"}\n{\"city\":\"Ōsaka\"}";
+        assert_eq!(FormatDetector::detect(input), InputFormat::Jsonl);
+    }
+
+    #[test]
+    fn detect_csv_with_unicode_fields() {
+        let input = "name,city\nAlice,東京\nBob,大阪";
+        assert_eq!(FormatDetector::detect(input), InputFormat::Csv);
+    }
 }

@@ -1,8 +1,11 @@
 // file: crates/toon-mcp-core/src/parser/mod.rs
 // description: Parser trait definition shared by all format-specific parsers
 
+/// CSV and TSV parser.
 pub mod csv;
+/// JSON parser.
 pub mod json;
+/// JSONL (newline-delimited JSON) parser.
 pub mod jsonl;
 
 use crate::error::CoreError;

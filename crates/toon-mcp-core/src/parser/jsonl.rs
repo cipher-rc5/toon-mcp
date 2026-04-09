@@ -102,4 +102,30 @@ not json
         let v = p.parse(input).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2);
     }
+
+    // --- L6: edge-case tests ---
+
+    #[test]
+    fn empty_input_returns_empty_array() {
+        let p = JsonlParser;
+        let v = p.parse("").unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_returns_empty_array() {
+        let p = JsonlParser;
+        let v = p.parse("   \n\t\n  ").unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unicode_field_names_and_values_parse() {
+        let input = "{\"名前\":\"太郎\"}\n{\"名前\":\"花子\"}";
+        let p = JsonlParser;
+        let v = p.parse(input).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["名前"], "太郎");
+    }
 }
