@@ -61,7 +61,7 @@ Async event recording. Decoupled from the core pipeline via the `LogSink` trait 
 |---|---|
 | `sink.rs` | `LogSink` async trait |
 | `event.rs` | `LogEvent` struct (all fields flat, all serializable) |
-| `parquet_sink.rs` | Production sink: buffers events in memory, flushes to hive-partitioned JSONL via `spawn_blocking` |
+| `jsonl_sink.rs` | Production sink: buffers events in memory, flushes to hive-partitioned JSONL via `spawn_blocking`; holds file handles open between flushes |
 | `memory_sink.rs` | Test sink: accumulates events in a `Vec` behind `Arc<Mutex<>>` |
 | `noop_sink.rs` | Zero-cost sink for benchmarks or disabled logging |
 | `error.rs` | `LogError` |
@@ -92,7 +92,7 @@ sequenceDiagram
     participant Server as toon-mcp-server<br/>(stdio JSON-RPC)
     participant Handler as handler.rs
     participant Core as toon-mcp-core
-    participant Sink as ParquetSink<br/>(background task)
+    participant Sink as JsonlSink<br/>(background task)
 
     Client->>Server: tools/call { name, params }
     Server->>Handler: dispatch via tool_router
@@ -144,11 +144,11 @@ flowchart TD
     EnvVars["Shell environment<br/>TOON_* vars"] --> Dotenvy
     Dotenvy --> Config["Config::load()"]
     Config --> CompressConfig["CompressConfig<br/>(passed to Compressor)"]
-    Config --> ParquetSinkConfig["ParquetSinkConfig<br/>(passed to ParquetSink)"]
+    Config --> JsonlSinkConfig["JsonlSinkConfig<br/>(passed to JsonlSink)"]
     Config --> LogEnabled{"logging_enabled?"}
-    LogEnabled -- yes --> ParquetSink["ParquetSink::new()\n+ spawn background task"]
+    LogEnabled -- yes --> JsonlSink["JsonlSink::new()\n+ spawn background task"]
     LogEnabled -- no --> NoopSink["NoopSink"]
-    ParquetSink --> ArcSink["Arc&lt;dyn LogSink&gt;"]
+    JsonlSink --> ArcSink["Arc&lt;dyn LogSink&gt;"]
     NoopSink --> ArcSink
     ArcSink --> ToonMcpServer["ToonMcpServer { config, log_sink }"]
 ```
@@ -163,7 +163,7 @@ The logging subsystem is intentionally decoupled from the tool pipeline via the 
 graph TD
     Handler["handler.rs<br/>(tool handlers)"]
     Trait["LogSink trait<br/>(async_trait)"]
-    Parquet["ParquetSink<br/>(mpsc channel)"]
+    Parquet["JsonlSink<br/>(mpsc channel)"]
     Memory["MemorySink<br/>(Arc Mutex Vec)"]
     Noop["NoopSink<br/>(drop events)"]
     Writer["writer_task<br/>(background Tokio task)"]
@@ -177,7 +177,7 @@ graph TD
     Writer --> FS
 ```
 
-The `ParquetSink` channel pattern means the `duckdb::Connection` (in the future) or file handles live exclusively on the background `writer_task` — they are never shared across threads, eliminating the need for `Arc<Mutex<Handle>>`.
+The `JsonlSink` channel pattern means file handles live exclusively on the background `writer_task` — they are never shared across threads, eliminating the need for `Arc<Mutex<Handle>>`.
 
 For full details, see [logging.md](logging.md).
 
@@ -203,11 +203,11 @@ Handlers accept `Arc<dyn LogSink>` rather than a concrete sink type. This makes 
 
 - Use `MemorySink` in unit tests to assert event fields
 - Use `NoopSink` in benchmarks to eliminate I/O overhead from measurements
-- Swap in a future `DuckDbSink` without touching handler code
+- Swap in a future alternative sink without touching handler code
 
 ### 4. Single Background Writer Task
 
-Rather than `Arc<Mutex<Connection>>` (which would require holding a mutex guard across `await` points, violating Rust's borrow rules), `ParquetSink` sends events over an `mpsc` channel to a single Tokio task that exclusively owns all I/O resources. This pattern:
+Rather than `Arc<Mutex<File>>` (which would require holding a mutex guard across `await` points, violating Rust's borrow rules), `JsonlSink` sends events over an `mpsc` channel to a single Tokio task that exclusively owns all file handles. This pattern:
 
 - Eliminates lock contention
 - Avoids `MutexGuard` held across `.await`

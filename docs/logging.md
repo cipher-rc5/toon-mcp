@@ -10,7 +10,7 @@ toon-mcp records a structured `LogEvent` for every tool invocation. Events are w
 flowchart TD
     Handler["tool handler\n(compress_content, detect_format, etc.)"]
     Trait["Arc&lt;dyn LogSink&gt;\n(fire-and-forget)"]
-    ParquetSink["ParquetSink\n(mpsc::Sender&lt;SinkCmd&gt;)"]
+    JsonlSink["JsonlSink\n(mpsc::Sender&lt;SinkCmd&gt;)"]
     Channel["tokio mpsc channel"]
     WriterTask["writer_task\n(background Tokio task)"]
     Buffer["in-memory Vec&lt;LogEvent&gt;"]
@@ -19,8 +19,8 @@ flowchart TD
     JSONL["data/logs/\nday=YYYY-MM-DD/\nevents.jsonl"]
 
     Handler -- "record(event).await" --> Trait
-    Trait --> ParquetSink
-    ParquetSink -- "SinkCmd::Record" --> Channel
+    Trait --> JsonlSink
+    JsonlSink -- "SinkCmd::Record" --> Channel
     Channel --> WriterTask
     WriterTask --> Buffer
     Buffer --> FlushTrigger
@@ -51,7 +51,7 @@ Handlers call `record` with fire-and-forget semantics — the returned `Result` 
 
 | Sink | Use case |
 |---|---|
-| `ParquetSink` | Production — writes hive-partitioned JSONL to `TOON_LOG_DIR` |
+| `JsonlSink` | Production — writes hive-partitioned JSONL to `TOON_LOG_DIR` |
 | `MemorySink` | Unit tests — accumulates events in `Arc<Mutex<Vec<LogEvent>>>` for assertion |
 | `NoopSink` | Benchmarks or disabled logging — drops all events immediately |
 
@@ -60,9 +60,9 @@ The server selects the sink at startup based on `TOON_LOG_ENABLED`:
 ```mermaid
 flowchart LR
     LogEnabled{"TOON_LOG_ENABLED?"}
-    LogEnabled -- true --> ParquetSink["ParquetSink::new(config)\n+ tokio::spawn(writer_task)"]
+    LogEnabled -- true --> JsonlSink["JsonlSink::new(config)\n+ tokio::spawn(writer_task)"]
     LogEnabled -- false --> NoopSink["NoopSink"]
-    ParquetSink --> Arc["Arc&lt;dyn LogSink&gt;"]
+    JsonlSink --> Arc["Arc&lt;dyn LogSink&gt;"]
     NoopSink --> Arc
 ```
 
@@ -102,13 +102,13 @@ Every tool invocation produces one `LogEvent` with the following fields:
 
 ---
 
-## ParquetSink Internals
+## JsonlSink Internals
 
-**Source:** `crates/toon-mcp-logging/src/parquet_sink.rs`
+**Source:** `crates/toon-mcp-logging/src/jsonl_sink.rs`
 
 ### Command Channel
 
-`ParquetSink` holds only an `mpsc::Sender<SinkCmd>`. The actual file handles live on the background `writer_task`. This eliminates the need for `Arc<Mutex<FileHandle>>` and ensures I/O resources are never shared across tasks.
+`JsonlSink` holds only an `mpsc::Sender<SinkCmd>`. The actual file handles live on the background `writer_task`. This eliminates the need for `Arc<Mutex<FileHandle>>` and ensures I/O resources are never shared across tasks.
 
 ```rust
 enum SinkCmd {

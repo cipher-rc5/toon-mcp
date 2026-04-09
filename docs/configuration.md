@@ -197,7 +197,7 @@ pub struct Config {
     pub fold_min_depth: usize,
     pub primitive_array_min: usize,
     pub logging_enabled: bool,
-    pub logging: ParquetSinkConfig,
+    pub logging: JsonlSinkConfig,
     pub log_level: String,
     pub client_hint: Option<String>,
 }
