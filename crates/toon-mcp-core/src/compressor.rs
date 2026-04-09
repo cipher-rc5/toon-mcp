@@ -143,6 +143,10 @@ pub enum CompressDecision {
     PassedThrough {
         /// The reason compression was skipped.
         reason: PassThroughReason,
+        /// The detected input format, if detection ran before the pass-through
+        /// decision was made.  `None` when detection was skipped (e.g.
+        /// `BelowMinBytes` or `InputExceedsLimit`).
+        input_format: Option<InputFormat>,
     },
 }
 
@@ -169,14 +173,14 @@ impl Compressor {
     /// let config = CompressConfig::default();
     /// assert!(matches!(
     ///     Compressor::decide(short, &config),
-    ///     CompressDecision::PassedThrough { reason: PassThroughReason::BelowMinBytes }
+    ///     CompressDecision::PassedThrough { reason: PassThroughReason::BelowMinBytes, .. }
     /// ));
     ///
     /// // Unknown/prose input is passed through as UnknownFormat.
     /// let prose = "a".repeat(300);
     /// assert!(matches!(
     ///     Compressor::decide(&prose, &config),
-    ///     CompressDecision::PassedThrough { reason: PassThroughReason::UnknownFormat }
+    ///     CompressDecision::PassedThrough { reason: PassThroughReason::UnknownFormat, .. }
     /// ));
     ///
     /// // Oversized input is rejected before any allocation.
@@ -184,7 +188,7 @@ impl Compressor {
     /// let tiny_limit = CompressConfig { max_input_bytes: 10, ..CompressConfig::default() };
     /// assert!(matches!(
     ///     Compressor::decide(&huge, &tiny_limit),
-    ///     CompressDecision::PassedThrough { reason: PassThroughReason::InputExceedsLimit { .. } }
+    ///     CompressDecision::PassedThrough { reason: PassThroughReason::InputExceedsLimit { .. }, .. }
     /// ));
     /// ```
     pub fn decide(input: &str, config: &CompressConfig) -> CompressDecision {
@@ -197,6 +201,7 @@ impl Compressor {
                     actual: original_bytes,
                     limit: config.max_input_bytes,
                 },
+                input_format: None,
             };
         }
 
@@ -204,6 +209,7 @@ impl Compressor {
         if original_bytes < config.min_bytes {
             return CompressDecision::PassedThrough {
                 reason: PassThroughReason::BelowMinBytes,
+                input_format: None,
             };
         }
 
@@ -214,10 +220,12 @@ impl Compressor {
                 if format == InputFormat::Unknown {
                     return CompressDecision::PassedThrough {
                         reason: PassThroughReason::UnknownFormat,
+                        input_format: Some(InputFormat::Unknown),
                     };
                 }
                 return CompressDecision::PassedThrough {
                     reason: PassThroughReason::ParseFailed { format, detail },
+                    input_format: Some(format),
                 };
             }
             Err(e) => {
@@ -227,6 +235,7 @@ impl Compressor {
                         format: InputFormat::Unknown,
                         detail: e.to_string(),
                     },
+                    input_format: Some(InputFormat::Unknown),
                 };
             }
         };
@@ -241,6 +250,7 @@ impl Compressor {
         if shape == ShapeClass::PassThrough {
             return CompressDecision::PassedThrough {
                 reason: PassThroughReason::ShapeNotBeneficial,
+                input_format: Some(fmt),
             };
         }
 
@@ -262,6 +272,7 @@ impl Compressor {
                         format: InputFormat::Unknown,
                         detail: e.to_string(),
                     },
+                    input_format: Some(fmt),
                 };
             }
         };
@@ -278,6 +289,7 @@ impl Compressor {
                     output_ratio,
                     max_output_ratio: config.max_output_ratio,
                 },
+                input_format: Some(fmt),
             };
         }
 
@@ -344,6 +356,7 @@ mod tests {
                         actual: 100,
                         limit: 50,
                     },
+                ..
             } => {}
             other => panic!("expected InputExceedsLimit, got {other:?}"),
         }
@@ -356,6 +369,7 @@ mod tests {
         match Compressor::decide(input, &config) {
             CompressDecision::PassedThrough {
                 reason: PassThroughReason::BelowMinBytes,
+                ..
             } => {}
             other => panic!("expected BelowMinBytes, got {other:?}"),
         }
@@ -368,6 +382,7 @@ mod tests {
         match Compressor::decide(&input, &config) {
             CompressDecision::PassedThrough {
                 reason: PassThroughReason::UnknownFormat,
+                ..
             } => {}
             other => panic!("expected UnknownFormat, got {other:?}"),
         }
@@ -408,7 +423,7 @@ mod tests {
                 assert_eq!(input_format, InputFormat::Json);
                 assert_eq!(shape_class, ShapeClass::Tabular);
             }
-            CompressDecision::PassedThrough { reason } => {
+            CompressDecision::PassedThrough { reason, .. } => {
                 panic!("expected Compressed, got PassedThrough({reason:?})");
             }
         }
@@ -431,7 +446,7 @@ mod tests {
                 assert_eq!(input_format, InputFormat::Jsonl);
                 assert_eq!(shape_class, ShapeClass::Tabular);
             }
-            CompressDecision::PassedThrough { reason } => {
+            CompressDecision::PassedThrough { reason, .. } => {
                 panic!("expected Compressed, got PassedThrough({reason:?})");
             }
         }
@@ -459,6 +474,7 @@ mod tests {
             }
             CompressDecision::PassedThrough {
                 reason: PassThroughReason::InsufficientSavings { .. },
+                ..
             } => {}
             other => {
                 panic!("unexpected decision: {other:?}");
@@ -477,6 +493,7 @@ mod tests {
         match Compressor::decide(&input, &config) {
             CompressDecision::PassedThrough {
                 reason: PassThroughReason::InsufficientSavings { .. },
+                ..
             } => {}
             other => panic!("expected InsufficientSavings, got {other:?}"),
         }
