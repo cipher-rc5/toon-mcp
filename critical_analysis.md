@@ -1,440 +1,462 @@
-# toon-mcp — Critical Technical Analysis
+# toon-mcp — Critical Production Readiness Analysis
 
-**Date:** 2026-04-08
-**Scope:** Full workspace (toon-mcp-core, toon-mcp-logging, toon-mcp-server, toon-mcp-bench)
-**Build status:** Passes `cargo build`, `cargo test --workspace`, `cargo clippy -- -D warnings`, `cargo fmt --check`
+**Score: 5.5 / 10**
 
----
-
-## Production Readiness Score: 4 / 10 (original) → 8 / 10 (post-remediation)
-
-> **Note:** All findings in this document have been addressed. The score below
-> reflects the state at the time of analysis. See `improvements.md` for the
-> remediation checklist and git history for the implementation.
-
-The codebase is well-structured and architecturally sound for a pre-alpha prototype. The layering rules are enforced, the code compiles clean, and the tests pass. However, a substantial number of correctness issues, missing operational requirements, documentation inconsistencies, and absent safety guarantees prevent it from being deployed in any production or user-facing context without significant additional work.
+**Reviewer context:** Full static analysis of all Rust source files, CI
+configuration, documentation, and test suite. `cargo check`, `cargo clippy
+-- -D warnings`, `cargo test --workspace`, and `cargo build --release` were
+all run and passed cleanly. Issues below are architectural, operational, and
+safety concerns — not compilation errors.
 
 ---
 
-## Summary of Findings
+## Executive Summary
 
-| Severity | Count |
-|---|---|
-| Critical | 5 |
-| High | 8 |
-| Medium | 9 |
-| Low | 7 |
-
----
-
-## Critical Issues
-
-### C1 — No input size limit: unbounded memory allocation and potential OOM
-
-**Location:** `crates/toon-mcp-server/src/handler.rs` — all three handlers
-
-There is no upper bound on `params.input`. An MCP client (or adversary with stdio access) can send an arbitrarily large string. The pipeline will attempt to parse it entirely into memory as `serde_json::Value`, hold a clone for re-detection, and then allocate the TOON-encoded output. For a 500 MB payload this means multiple gigabyte allocations on a single tool call. The server has no rejection mechanism.
-
-**Impact:** Out-of-memory crash, server restart loop, or host OS swap exhaustion. A single malicious or buggy client call brings down the server.
-
-**No mitigation exists anywhere in the codebase.**
+The codebase is a disciplined, well-structured Rust workspace at the prototype
+stage. Architectural separation of concerns is correct: a pure core library,
+a decoupled logging layer, and a thin server binary. The code style is
+consistent, doc coverage is solid, and the test suite passes with zero
+failures. However, several categories of concern prevent production deployment:
+the primary logging backend is a JSONL file writer instead of the planned
+DuckDB-backed sink, the `detect_format` handler exposes an unprotected
+synchronous code path on the async executor, the shutdown sequence is
+unreliable, there are no integration or end-to-end tests of the MCP transport
+layer, and observability is minimal. The score reflects a well-engineered
+prototype that has not yet crossed the gap to a deployable, operable service.
 
 ---
 
-### C2 — Threshold logic is inverted relative to its documentation
+## Category Scores
 
-**Location:** `crates/toon-mcp-core/src/compressor.rs:222`
+| Category | Score | Weight |
+|---|---|---|
+| Architecture and layering | 8 / 10 | High |
+| Error handling and correctness | 6 / 10 | High |
+| Operational safety (shutdown, signals) | 4 / 10 | High |
+| Test coverage and quality | 5 / 10 | High |
+| Observability and debuggability | 4 / 10 | Medium |
+| Security and input validation | 6 / 10 | Medium |
+| Performance and concurrency | 6 / 10 | Medium |
+| CI/CD and release pipeline | 5 / 10 | Medium |
+| Documentation | 8 / 10 | Low |
+| Dependency management | 8 / 10 | Low |
+
+---
+
+## Critical Issues (Blockers)
+
+### C1 — `detect_format` runs blocking I/O on the tokio executor
+
+**File:** `crates/toon-mcp-server/src/handler.rs:91-93`
+
+`handle_compress_content` and `handle_compression_stats` correctly wrap
+`Compressor::decide` in `tokio::task::spawn_blocking`. `handle_detect_format`
+does not. `FormatDetector::detect` calls `serde_json::from_str` (full document
+parse), CSV reader allocation, and multiple string scans directly on the
+async executor thread. For large inputs this will starve the tokio runtime
+of its worker threads. The AGENTS.md rule "Never call blocking I/O on the
+tokio executor" is violated.
 
 ```rust
-// Actual code
-if savings_pct < (1.0 - config.threshold) {
-    return CompressDecision::PassedThrough { ... };
+// handler.rs:92 — runs synchronously on the executor, no spawn_blocking
+let fmt = FormatDetector::detect(input);
+```
+
+**Impact:** Under concurrent load, a single large detect call can block all
+other inflight requests. Production: high severity.
+
+---
+
+### C2 — Shutdown sequence does not guarantee log flush
+
+**File:** `crates/toon-mcp-server/src/main.rs:66-79`
+
+The shutdown path calls `sink.flush()` (which sends `SinkCmd::Flush` over the
+mpsc channel) then `drop(sink)` then `tokio::time::sleep(200ms)`. This is
+fragile for three reasons:
+
+1. `flush()` is non-consuming — it sends a Flush command but does not wait for
+   the writer task to acknowledge completion. The actual I/O may not have
+   finished when the program continues.
+2. The 200 ms sleep is an arbitrary race condition. If the writer task is slow
+   (e.g., filesystem pressure), events are silently lost.
+3. `Box::new(sink).shutdown()` exists on the `LogSink` trait and returns an
+   ack channel confirming the flush completed, but it is never called. The
+   correct shutdown is to call `shutdown()` on the boxed sink, which blocks
+   until the writer task drains and acknowledges.
+
+**Impact:** Log events from the last flush interval before exit are silently
+dropped every time the server shuts down.
+
+---
+
+### C3 — No SIGTERM / SIGINT handler; stdio closure is the only shutdown path
+
+**File:** `crates/toon-mcp-server/src/main.rs`
+
+The server only terminates cleanly when the MCP client closes the stdin pipe.
+There is no `tokio::signal::ctrl_c()` or `tokio::signal::unix::signal(SIGTERM)`
+handler. When deployed as a system service (systemd, launchd, Docker) a
+SIGTERM is sent before SIGKILL. Without handling it, the process is killed
+without flushing the log sink, and the writer task is aborted mid-write,
+potentially corrupting the JSONL partition file.
+
+**Impact:** Production deployments via any process supervisor will lose log
+events and may write partial JSONL lines on every restart.
+
+---
+
+### C4 — `ParquetSink::flush()` does not confirm write completion
+
+**File:** `crates/toon-mcp-logging/src/parquet_sink.rs:103-108`
+
+`flush()` sends `SinkCmd::Flush` over the channel and returns immediately. It
+does not wait for the writer task to complete the disk write. This means callers
+(including the shutdown path in `main.rs`) get a successful `Ok(())` before any
+data has actually reached disk.
+
+```rust
+async fn flush(&self) -> Result<(), LogError> {
+    self.sender
+        .send(SinkCmd::Flush)  // fire-and-forget — no ack
+        .await
+        .map_err(|e| LogError::ChannelSend(e.to_string()))
 }
 ```
 
-`TOON_COMPRESSION_THRESHOLD = 0.85` (the default) means the savings check passes when `savings_pct >= 0.15`, i.e., when the output is at most 85% of the input. But the field doc comment on `CompressConfig::threshold` says:
+Compare with `shutdown()`, which correctly uses a `oneshot::Sender` for
+acknowledgement. `flush()` should do the same.
 
-> "Encode only when `toon_bytes < input_bytes * threshold`"
-
-These are not equivalent:
-- The doc says: compress when `toon_bytes < input_bytes * 0.85` → accept if output is < 85% of input → savings > 15% ✓
-- The code says: compress when `savings_pct >= (1.0 - 0.85)` = `savings_pct >= 0.15` → savings > 15% ✓
-
-The check is numerically equivalent, but the semantic description in `docs/architecture.md` and `docs/configuration.md` is internally contradictory. The configuration reference (`docs/configuration.md:27`) states:
-
-> "Maximum fraction of the original byte count that the TOON output may occupy."
-
-While `docs/architecture.md:222` shows the opposite sign convention. A `threshold=1.0` would require zero savings (`savings_pct >= 0.0`), meaning any positive compression passes — but the configuration doc example says `threshold=1.0` is "pass through unless TOON output is strictly smaller than input", which is the same semantics but described as "useful for testing the encoding path." This double-inversion makes the threshold non-intuitive to configure and is a latent operator error source.
-
-**Impact:** Misconfigured deployments. Operators setting `threshold=0.5` expecting "only compress if 50% savings" will instead get "compress if any savings exist." This is a user-facing correctness issue.
+**Impact:** `flush()` is semantically broken as an acknowledged operation.
+The main.rs flush timeout will always succeed immediately, not after data
+is durable.
 
 ---
 
-### C3 — Double parse on every successful compression: correctness risk and wasted work
+### C5 — DuckDB sink was planned but never implemented; AGENTS.md still references it
 
-**Location:** `crates/toon-mcp-server/src/handler.rs:189-195` and `handler.rs:323-326`
+**File:** `AGENTS.md:103`, `docs/architecture.md:180`, `docs/initial_plan.md`
 
-For both `compress_content` and `compression_stats`, when compression succeeds, the handler re-calls `FormatDetector::detect_and_parse` on the original input to extract `format` and `shape_class` for the response and log event:
+The `AGENTS.md` External Reference Corpus lists `duckdb` under "Any work on
+`duckdb_sink.rs`", and `architecture.md` describes the `DuckDbSink` as a
+future replacement for the JSONL writer. The planned structured storage with
+queryable Parquet output was scoped to the initial plan but was never
+implemented. The production logging layer is the `ParquetSink`, which despite
+its name writes JSONL files, not Parquet. The sink name is misleading and the
+AGENTS.md references a non-existent file, which will cause confusion for future
+contributors.
 
-```rust
-// CompressDecision does not expose fmt or shape, so we re-detect
-let fmt: String = FormatDetector::detect(&input).as_str().into();
-let shape: String = match toon_mcp_core::detector::FormatDetector::detect_and_parse(&input) {
-    Ok((_, val)) => Classifier::classify(&val).as_str().into(),
-    Err(_) => ShapeClass::PassThrough.as_str().into(),
-};
-```
-
-This is a double-parse of the full document on every successful compression call. For a 1 MB JSON payload, this is two full serde_json deserializations plus one full classification walk. The comment acknowledges this ("cheap — value already parsed inside Compressor") but the actual cost is O(N) parsing, not O(1) lookup.
-
-More critically, the `CompressDecision::Compressed` variant does not expose the detected `InputFormat` or classified `ShapeClass`. Because the handler must re-detect independently, there is a theoretical TOCTOU window: if the input contains non-deterministic content (currently impossible with pure functions, but a design smell), the format in the log could differ from the format used to encode.
-
-**Impact:** 2x CPU and memory cost on the hot path. Structural design flaw that the `CompressDecision` type should carry format and shape.
-
----
-
-### C4 — `ParquetSink` writer task panic is silently swallowed; events are lost without caller awareness
-
-**Location:** `crates/toon-mcp-logging/src/parquet_sink.rs:121` (`writer_task`)
-
-If `writer_task` panics (e.g., `spawn_blocking` itself panics), the `mpsc::Receiver` is dropped. Subsequent `record()` calls return `LogError::ChannelSend`. But the handlers unconditionally fire-and-forget: `let _ = log_sink.record(event).await;`. There is no recovery path, no alert, and no way for the operator to know that logging silently stopped.
-
-Furthermore, `tokio::spawn(task)` in `main.rs:32` does not attach a `.expect()` or any join handle monitoring. If the writer task exits unexpectedly mid-session, the server keeps serving tool calls while silently dropping all log events with no operator signal.
-
-**Impact:** Silent data loss. An operator relying on event logs for compliance, billing, or analytics will receive a truncated log with no error indicator.
-
----
-
-### C5 — Committed runtime artifact in source tree: `data/1774347477_evaluation.jsonl`
-
-**Location:** `data/1774347477_evaluation.jsonl` (2,053 lines)
-
-A 2,053-line JSONL evaluation file containing real prediction data (`btc_price`, `predicted_direction`, `actual_winner`, `confidence`, `model_version`) is committed to the repository. This is not a test fixture — it is a runtime artifact from an unrelated trading/evaluation system. The data includes:
-
-- Unix timestamps
-- BTC price data
-- Confidence scores and directional predictions
-- Model version identifiers
-
-This file has no relationship to the toon-mcp codebase and should not exist in the repository. It may contain proprietary model evaluation data.
-
-**Impact:** Data leakage, repository pollution, confused consumers of the repo. Violates the principle that only reproducible build inputs belong in source control.
+**Impact:** The name "ParquetSink" is wrong (it writes JSONL). Documentation
+references a dead code path. Future contributors will waste time looking for
+`duckdb_sink.rs`.
 
 ---
 
 ## High Severity Issues
 
-### H1 — No graceful shutdown: buffered log events are lost on SIGTERM/process exit
+### H1 — Silent event corruption on serialization failure in flush_pending
 
-**Location:** `crates/toon-mcp-server/src/main.rs:44`
+**File:** `crates/toon-mcp-logging/src/parquet_sink.rs:202`
 
-```rust
-service.waiting().await?;
-info!("toon-mcp-server shutting down");
-Ok(())
-```
-
-After `service.waiting()` returns (client disconnects or stdin closes), `main` immediately returns. The `ParquetSink` background task is still running with unflushed events in its buffer. Tokio drops all non-awaited tasks on runtime shutdown. The `shutdown()` method on `ParquetSink` is never called from `main.rs`.
-
-**Impact:** Up to `TOON_LOG_BUFFER_SIZE` (default: 1,000) events are silently dropped on every clean server exit.
-
----
-
-### H2 — `Config::load()` silently ignores invalid environment variable values with no tracing output
-
-**Location:** `crates/toon-mcp-server/src/config.rs:95-130`
-
-All `env_*` helpers use `.and_then(|v| v.parse().ok()).unwrap_or(default)` — parse failures silently fall through to the default. The `docs/configuration.md` claims:
-
-> "Config::load() does not panic on invalid values — it logs a tracing::warn! and substitutes the default."
-
-But the implementation emits no `tracing::warn!`. Invalid values like `TOON_MIN_BYTES=abc` are silently ignored. An operator who typo'd a variable will have no indication that their configuration was rejected and the default is being used.
-
-**Impact:** Misconfiguration silently ignored. The documentation is incorrect and the behavior is operationally dangerous.
-
----
-
-### H3 — No rate limiting or per-call timeout: a slow client blocks the tool handler indefinitely
-
-**Location:** `crates/toon-mcp-server/src/handler.rs`
-
-The compression pipeline is synchronous and unbounded in execution time (bound only by input size). There is no `tokio::time::timeout` wrapping the `Compressor::decide` call or the log sink `record` call. A sufficiently large input will hold the handler thread for seconds.
-
-Since rmcp uses the stdio transport sequentially, a single hung handler blocks all subsequent tool calls on that session.
-
-**Impact:** Denial of service on large inputs; client timeout mismatches.
-
----
-
-### H4 — `day_partition_key` uses deprecated `DateTime::from_timestamp`
-
-**Location:** `crates/toon-mcp-logging/src/parquet_sink.rs:234`
+When `serde_json::to_string(event)` fails during a flush, the event is silently
+replaced with `"{}"`. This means a corrupted `LogEvent` writes a valid but
+empty JSON object to disk, making the failure invisible in both the logs and
+any downstream DuckDB query.
 
 ```rust
-let dt = DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(|| {
-    DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is a valid timestamp")
-});
+.map(|e| serde_json::to_string(e).unwrap_or_else(|_| "{}".into()))
 ```
 
-`DateTime::from_timestamp` was deprecated in chrono 0.4.27 in favour of `DateTime::from_timestamp` → `DateTime::from_timestamp` → `DateTime::from_timestamp` (the API changed). The current chrono 0.4 series emits a deprecation warning for this function. The workspace Cargo.toml pins `chrono = "0.4"` without an exact patch version, meaning this deprecation will become a compile error when the crate is eventually updated to chrono 0.5.
+`LogEvent` only contains primitive types and `Option<String>` fields; in
+practice serialization cannot fail. But the silent replacement is a correctness
+hazard: when it does fail (e.g., a future field with a non-serializable type),
+data is lost without any observable signal.
 
-**Impact:** Build breakage on the next chrono major version bump. Currently emits a compiler warning that is suppressed by the test run.
-
----
-
-### H5 — `ServerError` is `#[allow(dead_code)]` and unused: error surface is vestigial
-
-**Location:** `crates/toon-mcp-server/src/error.rs:9`
-
-```rust
-#[allow(dead_code)]
-#[derive(Debug, Error)]
-pub enum ServerError {
-    LoggingInit(#[from] toon_mcp_logging::LogError),
-    McpService(String),
-}
-```
-
-`ServerError` is never instantiated or returned from any function. `main.rs` returns `Box<dyn std::error::Error>`. The `#[allow(dead_code)]` suppresses the warning rather than either using the type or removing it. This is not a stub pattern — it has been `#[allow]`-ed, which means it will never trigger a warning reminding developers to implement it.
-
-**Impact:** Dead code in the error surface; `main.rs` violates the stated rule against `Box<dyn Error>` in public API return types (AGENTS.md rule).
+**Impact:** Silent data corruption in the audit log; undetectable in queries.
 
 ---
 
-### H6 — No workspace-level `[package]` metadata: unpublishable crates
+### H2 — `spawn_blocking` errors are mapped to `invalid_params` instead of an internal error
 
-**Location:** `Cargo.toml` (workspace root), all crate `Cargo.toml` files
+**File:** `crates/toon-mcp-server/src/handler.rs:209, 365`
 
-No crate has `description`, `license`, `repository`, `authors`, or `keywords` fields. The `[workspace.package]` block only sets `edition = "2024"`. These are required for any crate destined for crates.io and are best practice for any shared library.
-
-**Impact:** Cannot publish without adding required metadata. No license is specified anywhere (README mentions "See LICENSE if present" but no LICENSE file exists).
-
----
-
-### H7 — Missing `LICENSE` file
-
-**Location:** Repository root
-
-README.md line 306: "See [LICENSE](LICENSE) if present." No LICENSE file exists. For an open-source tool that LLM developers will embed in production workflows, the absence of a license means it is legally all-rights-reserved by default.
-
-**Impact:** Users cannot legally use, modify, or redistribute the code without explicit permission.
+`JoinError` from a panicking `spawn_blocking` task is reported back to the MCP
+client as `invalid_params`. This is the wrong MCP error code — `invalid_params`
+implies the client sent bad input, not that the server had an internal failure.
+An internal server error should use a different error code (e.g.
+`McpError::internal_error`). Clients that branch on error codes will
+misdiagnose server panics as user errors.
 
 ---
 
-### H8 — Benchmark baselines not committed; AGENTS.md rule violated
+### H3 — `compression_stats` re-runs `FormatDetector::detect` after already running the full pipeline
 
-**Location:** `AGENTS.md` (mandatory rule), `docs/testing.md:84`
+**File:** `crates/toon-mcp-server/src/handler.rs:370`
 
-AGENTS.md states: "Baseline snapshots are committed to `bench/baselines/`. Do not delete them." The `bench/baselines/` directory does not exist. No baselines have ever been captured. The `.gitignore` lists `/bench/baselines/` as ignored.
+After calling `Compressor::decide` (which internally calls
+`FormatDetector::detect_and_parse`), `handle_compression_stats` calls
+`FormatDetector::detect` again to populate the `fmt` field for pass-through
+cases. This is a redundant O(N) full-document scan. The same issue exists in
+`handle_compress_content` at line 242 for `PassedThrough` branches. The format
+information should be carried in `PassedThrough` variants of `CompressDecision`,
+as it is already present in `Compressed`.
 
-**Impact:** No regression protection on the benchmark suite. The mandatory rule in AGENTS.md is violated. The `.gitignore` entry actively prevents baselines from being committed even if generated.
+---
+
+### H4 — `toon-format` is declared twice in `toon-mcp-server/Cargo.toml`
+
+**File:** `crates/toon-mcp-server/Cargo.toml:31` and `Cargo.toml:22`
+
+`toon-format` is declared both in the workspace `[workspace.dependencies]`
+table and directly in the server's `[dependencies]` with an explicit version
+string, bypassing the workspace key. Any future version bump to `toon-format`
+must be made in two places or the server will silently resolve a different
+version than the rest of the workspace.
+
+---
+
+### H5 — `unsafe` env var mutation in config tests is data-race prone
+
+**File:** `crates/toon-mcp-server/src/config.rs:237-243`
+
+Tests use `unsafe { std::env::set_var(...) }` protected by a `Mutex`. This
+relies on all tests that touch env vars being in the same test binary and
+all using `ENV_LOCK`. This is fragile: adding a test in a different module that
+calls `std::env::var` without acquiring the lock introduces a silent data race.
+In Rust 2024 edition, `std::env::set_var` is deprecated and `unsafe` is
+required. The correct approach is to use a test helper crate (e.g.,
+`serial_test`, `temp-env`) or restructure `Config::load()` to accept an
+environment abstraction injectable for tests.
+
+---
+
+### H6 — No integration test of the MCP transport layer
+
+**File:** `crates/toon-mcp-server/src/server.rs`
+
+The `server.rs` tool routing layer (`#[tool_router]`, `#[tool_handler]`) has
+zero test coverage, as acknowledged in `docs/testing.md`. The only way to
+verify that tool names are dispatched to the correct handler, that JSON
+parameter deserialization works end-to-end, and that the rmcp framing is
+correct is via a stdio round-trip test. No such test exists. A bug in the
+macro expansion or the `Parameters<T>` wrapper would be invisible until the
+server is deployed.
+
+**Impact:** The most critical integration point in the entire server — the
+MCP wire protocol — is completely untested.
 
 ---
 
 ## Medium Severity Issues
 
-### M1 — `toon-mcp-server` directly imports `csv` for column count detection, duplicating core logic
+### M1 — No rate limiting at the MCP handler level
 
-**Location:** `crates/toon-mcp-server/Cargo.toml:26`, `handler.rs:72-79`
-
-The server imports `csv` directly and uses `csv::ReaderBuilder` in `handle_detect_format` to compute `column_count`. This duplicates logic that properly belongs in `toon-mcp-core`. It also means the handler is format-aware in a way the architecture doc says it should not be.
-
----
-
-### M2 — `.env.example` is stale and contains removed variables from the DuckDB era
-
-**Location:** `.env.example:29-33`
-
-```
-TOON_LOG_DB_PATH=data/interactions.duckdb
-TOON_LOG_PARQUET_DIR=data/parquet
-```
-
-These variables are not read by `Config::load()`. The implemented logging backend uses `TOON_LOG_DIR` only. These phantom variables will confuse operators who try to configure DuckDB integration that no longer exists.
+The server accepts arbitrarily many concurrent tool calls. A malicious or
+misbehaving client could submit many large-input calls simultaneously, consuming
+all `spawn_blocking` threads and memory. There is a per-call byte limit
+(`TOON_MAX_INPUT_BYTES`) but no concurrency limit or queue depth cap at the
+handler level.
 
 ---
 
-### M3 — `docs/testing.md` references a non-existent `duckdb_sink.rs` file
+### M2 — Log directory defaults to a relative path
 
-**Location:** `docs/testing.md:36`
+**File:** `crates/toon-mcp-server/src/config.rs:86`
 
-```
-| DuckDB sink | crates/toon-mcp-logging/src/duckdb_sink.rs:275 | #[tokio::test] | 2 |
-```
-
-There is no `duckdb_sink.rs` file. The actual sink is `parquet_sink.rs`. The test count table also shows 46 tests total but the workspace produces 47 (39 + 3 + 5 = 47, plus 12 doctests = 59). The documentation describing the test suite is incorrect.
-
----
-
-### M4 — `docs/algorithms.md` pseudocode for `probe_delimited` diverges from actual implementation
-
-**Location:** `docs/algorithms.md:91-102`
-
-The documentation shows `has_headers: false` and reads three rows with `take(3)`:
-
-```rust
-let mut rdr = csv::ReaderBuilder::new()
-    .delimiter(delimiter)
-    .has_headers(false)
-    .from_reader(input.as_bytes());
-let rows: Vec<csv::StringRecord> = rdr.records().take(3).filter_map(Result::ok).collect();
-```
-
-The actual implementation (`detector.rs:157-177`) uses `has_headers: true` and reads only the first data record:
-
-```rust
-let headers = match rdr.headers() { ... };
-match rdr.records().next() { ... }
-```
-
-These are different algorithms. Documentation is misleading to anyone trying to understand the detection behavior.
+`TOON_LOG_DIR` defaults to `"data/logs"` (relative). The README warns that
+Claude Desktop requires absolute paths. A user who forgets to set an absolute
+path in Claude Desktop will silently write logs relative to the process working
+directory (which may be `/` or a temp dir in a managed environment), and the
+log files will be unrecoverable. The server should detect relative paths at
+startup and emit a `tracing::warn!` with a clear message when running under
+environments known to have unpredictable working directories.
 
 ---
 
-### M5 — `MemorySink` has no integration tests despite being purpose-built for testing
+### M3 — Writer task supervisor does not restart the writer; it only logs
 
-**Location:** `crates/toon-mcp-logging/src/memory_sink.rs`
+**File:** `crates/toon-mcp-server/src/main.rs:38-45`
 
-`MemorySink` was built specifically to enable handler integration tests that assert on logged `LogEvent` fields. This is explicitly called out as a known gap in `docs/testing.md:57-66`. Zero integration tests use it. No handler test verifies that `tool_name`, `input_bytes`, `compressed`, `savings_pct`, or `format` are correctly populated in the emitted event.
-
----
-
-### M6 — No `Config::load()` tests; silent env-var misconfiguration is completely untested
-
-**Location:** `crates/toon-mcp-server/src/config.rs`
-
-`Config::load()` is untested (acknowledged in `docs/testing.md:67-73`). With 13 env vars that each have fallback behavior, there are many paths that have never been exercised by a test runner. This is especially concerning given issue H2 (silent failure on invalid values).
+The supervisor task spawned after `ParquetSink::new` logs an error if the
+writer task exits unexpectedly, but takes no action. After an unexpected writer
+exit, all subsequent `sink.record()` calls will fail with
+`LogError::ChannelSend` (channel closed), and those errors are silently dropped
+by `let _ = log_sink.record(event).await`. The system continues running but
+logging is permanently dead, with no operator-visible indication.
 
 ---
 
-### M7 — Workspace dependency versions use open ranges, violating AGENTS.md
+### M4 — No health check or readiness signal
 
-**Location:** `Cargo.toml:11-44`
-
-AGENTS.md states: "All workspace.dependencies MUST specify an exact semver version string. Do NOT use wildcard (*) or open ranges (>=)." Yet multiple workspace dependencies use open minor/patch ranges:
-
-- `toon-format = { version = "0.4", ... }` — matches any 0.4.x
-- `schemars = "1"` — matches any 1.x.y
-- `serde = { version = "1", ... }` — matches any 1.x.y
-- `serde_json = "1"` — matches any 1.x.y
-- `csv = "1.3"` — matches any 1.3.x through 1.x.y
-- `async-trait = "0.1"` — matches any 0.1.x
-- `tokio = { version = "1", ... }` — matches any 1.x.y
-- `duckdb = { version = "1.1", ... }` — matches any 1.1.x through 1.x.y
-- `tracing = "0.1"` — matches any 0.1.x
-- `tracing-subscriber = { version = "0.3", ... }` — matches any 0.3.x
-- `chrono = { version = "0.4", ... }` — matches any 0.4.x
-- `dotenvy = "0.15"` — matches any 0.15.x
-- `thiserror = "2"` — matches any 2.x.y
-- `uuid = { version = "1", ... }` — matches any 1.x.y
-
-Only `criterion = "0.8.2"` and `tempfile = "3.10"` specify minor versions. None use exact `=x.y.z` pinning. The AGENTS.md rule is broken by virtually every dependency.
+There is no mechanism for a process supervisor or monitoring system to
+determine whether the server is healthy and accepting requests. MCP servers
+communicate over stdio, but there is no liveness endpoint or startup signal
+beyond the MCP `initialize` handshake. A deployment that checks health by
+polling a port would have no answer.
 
 ---
 
-### M8 — `is_fold_chain` uses `.expect()` with a postcondition claim that is not fully verified at compile time
+### M5 — `async_trait` macro is a compatibility shim, not idiomatic Rust 1.75+
 
-**Location:** `crates/toon-mcp-core/src/classifier.rs:198`
+**File:** `crates/toon-mcp-logging/src/sink.rs:29`
 
-```rust
-let child = map.values().next().expect("map has exactly one value");
-```
-
-The comment claim is correct given the `map.len() == 1` guard on the same arm, but this is a runtime assertion that could be eliminated with a safer pattern (`map.into_values().next()` paired with `?` or `if let`). AGENTS.md permits `.expect()` only with a postcondition message, and this one is present — but the approach is fragile if the match arm pattern is ever refactored.
+Rust 1.75 stabilized `async fn` in traits natively. The toolchain is pinned to
+1.87.0. Using `async_trait` (which erases the future via `Box<dyn Future>` and
+adds a heap allocation per call) is unnecessary and introduces overhead on
+every `record()`, `flush()`, and `shutdown()` call. This should be replaced
+with native async trait syntax.
 
 ---
 
-### M9 — `duckdb` is in `workspace.dependencies` and `toon-mcp-server/Cargo.toml` but unused
+### M6 — No structured log correlation between tracing events and LogEvents
 
-**Location:** `Cargo.toml:30`, `toon-mcp-server/Cargo.toml` (not present but implied by earlier agent notes)
+`tracing` spans and `LogEvent` records are completely separate. A
+`tracing::error!` and the `LogEvent` for the same request share no correlation
+ID. Debugging a failing request requires correlating stderr tracing output
+(which has no stable request ID) against `LogEvent.event_id` (UUIDv4, which is
+not emitted to tracing). A `tracing::info!` event at the start of each tool
+call that emits the `event_id` would make incident investigation tractable.
 
-`duckdb = { version = "1.1", features = ["bundled"] }` is declared in `workspace.dependencies`. The `bundled` feature compiles DuckDB from source, adding significant compile time and binary size. No crate in the workspace depends on it. It is dead weight in the workspace manifest, inflating `cargo build` times and triggering unnecessary compilation.
+---
 
-**Note:** After direct verification, `duckdb` does not appear in any crate's `[dependencies]`, so it is declared but not pulled in. Still, its presence in the workspace manifest is misleading and violates workspace hygiene.
+### M7 — CI runs on `ubuntu-latest` with no pinned version
+
+**File:** `.github/workflows/ci.yml:17`
+
+`runs-on: ubuntu-latest` resolves to whatever GitHub's current LTS is. A
+runner image update could change the libc version, linker, or system libraries.
+Combined with a pinned Rust toolchain this is low risk but impure. A CI
+failure caused by a runner image change is indistinguishable from a code
+regression without pinned runner images.
+
+---
+
+### M8 — No code coverage enforcement in CI
+
+The CI pipeline runs `cargo test` but has no coverage gate. It is unknown what
+percentage of lines are covered. The known testing gaps (transport layer,
+parser edge cases, unicode inputs, empty inputs) could silently regress.
 
 ---
 
 ## Low Severity Issues
 
-### L1 — No `tracing::warn!` for invalid env var values (documentation promises it)
+### L1 — `clone()` before `spawn_blocking` allocates a full input copy per call
 
-See H2 above. The configuration documentation explicitly promises warn-level output for invalid values, but no `tracing::warn!` calls exist anywhere in `config.rs`. The document is wrong.
+**File:** `crates/toon-mcp-server/src/handler.rs:194, 350`
 
----
-
-### L2 — `data/` directory contains runtime artifacts that are not gitignored
-
-**Location:** `.gitignore`, `data/` directory
-
-`data/interactions.duckdb` and `data/logs/` are partially covered by gitignore. However, `data/1774347477_evaluation.jsonl` is committed (see C5). The gitignore entry `logs/` would match `data/logs/` only if interpreted as a glob pattern relative to the repository root, but gitignore patterns without a leading `/` match anywhere in the tree, so `data/logs/` is gitignored. The evaluation JSONL is not.
+`input_clone = input.clone()` copies the entire input string to move it into
+the `spawn_blocking` closure. For a 10 MiB input this is a 10 MiB allocation
+per call. Since `input` is already owned (moved from `params.input`), the
+original could be moved directly into the closure, eliminating the copy.
 
 ---
 
-### L3 — `CompressConfig` is constructed identically in both handlers — a DRY violation
+### L2 — `handler.rs` result destructuring tuple is verbose and error-prone
 
-**Location:** `handler.rs:159-167` (`handle_compress_content`) and `handler.rs:299-307` (`handle_compression_stats`)
+**File:** `crates/toon-mcp-server/src/handler.rs:216-253`
 
-```rust
-let compress_config = CompressConfig {
-    threshold: config.compression_threshold,
-    min_bytes: config.min_bytes,
-    key_folding: config.key_folding,
-    delimiter: config.delimiter,
-    tabular_min_rows: config.tabular_min_rows,
-    fold_min_depth: config.fold_min_depth,
-    primitive_array_min: config.primitive_array_min,
-};
-```
-
-This 8-line block is copy-pasted verbatim in both handlers. A helper function or a `From<&Config> for CompressConfig` impl would eliminate the duplication.
+The 7-element tuple returned from the `match &decision` block is difficult to
+maintain. Adding a field to `CompressDecision::Compressed` requires updating
+the tuple signature at the match site, the type annotation, and the downstream
+usages. A named intermediate struct would be clearer and less fragile.
 
 ---
 
-### L4 — `detect_format` handler uses `input.lines()` while core uses `input.lines().enumerate()`
+### L3 — JSONL file opened with `append` mode on every flush, not held open
 
-**Location:** `handler.rs:65`
+**File:** `crates/toon-mcp-logging/src/parquet_sink.rs:212-216`
 
-The handler counts non-empty lines with:
-```rust
-Some(input.lines().filter(|l| !l.trim().is_empty()).count())
-```
-
-This is consistent with the JSONL parser's behavior but is a separate implementation of line counting logic that could drift. A helper or reuse of the parser's output would be more maintainable.
-
----
-
-### L5 — No CI pipeline defined
-
-There is no `.github/workflows/`, `.gitlab-ci.yml`, `.circleci/`, or any other CI configuration file. The pre-commit gate (`cargo fmt && cargo clippy -- -D warnings && cargo test --workspace`) exists only as a human-executed mandate in AGENTS.md and README.md. Any push can introduce breakage that is not automatically caught.
+Each flush opens the JSONL file, appends, and closes it. For high-throughput
+scenarios (many events per flush interval) this is a syscall-per-flush
+overhead. The writer task should hold the file handle open between flushes and
+only re-open on day boundary rolls, which would reduce syscall overhead
+significantly.
 
 ---
 
-### L6 — `toon-mcp-bench/src/lib.rs` is an empty file with only a header comment
+### L4 — `ParquetSinkConfig` name is misleading; the sink writes JSONL
 
-**Location:** `crates/toon-mcp-bench/src/lib.rs`
+**File:** `crates/toon-mcp-logging/src/parquet_sink.rs:35`
 
-The bench crate has `src/lib.rs` with only the file header. The benchmarks are `[[bench]]` binaries and do not depend on this lib. The file is dead. A `[[bench]]`-only crate does not need a `lib.rs`. The empty file is confusing.
-
----
-
-### L7 — `opencode.json` and `README.md` have inconsistent integration instructions
-
-`opencode.json` sets `TOON_LOG_DIR` to a path that assumes the repo is at a specific location. `README.md` correctly says paths must be absolute for Claude Desktop. But the `opencode.json` example uses what appears to be a relative or placeholder path. The two documents describe slightly different setup workflows without cross-referencing the inconsistency.
+The struct is named `ParquetSinkConfig` and the file `parquet_sink.rs`, but
+the implementation writes JSONL, not Parquet. This was clearly intended as a
+transitional name (pending the DuckDB migration), but the name will mislead
+any contributor or operator who reads the config struct name and expects actual
+Parquet output.
 
 ---
 
-## Structural Observations (Non-Scoring)
+### L5 — Missing TSV detection test for `FormatDetector::detect_and_parse`
 
-These are design patterns that are not bugs today but are worth noting for future development:
+**File:** `crates/toon-mcp-core/src/detector.rs`
 
-**S1 — `PassThroughReason::as_str` allocates a `String` rather than returning `&'static str`.**
-Every log event construction calls `reason.as_str()` which allocates. `ShapeClass::as_str` returns `&'static str`. `PassThroughReason::as_str` should do the same for the non-parameterised variants. The parameterised variant `InsufficientSavings` does need formatting, but the others do not.
+`detect_and_parse` has a test for JSON and a test for `Unknown` errors, but
+no tests for `Jsonl`, `Csv`, or `Tsv` paths through `detect_and_parse`. The
+`detect` tests cover format recognition but not the combined detect-and-parse
+code path for these formats.
 
-**S2 — The `LogSink` trait `shutdown` method consumes `Box<Self>`.**
-This forces every shutdown call site to box the sink explicitly (`Box::new(sink).shutdown()`). This pattern is unusual for Rust trait objects and is not standard ergonomics. An `async fn shutdown(&mut self)` with a consumed `&mut self` or a separate `ShutdownHandle` pattern would be more idiomatic.
+---
 
-**S3 — No `version` in `[workspace.package]`; crate versions are `0.1.0` hardcoded.**
-All four crates are at `0.1.0` with no shared version management strategy. For a workspace that may eventually be published, shared versioning via `version.workspace = true` would simplify release management.
+### L6 — `bench/baselines/` is committed but `.gitignore` excludes Criterion output
 
-**S4 — `detector.rs` internal comment says "JSON probe — cheapest successful path" but JSON parsing is O(N) over the full document, the most expensive probe for large inputs.**
-A truly cheap probe would check only the first non-whitespace byte (`{` or `[`) before attempting full parse. The comment is misleading about actual performance characteristics.
+**File:** `.gitignore:13`
+
+`.gitignore` excludes `criterion/` (Criterion's HTML report output) but the
+`bench/baselines/` path is explicitly tracked. This is intentional per the
+comment but the Criterion baseline format is internal to Criterion and not
+designed to be stable across versions. A Criterion upgrade could invalidate
+committed baselines silently.
+
+---
+
+### L7 — No `#[deny(missing_docs)]` crate-level attribute
+
+The AGENTS.md rules require all public items to have doc comments. This rule
+is enforced in CI only via `cargo doc --no-deps -- -D warnings` for missing
+docs on public items, but a crate-level `#![deny(missing_docs)]` attribute
+would catch violations at compile time locally before CI runs.
+
+---
+
+### L8 — `opencode.json` is not documented in README
+
+**File:** `opencode.json`, `README.md:89-95`
+
+The README mentions opencode integration but does not document the
+`opencode.json` schema or how to modify it. A contributor who wants to change
+server arguments or add env vars will not know where to look.
+
+---
+
+## Summary Table
+
+| ID | Severity | Location | Description |
+|---|---|---|---|
+| C1 | Critical | `handler.rs:92` | `detect_format` blocks executor thread, no `spawn_blocking` |
+| C2 | Critical | `main.rs:66-79` | Shutdown does not await flush acknowledgement |
+| C3 | Critical | `main.rs` | No SIGTERM/SIGINT handler; process supervisor kills without flush |
+| C4 | Critical | `parquet_sink.rs:103` | `flush()` is fire-and-forget; returns before data hits disk |
+| C5 | Critical | `AGENTS.md`, `parquet_sink.rs` | DuckDB sink planned but never built; `ParquetSink` name is wrong |
+| H1 | High | `parquet_sink.rs:202` | Silent `{}` replacement on serialization failure corrupts audit log |
+| H2 | High | `handler.rs:209,365` | `JoinError` from server panic reported as `invalid_params` to client |
+| H3 | High | `handler.rs:242,370` | Redundant second `detect()` call on every pass-through response |
+| H4 | High | `server/Cargo.toml:31` | `toon-format` duplicated outside workspace table |
+| H5 | High | `config.rs:237` | `unsafe` env mutation in tests; fragile, Rust 2024 deprecated |
+| H6 | High | `server.rs` | MCP transport/routing layer has zero test coverage |
+| M1 | Medium | `handler.rs` | No concurrency cap; executor starvation under load |
+| M2 | Medium | `config.rs:86` | Relative `TOON_LOG_DIR` default silently misdirects logs |
+| M3 | Medium | `main.rs:38` | Writer task supervisor logs failure but does not restart |
+| M4 | Medium | `main.rs` | No health check or readiness signal |
+| M5 | Medium | `sink.rs` | `async_trait` crate unnecessary on Rust 1.75+; heap allocation overhead |
+| M6 | Medium | `handler.rs` | No request correlation between tracing spans and `LogEvent.event_id` |
+| M7 | Medium | `ci.yml:17` | Unpinned `ubuntu-latest` runner |
+| M8 | Medium | `ci.yml` | No code coverage gate or measurement in CI |
+| L1 | Low | `handler.rs:194,350` | Unnecessary full input clone before `spawn_blocking` |
+| L2 | Low | `handler.rs:216` | 7-element tuple destructuring is fragile |
+| L3 | Low | `parquet_sink.rs:212` | File re-opened on every flush instead of held open |
+| L4 | Low | `parquet_sink.rs` | `ParquetSink`/`ParquetSinkConfig` names contradict JSONL behaviour |
+| L5 | Low | `detector.rs` | Missing `detect_and_parse` tests for JSONL, CSV, TSV paths |
+| L6 | Low | `bench/baselines/` | Committed Criterion baselines not guaranteed stable across versions |
+| L7 | Low | all crates | No `#![deny(missing_docs)]` crate attribute |
+| L8 | Low | `README.md` | `opencode.json` schema undocumented |

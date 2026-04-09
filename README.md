@@ -70,6 +70,7 @@ All variables are optional. The server runs with sensible defaults without a `.e
 | `TOON_MIN_BYTES` | `256` | Inputs smaller than this are passed through without attempting compression. |
 | `TOON_MAX_INPUT_BYTES` | `10485760` | Inputs larger than this (default 10 MiB) are rejected immediately without parsing, preventing unbounded memory use. |
 | `TOON_PIPELINE_TIMEOUT_MS` | `30000` | Per-call compression timeout in milliseconds. Calls exceeding this return an error. |
+| `TOON_MAX_CONCURRENT_CALLS` | `8` | Maximum number of concurrent blocking pipeline calls. New calls are rejected with a "server busy" error when the limit is reached. |
 | `TOON_KEY_FOLDING` | `true` | Enable TOON key-folding mode for deeply nested objects. |
 | `TOON_DELIMITER` | `comma` | TOON output delimiter: `comma`, `tab`, or `pipe`. |
 | `TOON_TABULAR_MIN_ROWS` | `3` | Minimum row count for an array to be classified as tabular. |
@@ -94,6 +95,33 @@ The repository ships a ready-to-use `opencode.json`. Build the release binary an
 cargo build --release
 opencode  # picks up opencode.json from the current directory
 ```
+
+The `opencode.json` schema is:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "mcp": {
+    "toon": {
+      "type": "local",
+      "command": ["./target/release/toon-mcp-server"],
+      "enabled": true,
+      "environment": {
+        "TOON_CLIENT_HINT": "opencode"
+      }
+    }
+  }
+}
+```
+
+- `type: "local"` — the binary runs as a subprocess in the project directory,
+  so `TOON_LOG_DIR` can be a relative path (e.g. `data/logs`).
+- `command` — path to the release binary, relative to the project root.
+- `environment` — any `TOON_*` variable can be overridden here. Only variables
+  that differ from their defaults need to be listed.
+- `enabled` — set to `false` to temporarily disable the server without removing
+  the configuration.
 
 ### Claude Desktop
 

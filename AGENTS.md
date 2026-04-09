@@ -16,7 +16,6 @@ requires them. Do not preload all references on every turn.
 |-----------|--------------|
 | https://docs.rs/rmcp/latest/rmcp/ | Any work on server.rs, handler.rs, or MCP protocol |
 | https://docs.rs/toon-format/latest/toon_format/ | Any work on detector.rs, classifier.rs, or compressor.rs |
-| https://docs.rs/duckdb/latest/duckdb/ | Any work on duckdb_sink.rs or schema changes |
 | https://docs.rs/csv/latest/csv/ | Any work on parser/csv.rs |
 | https://docs.rs/tokio/latest/tokio/ | Any async work, spawn_blocking, mpsc, oneshot |
 | https://docs.rs/criterion/latest/criterion/ | Any work in toon-mcp-bench |
@@ -32,8 +31,7 @@ requires them. Do not preload all references on every turn.
 - Formatter: rustfmt exclusively. Run `cargo fmt` before every commit.
 - Linter: clippy exclusively. Run `cargo clippy -- -D warnings`.
   All warnings are errors.
-- No build.rs files unless a C dependency requires bindgen (duckdb bundled
-  uses one internally — do not add another).
+- No build.rs files unless a C dependency requires bindgen.
 - No Docker in local development.
 
 ### Strict Version Pinning
@@ -73,8 +71,8 @@ Every Rust source file MUST begin with this header:
 - Never use Box<dyn Error> in public API return types.
 - Never hold a std::sync::MutexGuard across an .await point.
 - Never call blocking I/O on the tokio executor. Use spawn_blocking.
-- The duckdb::Connection MUST live exclusively on the DuckDbSink background
-  task. It MUST NOT be wrapped in Arc<Mutex<Connection>>.
+- File handles in JsonlSink MUST live exclusively on the background writer
+  task. They MUST NOT be wrapped in Arc<Mutex<Handle>>.
 
 ---
 
@@ -96,7 +94,6 @@ Layer call direction (strict — no upward calls permitted):
 - All tool handlers live in toon-mcp-server/src/handler.rs.
 - Config is loaded once in main.rs and passed by value or Arc.
 - The LogSink trait is the only interface between handlers and logging.
-  Handlers MUST NOT import duckdb directly.
 - Claude Desktop requires absolute paths in all env config values that
   reference the file system. Document this clearly in README.md.
 
@@ -135,7 +132,7 @@ chore, revert.
 | rayon | Tokio runtime conflict; spawn_blocking is sufficient |
 | async-std or smol | Tokio is the sole async runtime |
 | libsql | Wrong tool; dedicated writer task eliminates Send+Sync problem |
-| Arc<Mutex<duckdb::Connection>> | Replaced by writer task + mpsc channel |
+| Arc<Mutex<File>> in JsonlSink | Replaced by writer task + mpsc channel |
 | Box<dyn Error> in public APIs | Untyped error surface |
 | .unwrap() outside tests/main | Panics on production paths |
 | anyhow in library crates | Leaks opaque errors to callers |
@@ -143,6 +140,5 @@ chore, revert.
 | Emojis anywhere | Consistency |
 | Direct LLM API calls from server | Server is a tool provider only |
 | System prompt injection per turn | Instructions registered once in ServerInfo |
-| parquet crate (Apache Arrow) | DuckDB COPY TO handles Parquet natively |
 | XML, YAML, TOML parsers (v1) | Out of scope; planned for future plugin iteration |
 | toon-mcp-bench importing server crates | Bench depends only on toon-mcp-core |
