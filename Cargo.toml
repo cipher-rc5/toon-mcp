@@ -31,7 +31,7 @@ csv = "=1.4.0"
 
 # Async
 async-trait = "=0.1.89"
-tokio = { version = "=1.51.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "=1.51.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Benchmarking
 criterion = { version = "=0.8.2", features = ["html_reports"] }
@@ -44,5 +44,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 chrono   = { version = "=0.4.44", features = ["serde"] }
 dotenvy  = "=0.15.7"
 tempfile = "=3.27.0"
+temp-env = "=0.3.6"
+anyhow   = "=1.0.98"
 thiserror = "=2.0.18"
 uuid     = { version = "=1.23.0", features = ["v4"] }

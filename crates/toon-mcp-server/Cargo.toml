@@ -13,6 +13,10 @@ categories  = ["command-line-utilities"]
 name = "toon-mcp-server"
 path = "src/main.rs"
 
+[lib]
+name = "toon_mcp_server"
+path = "src/lib.rs"
+
 [dependencies]
 toon-mcp-core    = { path = "../toon-mcp-core" }
 toon-mcp-logging = { path = "../toon-mcp-logging" }
@@ -21,11 +25,15 @@ serde.workspace        = true
 serde_json.workspace   = true
 schemars.workspace     = true
 tokio.workspace        = true
-async-trait.workspace  = true
 thiserror.workspace    = true
 dotenvy.workspace      = true
 tracing.workspace      = true
 tracing-subscriber.workspace = true
 uuid.workspace         = true
 chrono.workspace       = true
-toon-format            = { version = "=0.4.5", default-features = false }
+toon-format.workspace  = true
+
+[dev-dependencies]
+temp-env = "=0.3.6"
+rmcp     = { version = "=1.3.0", features = ["server", "transport-io", "macros", "schemars", "client"] }
+anyhow   = "=1.0.98"
