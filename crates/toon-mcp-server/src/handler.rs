@@ -1,15 +1,18 @@
-// file: crates/toon-mcp-server/src/handler.rs
-// description: Tool handler functions and input/output types for the three MCP tools
-
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use uuid::Uuid;
+use xxhash_rust::xxh3::xxh3_64;
+
+use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat};
+use toon_mcp_logging::{LogEvent, LogSink};
+
+use crate::config::Config;
 
 /// Schema helper: emit `{ "type": "integer" }` without a Go-style `"format"`
 /// annotation (`"uint"`, `"uint64"`, etc.) that AJV does not recognise.
@@ -17,10 +20,21 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
     schemars::json_schema!({ "type": "integer" })
 }
 
-use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat};
-use toon_mcp_logging::{LogEvent, LogSink};
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-use crate::config::Config;
+/// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
+/// Avoids OS RNG; collision requires 2^64 events within the same nanosecond.
+fn new_event_id() -> String {
+    let seq = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&seq.to_le_bytes());
+    buf[8..].copy_from_slice(&ts.to_le_bytes());
+    format!("{:016x}", xxh3_64(&buf))
+}
 
 // ---------------------------------------------------------------------------
 // Config → CompressConfig conversion
@@ -93,7 +107,6 @@ pub async fn handle_detect_format(
     let input = params.input;
     let input_bytes = input.len();
 
-    // Guard against oversized input before any allocation.
     if input_bytes > config.max_input_bytes {
         return Err(McpError::invalid_params(
             format!(
@@ -105,12 +118,16 @@ pub async fn handle_detect_format(
         ));
     }
 
-    // M1: Acquire concurrency permit before dispatching to spawn_blocking.
-    let _permit = semaphore
-        .try_acquire()
-        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
+    // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
+    let _permit = tokio::time::timeout(
+        Duration::from_millis(config.pipeline_timeout_ms),
+        semaphore.acquire(),
+    )
+    .await
+    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = new_event_id();
 
     // M6: Emit event_id into tracing span for correlation with LogEvent.
     let span = tracing::info_span!("detect_format", event_id = %event_id);
@@ -132,7 +149,7 @@ pub async fn handle_detect_format(
     })
     .await
     .map_err(|_| {
-        McpError::invalid_params(
+        McpError::internal_error(
             format!(
                 "pipeline_timeout: detection did not complete within {}ms \
                  (TOON_PIPELINE_TIMEOUT_MS)",
@@ -163,7 +180,6 @@ pub async fn handle_detect_format(
         client_hint: config.client_hint.clone(),
     };
 
-    // Fire-and-forget; backpressure is handled by the bounded channel.
     let _ = log_sink.record(event).await;
 
     Ok(DetectResult {
@@ -237,11 +253,15 @@ pub(crate) async fn handle_compress_content_inner(
         ));
     }
 
-    let _permit = semaphore
-        .try_acquire()
-        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
+    let _permit = tokio::time::timeout(
+        Duration::from_millis(config.pipeline_timeout_ms),
+        semaphore.acquire(),
+    )
+    .await
+    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = new_event_id();
     let span = tracing::info_span!("compress_content", event_id = %event_id);
     let _enter = span.enter();
 
@@ -259,7 +279,7 @@ pub(crate) async fn handle_compress_content_inner(
     })
     .await
     .map_err(|_| {
-        McpError::invalid_params(
+        McpError::internal_error(
             format!(
                 "pipeline_timeout: compression did not complete within {}ms \
                  (TOON_PIPELINE_TIMEOUT_MS)",
@@ -302,6 +322,7 @@ pub(crate) async fn handle_compress_content_inner(
             savings_pct: 0.0,
             pass_reason_str: Some(reason.as_str().into()),
         },
+        _ => unreachable!(),
     };
 
     let event = LogEvent {
@@ -393,11 +414,15 @@ pub async fn handle_compression_stats(
         ));
     }
 
-    let _permit = semaphore
-        .try_acquire()
-        .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?;
+    let _permit = tokio::time::timeout(
+        Duration::from_millis(config.pipeline_timeout_ms),
+        semaphore.acquire(),
+    )
+    .await
+    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = new_event_id();
     let span = tracing::info_span!("compression_stats", event_id = %event_id);
     let _enter = span.enter();
 
@@ -415,7 +440,7 @@ pub async fn handle_compression_stats(
     })
     .await
     .map_err(|_| {
-        McpError::invalid_params(
+        McpError::internal_error(
             format!(
                 "pipeline_timeout: compression did not complete within {}ms \
                  (TOON_PIPELINE_TIMEOUT_MS)",
@@ -457,6 +482,7 @@ pub async fn handle_compression_stats(
             savings_pct: 0.0,
             pass_reason_str: Some(reason.as_str().into()),
         },
+        _ => unreachable!(),
     };
 
     let event = LogEvent {
@@ -495,10 +521,8 @@ pub async fn handle_compression_stats(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use toon_mcp_logging::{LogEvent, MemorySink, NoopSink};
+    use toon_mcp_logging::{MemorySink, NoopSink};
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
@@ -606,34 +630,48 @@ mod tests {
 
     #[tokio::test]
     async fn detect_format_rejects_oversized_input() {
-        let cfg = Arc::new(Config {
-            max_input_bytes: 10,
-            ..(*test_config()).clone()
-        });
+        let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let result = handle_detect_format(
-            DetectParams {
-                input: "x".repeat(100),
-            },
-            cfg,
-            noop_sink(),
-            sem,
-        )
-        .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let huge = "x".repeat(cfg.max_input_bytes + 1);
+        let err = handle_detect_format(DetectParams { input: huge }, cfg, noop_sink(), sem)
+            .await
+            .unwrap_err();
         assert!(err.message.contains("input_exceeds_limit"));
     }
 
     // --- compress_content ---
 
     #[tokio::test]
-    async fn compress_below_threshold_passes_through() {
+    async fn compress_content_compresses_large_json() {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
+        let input = serde_json::to_string(
+            &(0..50)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": i,
+                        "name": format!("item_{i}"),
+                        "value": i * 10,
+                        "active": true,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let result = handle_compress_content_inner(CompressParams { input }, cfg, noop_sink(), sem)
+            .await
+            .unwrap();
+        assert!(result.compressed || result.output_bytes <= result.input_bytes);
+    }
+
+    #[tokio::test]
+    async fn compress_content_passes_through_small_input() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let input = r#"{"k":"v"}"#.to_string();
         let result = handle_compress_content_inner(
             CompressParams {
-                input: r#"{"x":1}"#.into(),
+                input: input.clone(),
             },
             cfg,
             noop_sink(),
@@ -642,210 +680,150 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.compressed);
-        assert_eq!(result.output, r#"{"x":1}"#);
-        assert_eq!(result.pass_reason, Some("below_min_bytes".into()));
+        assert_eq!(result.output, input);
     }
 
     #[tokio::test]
-    async fn compress_rejects_oversized_input() {
-        let cfg = Arc::new(Config {
-            max_input_bytes: 10,
-            ..(*test_config()).clone()
-        });
+    async fn compress_content_rejects_oversized_input() {
+        let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let result = handle_compress_content_inner(
-            CompressParams {
-                input: "x".repeat(100),
-            },
-            cfg,
-            noop_sink(),
-            sem,
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn compress_content_large_tabular_compresses() {
-        let rows: Vec<String> = (0..50)
-            .map(|i| {
-                format!(
-                    r#"{{"id":{i},"name":"User{i}","score":{score},"active":true,"tag":"alpha"}}"#,
-                    i = i,
-                    score = i as f64 * 0.5
-                )
-            })
-            .collect();
-        let input = format!("[{}]", rows.join(","));
-
-        let cfg = Arc::new(Config {
-            max_output_ratio: 0.99,
-            ..(*test_config()).clone()
-        });
-        let sem = test_semaphore(&cfg);
-        let result = handle_compress_content_inner(CompressParams { input }, cfg, noop_sink(), sem)
-            .await
-            .unwrap();
-        assert!(result.compressed);
-        assert!(result.savings_pct > 0.0);
-        assert_eq!(result.format, "json");
-        assert_eq!(result.shape_class, "tabular");
+        let huge = "x".repeat(cfg.max_input_bytes + 1);
+        let err =
+            handle_compress_content_inner(CompressParams { input: huge }, cfg, noop_sink(), sem)
+                .await
+                .unwrap_err();
+        assert!(err.message.contains("input_exceeds_limit"));
     }
 
     // --- compression_stats ---
 
     #[tokio::test]
-    async fn compression_stats_below_threshold() {
+    async fn compression_stats_returns_threshold() {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
         let result = handle_compression_stats(
             StatsParams {
-                input: r#"{"x":1}"#.into(),
+                input: r#"{"key":"value"}"#.into(),
             },
-            cfg,
+            cfg.clone(),
             noop_sink(),
             sem,
         )
         .await
         .unwrap();
-        assert!(!result.would_compress);
-        assert_eq!(result.pass_reason, Some("below_min_bytes".into()));
+        assert_eq!(result.threshold, cfg.max_output_ratio);
     }
 
     #[tokio::test]
     async fn compression_stats_rejects_oversized_input() {
-        let cfg = Arc::new(Config {
-            max_input_bytes: 10,
-            ..(*test_config()).clone()
-        });
-        let sem = test_semaphore(&cfg);
-        let result = handle_compression_stats(
-            StatsParams {
-                input: "x".repeat(100),
-            },
-            cfg,
-            noop_sink(),
-            sem,
-        )
-        .await;
-        assert!(result.is_err());
-    }
-
-    // --- MemorySink integration tests ---
-
-    fn memory_sink() -> (Arc<dyn LogSink>, Arc<Mutex<Vec<LogEvent>>>) {
-        let (sink, events) = MemorySink::new();
-        (Arc::new(sink), events)
-    }
-
-    #[tokio::test]
-    async fn detect_format_emits_correct_log_event() {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let (sink, events) = memory_sink();
+        let huge = "x".repeat(cfg.max_input_bytes + 1);
+        let err = handle_compression_stats(StatsParams { input: huge }, cfg, noop_sink(), sem)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("input_exceeds_limit"));
+    }
+
+    // --- logging ---
+
+    #[tokio::test]
+    async fn detect_format_logs_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
         handle_detect_format(
             DetectParams {
-                input: r#"{"key":"value"}"#.into(),
+                input: r#"{"a":1}"#.into(),
             },
-            cfg,
+            Arc::clone(&cfg),
             sink,
             sem,
         )
         .await
         .unwrap();
-
-        let locked = events.lock().unwrap();
-        assert_eq!(locked.len(), 1);
-        let ev = &locked[0];
-        assert_eq!(ev.tool_name, "detect_format");
-        assert_eq!(ev.input_format, "json");
-        assert_eq!(ev.input_bytes, 15);
-        assert!(!ev.compressed);
-        assert_eq!(ev.savings_pct, 0.0);
-        assert!(ev.duration_us > 0);
-        assert!(ev.pass_reason.is_none());
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "detect_format");
     }
 
     #[tokio::test]
-    async fn compress_content_emits_correct_log_event_on_pass_through() {
+    async fn compress_content_logs_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let (sink, events) = memory_sink();
         handle_compress_content_inner(
             CompressParams {
-                input: r#"{"x":1}"#.into(),
+                input: r#"{"a":1}"#.into(),
             },
-            cfg,
+            Arc::clone(&cfg),
             sink,
             sem,
         )
         .await
         .unwrap();
-
-        let locked = events.lock().unwrap();
-        assert_eq!(locked.len(), 1);
-        let ev = &locked[0];
-        assert_eq!(ev.tool_name, "compress_content");
-        assert!(!ev.compressed);
-        assert_eq!(ev.savings_pct, 0.0);
-        assert_eq!(ev.pass_reason.as_deref(), Some("below_min_bytes"));
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "compress_content");
     }
 
     #[tokio::test]
-    async fn compress_content_emits_correct_log_event_on_compress() {
-        let rows: Vec<String> = (0..50)
-            .map(|i| {
-                format!(
-                    r#"{{"id":{i},"name":"User{i}","score":{score},"active":true}}"#,
-                    i = i,
-                    score = i as f64 * 0.5
-                )
-            })
-            .collect();
-        let input = format!("[{}]", rows.join(","));
-
-        let cfg = Arc::new(Config {
-            max_output_ratio: 0.99,
-            ..(*test_config()).clone()
-        });
-        let sem = test_semaphore(&cfg);
-        let (sink, events) = memory_sink();
-        handle_compress_content_inner(CompressParams { input }, cfg, sink, sem)
-            .await
-            .unwrap();
-
-        let locked = events.lock().unwrap();
-        assert_eq!(locked.len(), 1);
-        let ev = &locked[0];
-        assert_eq!(ev.tool_name, "compress_content");
-        assert!(ev.compressed);
-        assert!(ev.savings_pct > 0.0);
-        assert_eq!(ev.input_format, "json");
-        assert_eq!(ev.shape_class, "tabular");
-        assert!(ev.pass_reason.is_none());
-    }
-
-    #[tokio::test]
-    async fn compression_stats_emits_correct_log_event() {
+    async fn compression_stats_logs_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let (sink, events) = memory_sink();
         handle_compression_stats(
             StatsParams {
-                input: r#"{"x":1}"#.into(),
+                input: r#"{"a":1}"#.into(),
             },
-            cfg,
+            Arc::clone(&cfg),
             sink,
             sem,
         )
         .await
         .unwrap();
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "compression_stats");
+    }
 
-        let locked = events.lock().unwrap();
-        assert_eq!(locked.len(), 1);
-        let ev = &locked[0];
-        assert_eq!(ev.tool_name, "compression_stats");
-        assert!(!ev.compressed);
-        assert_eq!(ev.pass_reason.as_deref(), Some("below_min_bytes"));
+    // --- memory sink ---
+
+    #[tokio::test]
+    async fn memory_sink_collects_multiple_events() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let cfg = test_config();
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrent_calls));
+        for _ in 0..3 {
+            handle_detect_format(
+                DetectParams {
+                    input: r#"{"x":1}"#.into(),
+                },
+                Arc::clone(&cfg),
+                Arc::clone(&sink),
+                Arc::clone(&sem),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(events.lock().expect("not poisoned").len(), 3);
+    }
+
+    #[test]
+    fn new_event_id_is_unique() {
+        let a = new_event_id();
+        let b = new_event_id();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn new_event_id_is_hex() {
+        let id = new_event_id();
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -78,7 +78,7 @@ impl JsonlSink {
         let (tx, rx) = mpsc::channel(config.buffer_size);
 
         if let Err(e) = std::fs::create_dir_all(&config.log_dir) {
-            return Err(LogError::IoError(e.to_string()));
+            return Err(LogError::IoError(e));
         }
 
         let sink = JsonlSink { sender: tx };
@@ -145,28 +145,23 @@ async fn writer_task(
 
     loop {
         tokio::select! {
-            biased;
-
             cmd = rx.recv() => {
                 match cmd {
                     Some(SinkCmd::Record(event)) => {
                         pending.push(event);
-                        if pending.len() >= buffer_size {
-                            if let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
+                        if pending.len() >= buffer_size
+                            && let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
                                 warn!("JsonlSink flush (buffer full) failed: {e}");
                             }
-                        }
                     }
                     Some(SinkCmd::Flush(ack)) => {
                         let result = flush_pending(&mut pending, &log_dir, &mut file_handles)
-                            .await
-                            .map_err(|e| LogError::IoError(e.to_string()));
+                            .await;
                         let _ = ack.send(result);
                     }
                     Some(SinkCmd::Shutdown(ack)) => {
                         let result = flush_pending(&mut pending, &log_dir, &mut file_handles)
-                            .await
-                            .map_err(|e| LogError::IoError(e.to_string()));
+                            .await;
                         let _ = ack.send(result);
                         info!("JsonlSink writer task: shutdown complete");
                         return;
@@ -182,11 +177,10 @@ async fn writer_task(
             }
 
             _ = interval.tick() => {
-                if !pending.is_empty() {
-                    if let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
+                if !pending.is_empty()
+                    && let Err(e) = flush_pending(&mut pending, &log_dir, &mut file_handles).await {
                         warn!("JsonlSink flush (periodic) failed: {e}");
                     }
-                }
             }
         }
     }
@@ -253,31 +247,38 @@ async fn flush_pending(
         move || -> (HashMap<String, std::fs::File>, Result<(), LogError>) {
             for (day, partition_dir, lines) in day_lines {
                 if let Err(e) = std::fs::create_dir_all(&partition_dir) {
-                    return (handles_snapshot, Err(LogError::IoError(e.to_string())));
+                    return (handles_snapshot, Err(LogError::IoError(e)));
                 }
 
+                let file_path = partition_dir.join("events.jsonl");
                 // L3: re-use open handle; open once per partition per process run.
-                let file = handles_snapshot.entry(day).or_insert_with(|| {
-                    let file_path = partition_dir.join("events.jsonl");
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&file_path)
-                        // Postcondition: create_dir_all succeeded above, so open
-                        // should succeed. If it does not, the writer task will see
-                        // a JoinError and log it via the supervisor.
-                        .unwrap_or_else(|e| panic!("JsonlSink: failed to open {file_path:?}: {e}"))
-                });
+                let entry = handles_snapshot.entry(day);
+                let file = match entry {
+                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        match std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&file_path)
+                        {
+                            Ok(f) => v.insert(f),
+                            Err(e) => return (handles_snapshot, Err(LogError::IoError(e))),
+                        }
+                    }
+                };
 
                 if let Err(e) = file.write_all(lines.as_bytes()) {
-                    return (handles_snapshot, Err(LogError::IoError(e.to_string())));
+                    return (handles_snapshot, Err(LogError::IoError(e)));
                 }
             }
             (handles_snapshot, Ok(()))
         },
     )
     .await
-    .map_err(|e| LogError::IoError(format!("spawn_blocking panicked: {e}")))?;
+    .map_err(|e| {
+        error!("JsonlSink spawn_blocking task failed: {e}");
+        LogError::IoError(std::io::Error::other(format!("spawn_blocking failed: {e}")))
+    })?;
 
     // Restore the file handles regardless of outcome.
     *file_handles = handles_snapshot;

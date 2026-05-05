@@ -8,7 +8,7 @@ use thiserror::Error;
 pub enum LogError {
     /// A filesystem I/O error occurred while writing a log partition file.
     #[error("log I/O error: {0}")]
-    IoError(String),
+    IoError(#[source] std::io::Error),
 
     /// Sending an event to the background writer task failed because the
     /// channel was closed (writer task exited unexpectedly).

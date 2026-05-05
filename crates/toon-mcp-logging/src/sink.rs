@@ -23,8 +23,13 @@ use async_trait::async_trait;
 /// Callers should hold the concrete type in a `Box<dyn LogSink>` and call
 /// `boxed_sink.shutdown().await`. The pattern at call sites is:
 ///
-/// ```rust,ignore
-/// Box::new(my_sink).shutdown().await
+/// ```rust,no_run
+/// # use toon_mcp_logging::sink::LogSink;
+/// # use toon_mcp_logging::noop_sink::NoopSink;
+/// # async fn example() {
+/// let my_sink = NoopSink;
+/// Box::new(my_sink).shutdown().await.unwrap();
+/// # }
 /// ```
 #[async_trait]
 pub trait LogSink: Send + Sync + 'static {

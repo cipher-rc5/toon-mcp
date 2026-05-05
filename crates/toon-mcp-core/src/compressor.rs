@@ -57,6 +57,7 @@ impl Default for CompressConfig {
 }
 
 /// The reason content was passed through without compression.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PassThroughReason {
     /// Input byte length exceeded `max_input_bytes`.
@@ -122,6 +123,7 @@ impl std::fmt::Display for PassThroughReason {
 }
 
 /// The outcome of a compression attempt.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum CompressDecision {
     /// Compression was applied and the output met the savings threshold.

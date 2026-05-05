@@ -320,4 +320,34 @@ mod tests {
         let v = json!({"a": 1, "b": 2});
         assert_eq!(Classifier::classify(&v), ShapeClass::PassThrough);
     }
+
+    #[test]
+    fn tabular_min_rows_zero_does_not_panic() {
+        let config = ClassifyConfig {
+            tabular_min_rows: 0,
+            ..ClassifyConfig::default()
+        };
+        let v = json!([{"id": 1}]);
+        let _ = Classifier::classify_with(&v, &config);
+    }
+
+    #[test]
+    fn fold_min_depth_zero_does_not_panic() {
+        let config = ClassifyConfig {
+            fold_min_depth: 0,
+            ..ClassifyConfig::default()
+        };
+        let v = json!({"a": "leaf"});
+        let _ = Classifier::classify_with(&v, &config);
+    }
+
+    #[test]
+    fn primitive_array_min_zero_does_not_panic() {
+        let config = ClassifyConfig {
+            primitive_array_min: 0,
+            ..ClassifyConfig::default()
+        };
+        let v = json!([1]);
+        let _ = Classifier::classify_with(&v, &config);
+    }
 }

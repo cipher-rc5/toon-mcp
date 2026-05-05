@@ -33,3 +33,4 @@ pub use compressor::{
 };
 pub use detector::{FormatDetector, InputFormat};
 pub use error::CoreError;
+pub use parser::Parser;

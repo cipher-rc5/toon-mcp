@@ -67,6 +67,29 @@ pub struct Config {
     pub max_concurrent_calls: usize,
 }
 
+impl Default for Config {
+    /// Returns a `Config` populated with the same defaults as `Config::load`
+    /// when no environment variables are set.
+    fn default() -> Self {
+        Self {
+            max_output_ratio: 0.85,
+            min_bytes: 256,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            key_folding: true,
+            delimiter: Delimiter::Comma,
+            tabular_min_rows: 3,
+            fold_min_depth: 3,
+            primitive_array_min: 5,
+            logging_enabled: true,
+            logging: JsonlSinkConfig::default(),
+            log_level: "info".into(),
+            client_hint: None,
+            pipeline_timeout_ms: 30_000,
+            max_concurrent_calls: 8,
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from environment variables, falling back to defaults.
     ///

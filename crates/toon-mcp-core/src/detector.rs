@@ -129,9 +129,11 @@ impl FormatDetector {
     /// assert_eq!(FormatDetector::detect("plain text"), InputFormat::Unknown);
     /// ```
     pub fn detect(input: &str) -> InputFormat {
-        // 1. JSON probe — O(N) full-document parse; runs first so that
-        //    single-line JSON objects do not fall through to the JSONL probe.
-        if serde_json::from_str::<serde_json::Value>(input).is_ok() {
+        // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
+        let first_nonws = input.bytes().find(|b| !b.is_ascii_whitespace());
+        if matches!(first_nonws, Some(b'{') | Some(b'['))
+            && serde_json::from_str::<serde_json::Value>(input).is_ok()
+        {
             return InputFormat::Json;
         }
 
@@ -191,19 +193,17 @@ impl FormatDetector {
     // --- private helpers ---
 
     fn probe_jsonl(input: &str) -> bool {
-        let lines: Vec<&str> = input
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .take(2)
-            .collect();
-
-        if lines.len() < 2 {
-            return false;
+        let mut checked = 0usize;
+        for line in input.lines().filter(|l| !l.trim().is_empty()) {
+            if serde_json::from_str::<serde_json::Value>(line).is_err() {
+                return false;
+            }
+            checked += 1;
+            if checked == 2 {
+                return true;
+            }
         }
-
-        lines
-            .iter()
-            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+        false
     }
 
     fn probe_delimited(input: &str, delimiter: u8) -> bool {

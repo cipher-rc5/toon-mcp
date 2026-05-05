@@ -1,11 +1,6 @@
 // file: crates/toon-mcp-server/src/main.rs
 // description: Tokio entry point — wires config, logging, and MCP server together
 
-mod config;
-mod error;
-mod handler;
-mod server;
-
 use std::sync::Arc;
 
 use rmcp::{ServiceExt, transport::stdio};
@@ -14,7 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use toon_mcp_logging::{JsonlSink, LogSink, NoopSink};
 
-use crate::{config::Config, error::ServerError, server::ToonMcpServer};
+use toon_mcp_server::{config::Config, error::ServerError, server::ToonMcpServer};
 
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
@@ -112,8 +107,6 @@ async fn main() -> Result<(), ServerError> {
             info!("toon-mcp-server shutting down — flushing log sink");
         }
     }
-
-    info!("toon-mcp-server shutting down — flushing log sink");
 
     // C2/C4: Use the acknowledged flush() which now sends a Flush command and
     // waits on a oneshot channel for the writer task to confirm all pending

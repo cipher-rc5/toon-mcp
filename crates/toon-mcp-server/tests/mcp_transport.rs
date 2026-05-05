@@ -84,7 +84,7 @@ async fn detect_format_tool_routes_and_responds() -> anyhow::Result<()> {
         anyhow::Ok(())
     });
 
-    let client = TestClient::default().serve(client_transport).await?;
+    let client = TestClient.serve(client_transport).await?;
 
     let result = client
         .call_tool(
@@ -130,7 +130,7 @@ async fn compress_content_tool_routes_and_compresses() -> anyhow::Result<()> {
         anyhow::Ok(())
     });
 
-    let client = TestClient::default().serve(client_transport).await?;
+    let client = TestClient.serve(client_transport).await?;
 
     // Build a large tabular JSON payload that will definitely compress.
     let rows: Vec<String> = (0..50)
@@ -191,7 +191,7 @@ async fn compress_content_passes_through_prose() -> anyhow::Result<()> {
         anyhow::Ok(())
     });
 
-    let client = TestClient::default().serve(client_transport).await?;
+    let client = TestClient.serve(client_transport).await?;
 
     let prose = "This is plain prose text with no structured format.";
 
@@ -236,7 +236,7 @@ async fn compression_stats_tool_routes_and_returns_stats() -> anyhow::Result<()>
         anyhow::Ok(())
     });
 
-    let client = TestClient::default().serve(client_transport).await?;
+    let client = TestClient.serve(client_transport).await?;
 
     let result = client
         .call_tool(
@@ -285,7 +285,7 @@ async fn unknown_tool_name_returns_error() -> anyhow::Result<()> {
         anyhow::Ok(())
     });
 
-    let client = TestClient::default().serve(client_transport).await?;
+    let client = TestClient.serve(client_transport).await?;
 
     // rmcp returns an error for unknown tool names.
     let result = client

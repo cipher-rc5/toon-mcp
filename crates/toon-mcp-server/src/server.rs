@@ -1,12 +1,7 @@
-// file: crates/toon-mcp-server/src/server.rs
-// description: rmcp ServerHandler implementation with tool_router macro
-// reference: https://docs.rs/rmcp/latest/rmcp/
-
 use std::sync::Arc;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::tool::ToolRouter,
     handler::server::wrapper::Json,
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
@@ -23,16 +18,13 @@ use crate::{
     },
 };
 
-/// The main MCP server struct. Implements `ServerHandler` via the `tool_handler` macro.
-///
-/// Holds shared state passed into every tool call. `Clone` is required by rmcp.
+/// MCP server. Implements `ServerHandler` via the `tool_handler` macro.
+/// `Clone` is required by rmcp.
 #[derive(Clone)]
 pub struct ToonMcpServer {
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
-    /// M1: Global semaphore that caps concurrent blocking pipeline calls.
     semaphore: Arc<Semaphore>,
-    tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
@@ -44,11 +36,9 @@ impl ToonMcpServer {
             config: Arc::new(config),
             log_sink,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            tool_router: Self::tool_router(),
         }
     }
 
-    /// Detect the format of a structured input string.
     #[tool(description = "Detect the format of a structured input string. \
                           Returns the detected format (json, jsonl, csv, tsv, \
                           or unknown) and basic statistics.")]
@@ -66,7 +56,6 @@ impl ToonMcpServer {
         .map(Json)
     }
 
-    /// Compress structured content to TOON format for token efficiency.
     #[tool(description = "Compress structured content (JSON, JSONL, CSV, TSV) \
                           to TOON format for token efficiency. Returns the \
                           compressed TOON string when savings exceed the \
@@ -86,7 +75,6 @@ impl ToonMcpServer {
         .map(Json)
     }
 
-    /// Preview compression statistics without encoding.
     #[tool(description = "Preview compression statistics without encoding. \
                           Returns format detection, shape classification, and \
                           estimated token savings. Use before compress_content \
@@ -108,10 +96,6 @@ impl ToonMcpServer {
 
 #[tool_handler]
 impl ServerHandler for ToonMcpServer {
-    /// Return the server capabilities and instructions registered once at session handshake.
-    ///
-    /// No system prompt injection is performed on individual messages; these
-    /// instructions are sent once during the MCP session initialisation.
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.instructions = Some(
