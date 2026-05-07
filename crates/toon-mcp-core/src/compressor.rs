@@ -123,7 +123,12 @@ impl std::fmt::Display for PassThroughReason {
 }
 
 /// The outcome of a compression attempt.
-#[non_exhaustive]
+///
+/// This enum is intentionally **not** `#[non_exhaustive]`: callers
+/// (handlers, tests, downstream tooling) match it exhaustively so that
+/// any future variant produces a compile-time error rather than a
+/// silent runtime fallthrough. If a new variant is added here, treat
+/// it as a semver-significant change and update every match site.
 #[derive(Debug, Clone)]
 pub enum CompressDecision {
     /// Compression was applied and the output met the savings threshold.
@@ -216,6 +221,10 @@ impl Compressor {
         }
 
         // Step 3: detect and parse.
+        // Run detect once up-front so non-`ParseFailed` errors below can
+        // still report the format that detection identified, instead of
+        // collapsing to `Unknown`.
+        let detected_fmt = FormatDetector::detect(input);
         let (fmt, value) = match FormatDetector::detect_and_parse(input) {
             Ok(pair) => pair,
             Err(crate::error::CoreError::ParseFailed { format, detail, .. }) => {
@@ -231,13 +240,12 @@ impl Compressor {
                 };
             }
             Err(e) => {
-                // JSON or CSV parse error.
                 return CompressDecision::PassedThrough {
                     reason: PassThroughReason::ParseFailed {
-                        format: InputFormat::Unknown,
+                        format: detected_fmt,
                         detail: e.to_string(),
                     },
-                    input_format: Some(InputFormat::Unknown),
+                    input_format: Some(detected_fmt),
                 };
             }
         };
@@ -271,7 +279,7 @@ impl Compressor {
             Err(e) => {
                 return CompressDecision::PassedThrough {
                     reason: PassThroughReason::ParseFailed {
-                        format: InputFormat::Unknown,
+                        format: fmt,
                         detail: e.to_string(),
                     },
                     input_format: Some(fmt),

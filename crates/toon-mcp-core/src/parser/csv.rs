@@ -171,3 +171,106 @@ mod tests {
         assert!(arr[1]["x"].is_number());
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    // file: crates/toon-mcp-core/src/parser/csv.rs (proptest_tests)
+    // description: Round-trip proptests for CSV and TSV parsers using generated tables.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A header name strategy: alpha-only (so it never coerces to a number),
+    /// non-empty, no delimiter or newline characters.
+    fn header_strategy() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9_]{0,7}"
+    }
+
+    /// A cell value strategy: starts with a letter so the f64 parse always
+    /// fails and the parser yields a Value::String. Avoids commas, tabs,
+    /// quotes, newlines, and carriage returns to dodge CSV escaping.
+    fn cell_strategy() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9_ -]{0,7}"
+    }
+
+    /// Generate a (headers, rows) pair. Headers are unique within the table
+    /// because `csv::Reader` would otherwise fold duplicate columns into a
+    /// single map key, breaking the round trip property.
+    fn table_strategy(
+        cols: std::ops::Range<usize>,
+        rows: std::ops::Range<usize>,
+    ) -> impl Strategy<Value = (Vec<String>, Vec<Vec<String>>)> {
+        prop::collection::vec(header_strategy(), cols)
+            .prop_filter("headers must be unique", |hs| {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                hs.iter().all(|h| seen.insert(h.as_str()))
+            })
+            .prop_flat_map(move |headers| {
+                let n = headers.len();
+                let rows_strategy = prop::collection::vec(
+                    prop::collection::vec(cell_strategy(), n..=n),
+                    rows.clone(),
+                );
+                (Just(headers), rows_strategy)
+            })
+    }
+
+    /// Render a table to a string using the given delimiter byte.
+    fn render_table(headers: &[String], rows: &[Vec<String>], delim: char) -> String {
+        let d = delim.to_string();
+        let mut out = String::new();
+        out.push_str(&headers.join(&d));
+        for row in rows {
+            out.push('\n');
+            out.push_str(&row.join(&d));
+        }
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Round-trip a CSV table: headers and string cells survive parsing
+        /// into a `Value::Array` of `Value::Object` rows with matching keys
+        /// and string values.
+        #[test]
+        fn csv_round_trip_preserves_string_cells(
+            (headers, rows) in table_strategy(1..6, 1..6)
+        ) {
+            let input = render_table(&headers, &rows, ',');
+            let parsed = CsvParser::csv().parse(&input).expect("parse");
+            let arr = parsed.as_array().expect("array root");
+            prop_assert_eq!(arr.len(), rows.len());
+            for (row_idx, row_cells) in rows.iter().enumerate() {
+                let obj = arr[row_idx].as_object().expect("row is object");
+                prop_assert_eq!(obj.len(), headers.len());
+                for (col_idx, header) in headers.iter().enumerate() {
+                    let val = obj.get(header).expect("header present");
+                    let s = val.as_str().expect("value is string");
+                    prop_assert_eq!(s, row_cells[col_idx].as_str());
+                }
+            }
+        }
+
+        /// Same property for TSV: header and string-only cells round-trip
+        /// through a tab-delimited render and parse.
+        #[test]
+        fn tsv_round_trip_preserves_string_cells(
+            (headers, rows) in table_strategy(1..6, 1..6)
+        ) {
+            let input = render_table(&headers, &rows, '\t');
+            let parsed = CsvParser::tsv().parse(&input).expect("parse");
+            let arr = parsed.as_array().expect("array root");
+            prop_assert_eq!(arr.len(), rows.len());
+            for (row_idx, row_cells) in rows.iter().enumerate() {
+                let obj = arr[row_idx].as_object().expect("row is object");
+                prop_assert_eq!(obj.len(), headers.len());
+                for (col_idx, header) in headers.iter().enumerate() {
+                    let val = obj.get(header).expect("header present");
+                    let s = val.as_str().expect("value is string");
+                    prop_assert_eq!(s, row_cells[col_idx].as_str());
+                }
+            }
+        }
+    }
+}

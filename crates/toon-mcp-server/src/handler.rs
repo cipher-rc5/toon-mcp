@@ -7,6 +7,7 @@ use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 use xxhash_rust::xxh3::xxh3_64;
 
 use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat};
@@ -34,6 +35,40 @@ fn new_event_id() -> String {
     buf[..8].copy_from_slice(&seq.to_le_bytes());
     buf[8..].copy_from_slice(&ts.to_le_bytes());
     format!("{:016x}", xxh3_64(&buf))
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline helper
+// ---------------------------------------------------------------------------
+
+/// Run a synchronous closure on a blocking thread under a wall-clock timeout.
+///
+/// Wraps the `tokio::time::timeout(spawn_blocking(...))` pattern shared by
+/// every handler so the surrounding code does not have to thread two layers
+/// of error mapping. The timeout error message references
+/// `TOON_PIPELINE_TIMEOUT_MS` so operators can find the knob.
+async fn run_pipeline<F, T>(
+    op_name: &'static str,
+    pipeline_timeout_ms: u64,
+    f: F,
+) -> Result<T, McpError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let timeout = Duration::from_millis(pipeline_timeout_ms);
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(f))
+        .await
+        .map_err(|_| {
+            McpError::internal_error(
+                format!(
+                    "pipeline_timeout: {op_name} did not complete within \
+                     {pipeline_timeout_ms}ms (TOON_PIPELINE_TIMEOUT_MS)"
+                ),
+                None,
+            )
+        })?
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))
 }
 
 // ---------------------------------------------------------------------------
@@ -129,65 +164,55 @@ pub async fn handle_detect_format(
 
     let event_id = new_event_id();
 
-    // M6: Emit event_id into tracing span for correlation with LogEvent.
+    // M6: event_id is attached to the span for correlation with LogEvent.
+    // Concurrency: use `.instrument(span).await` instead of `span.enter()` so
+    // the span is not held across `.await` on the multi-threaded runtime.
     let span = tracing::info_span!("detect_format", event_id = %event_id);
-    let _enter = span.enter();
 
-    // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
-    // performs a full serde_json::from_str and CSV allocation which must not
-    // run on the tokio executor.
-    let timeout = Duration::from_millis(config.pipeline_timeout_ms);
-    let start = Instant::now();
-    let (fmt, line_count, column_count) = tokio::time::timeout(timeout, async {
-        tokio::task::spawn_blocking(move || {
-            let fmt = FormatDetector::detect(&input);
-            let line_count = FormatDetector::jsonl_line_count(fmt, &input);
-            let column_count = FormatDetector::column_count(fmt, &input);
-            (fmt, line_count, column_count)
+    async move {
+        let pipeline_timeout_ms = config.pipeline_timeout_ms;
+        let start = Instant::now();
+        // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
+        // performs a full serde_json::from_str and CSV allocation which must not
+        // run on the tokio executor.
+        let (fmt, line_count, column_count) =
+            run_pipeline("detection", pipeline_timeout_ms, move || {
+                let fmt = FormatDetector::detect(&input);
+                let line_count = FormatDetector::jsonl_line_count(fmt, &input);
+                let column_count = FormatDetector::column_count(fmt, &input);
+                (fmt, line_count, column_count)
+            })
+            .await?;
+
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: Utc::now().timestamp_micros(),
+            tool_name: "detect_format".into(),
+            input_format: fmt.as_str().into(),
+            shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+            input_bytes: input_bytes as u64,
+            output_bytes: input_bytes as u64,
+            compressed: false,
+            savings_pct: 0.0,
+            threshold_used: config.max_output_ratio,
+            duration_us,
+            pass_reason: None,
+            client_hint: config.client_hint.clone(),
+        };
+
+        let _ = log_sink.record(event).await;
+
+        Ok(DetectResult {
+            format: fmt.as_str().into(),
+            input_bytes,
+            line_count,
+            column_count,
         })
-        .await
-    })
+    }
+    .instrument(span)
     .await
-    .map_err(|_| {
-        McpError::internal_error(
-            format!(
-                "pipeline_timeout: detection did not complete within {}ms \
-                 (TOON_PIPELINE_TIMEOUT_MS)",
-                config.pipeline_timeout_ms
-            ),
-            None,
-        )
-    })?
-    // H2: JoinError from a panicking task is an internal server error, not a
-    // bad client request.
-    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
-
-    let duration_us = start.elapsed().as_micros() as u64;
-
-    let event = LogEvent {
-        event_id: event_id.clone(),
-        ts_us: Utc::now().timestamp_micros(),
-        tool_name: "detect_format".into(),
-        input_format: fmt.as_str().into(),
-        shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-        input_bytes: input_bytes as u64,
-        output_bytes: input_bytes as u64,
-        compressed: false,
-        savings_pct: 0.0,
-        threshold_used: config.max_output_ratio,
-        duration_us,
-        pass_reason: None,
-        client_hint: config.client_hint.clone(),
-    };
-
-    let _ = log_sink.record(event).await;
-
-    Ok(DetectResult {
-        format: fmt.as_str().into(),
-        input_bytes,
-        line_count,
-        column_count,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -263,97 +288,87 @@ pub(crate) async fn handle_compress_content_inner(
 
     let event_id = new_event_id();
     let span = tracing::info_span!("compress_content", event_id = %event_id);
-    let _enter = span.enter();
 
-    let compress_config = CompressConfig::from(config.as_ref());
-    let timeout = Duration::from_millis(config.pipeline_timeout_ms);
-    let start = Instant::now();
+    async move {
+        let compress_config = CompressConfig::from(config.as_ref());
+        let pipeline_timeout_ms = config.pipeline_timeout_ms;
+        let start = Instant::now();
 
-    // L1: Return (input, decision) so input is available for pass-through output.
-    let (input, decision) = tokio::time::timeout(timeout, async {
-        tokio::task::spawn_blocking(move || {
+        // L1: Return (input, decision) so input is available for pass-through output.
+        let (input, decision) = run_pipeline("compression", pipeline_timeout_ms, move || {
             let decision = Compressor::decide(&input, &compress_config);
             (input, decision)
         })
-        .await
-    })
+        .await?;
+
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        // L2 + H3: named struct, no second detect call.
+        // Match is exhaustive over `CompressDecision` (no wildcard) so any new
+        // variant produces a compile-time error.
+        let outcome = match &decision {
+            CompressDecision::Compressed {
+                toon,
+                toon_bytes,
+                savings_pct,
+                input_format,
+                shape_class,
+                ..
+            } => CompressOutcome {
+                output: toon.clone(),
+                compressed: true,
+                format_str: input_format.as_str().into(),
+                shape_str: shape_class.as_str().into(),
+                output_bytes: *toon_bytes,
+                savings_pct: *savings_pct,
+                pass_reason_str: None,
+            },
+            CompressDecision::PassedThrough {
+                reason,
+                input_format,
+            } => CompressOutcome {
+                output: input.clone(),
+                compressed: false,
+                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+                output_bytes: input_bytes,
+                savings_pct: 0.0,
+                pass_reason_str: Some(reason.as_str().into()),
+            },
+        };
+
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: Utc::now().timestamp_micros(),
+            tool_name: "compress_content".into(),
+            input_format: outcome.format_str.clone(),
+            shape_class: outcome.shape_str.clone(),
+            input_bytes: input_bytes as u64,
+            output_bytes: outcome.output_bytes as u64,
+            compressed: outcome.compressed,
+            savings_pct: outcome.savings_pct,
+            threshold_used: config.max_output_ratio,
+            duration_us,
+            pass_reason: outcome.pass_reason_str.clone(),
+            client_hint: config.client_hint.clone(),
+        };
+
+        let _ = log_sink.record(event).await;
+
+        Ok(CompressResult {
+            output: outcome.output,
+            compressed: outcome.compressed,
+            format: outcome.format_str,
+            shape_class: outcome.shape_str,
+            input_bytes,
+            output_bytes: outcome.output_bytes,
+            savings_pct: outcome.savings_pct,
+            duration_us,
+            pass_reason: outcome.pass_reason_str,
+        })
+    }
+    .instrument(span)
     .await
-    .map_err(|_| {
-        McpError::internal_error(
-            format!(
-                "pipeline_timeout: compression did not complete within {}ms \
-                 (TOON_PIPELINE_TIMEOUT_MS)",
-                config.pipeline_timeout_ms
-            ),
-            None,
-        )
-    })?
-    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
-
-    let duration_us = start.elapsed().as_micros() as u64;
-
-    // L2 + H3: named struct, no second detect call.
-    let outcome = match &decision {
-        CompressDecision::Compressed {
-            toon,
-            toon_bytes,
-            savings_pct,
-            input_format,
-            shape_class,
-            ..
-        } => CompressOutcome {
-            output: toon.clone(),
-            compressed: true,
-            format_str: input_format.as_str().into(),
-            shape_str: shape_class.as_str().into(),
-            output_bytes: *toon_bytes,
-            savings_pct: *savings_pct,
-            pass_reason_str: None,
-        },
-        CompressDecision::PassedThrough {
-            reason,
-            input_format,
-        } => CompressOutcome {
-            output: input.clone(),
-            compressed: false,
-            format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
-            shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-            output_bytes: input_bytes,
-            savings_pct: 0.0,
-            pass_reason_str: Some(reason.as_str().into()),
-        },
-        _ => unreachable!(),
-    };
-
-    let event = LogEvent {
-        event_id: event_id.clone(),
-        ts_us: Utc::now().timestamp_micros(),
-        tool_name: "compress_content".into(),
-        input_format: outcome.format_str.clone(),
-        shape_class: outcome.shape_str.clone(),
-        input_bytes: input_bytes as u64,
-        output_bytes: outcome.output_bytes as u64,
-        compressed: outcome.compressed,
-        savings_pct: outcome.savings_pct,
-        threshold_used: config.max_output_ratio,
-        duration_us,
-        pass_reason: outcome.pass_reason_str.clone(),
-        client_hint: config.client_hint.clone(),
-    };
-
-    let _ = log_sink.record(event).await;
-
-    Ok(CompressResult {
-        output: outcome.output,
-        compressed: outcome.compressed,
-        format: outcome.format_str,
-        shape_class: outcome.shape_str,
-        input_bytes,
-        output_bytes: outcome.output_bytes,
-        savings_pct: outcome.savings_pct,
-        duration_us,
-        pass_reason: outcome.pass_reason_str,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -424,95 +439,82 @@ pub async fn handle_compression_stats(
 
     let event_id = new_event_id();
     let span = tracing::info_span!("compression_stats", event_id = %event_id);
-    let _enter = span.enter();
 
-    let compress_config = CompressConfig::from(config.as_ref());
-    let timeout = Duration::from_millis(config.pipeline_timeout_ms);
-    let start = Instant::now();
+    async move {
+        let compress_config = CompressConfig::from(config.as_ref());
+        let pipeline_timeout_ms = config.pipeline_timeout_ms;
+        let start = Instant::now();
 
-    // L1: Return (input, decision) — no clone needed.
-    let (_input, decision) = tokio::time::timeout(timeout, async {
-        tokio::task::spawn_blocking(move || {
-            let decision = Compressor::decide(&input, &compress_config);
-            (input, decision)
+        let decision = run_pipeline("compression", pipeline_timeout_ms, move || {
+            Compressor::decide(&input, &compress_config)
         })
-        .await
-    })
+        .await?;
+
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        // L2 + H3: named struct, no second detect call.
+        // Exhaustive match — see `handle_compress_content_inner` for rationale.
+        let outcome = match &decision {
+            CompressDecision::Compressed {
+                toon_bytes,
+                savings_pct,
+                input_format,
+                shape_class,
+                ..
+            } => CompressOutcome {
+                output: String::new(),
+                compressed: true,
+                format_str: input_format.as_str().into(),
+                shape_str: shape_class.as_str().into(),
+                output_bytes: *toon_bytes,
+                savings_pct: *savings_pct,
+                pass_reason_str: None,
+            },
+            CompressDecision::PassedThrough {
+                reason,
+                input_format,
+            } => CompressOutcome {
+                output: String::new(),
+                compressed: false,
+                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+                output_bytes: input_bytes,
+                savings_pct: 0.0,
+                pass_reason_str: Some(reason.as_str().into()),
+            },
+        };
+
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: Utc::now().timestamp_micros(),
+            tool_name: "compression_stats".into(),
+            input_format: outcome.format_str.clone(),
+            shape_class: outcome.shape_str.clone(),
+            input_bytes: input_bytes as u64,
+            output_bytes: outcome.output_bytes as u64,
+            compressed: outcome.compressed,
+            savings_pct: outcome.savings_pct,
+            threshold_used: config.max_output_ratio,
+            duration_us,
+            pass_reason: outcome.pass_reason_str.clone(),
+            client_hint: config.client_hint.clone(),
+        };
+
+        let _ = log_sink.record(event).await;
+
+        Ok(StatsResult {
+            would_compress: outcome.compressed,
+            format: outcome.format_str,
+            shape_class: outcome.shape_str,
+            input_bytes,
+            estimated_output_bytes: outcome.output_bytes,
+            estimated_savings_pct: outcome.savings_pct,
+            threshold: config.max_output_ratio,
+            pass_reason: outcome.pass_reason_str,
+        })
+    }
+    .instrument(span)
     .await
-    .map_err(|_| {
-        McpError::internal_error(
-            format!(
-                "pipeline_timeout: compression did not complete within {}ms \
-                 (TOON_PIPELINE_TIMEOUT_MS)",
-                config.pipeline_timeout_ms
-            ),
-            None,
-        )
-    })?
-    .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?;
-
-    let duration_us = start.elapsed().as_micros() as u64;
-
-    // L2 + H3: named struct, no second detect call.
-    let outcome = match &decision {
-        CompressDecision::Compressed {
-            toon_bytes,
-            savings_pct,
-            input_format,
-            shape_class,
-            ..
-        } => CompressOutcome {
-            output: String::new(), // not used for stats
-            compressed: true,
-            format_str: input_format.as_str().into(),
-            shape_str: shape_class.as_str().into(),
-            output_bytes: *toon_bytes,
-            savings_pct: *savings_pct,
-            pass_reason_str: None,
-        },
-        CompressDecision::PassedThrough {
-            reason,
-            input_format,
-        } => CompressOutcome {
-            output: String::new(),
-            compressed: false,
-            format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
-            shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-            output_bytes: input_bytes,
-            savings_pct: 0.0,
-            pass_reason_str: Some(reason.as_str().into()),
-        },
-        _ => unreachable!(),
-    };
-
-    let event = LogEvent {
-        event_id: event_id.clone(),
-        ts_us: Utc::now().timestamp_micros(),
-        tool_name: "compression_stats".into(),
-        input_format: outcome.format_str.clone(),
-        shape_class: outcome.shape_str.clone(),
-        input_bytes: input_bytes as u64,
-        output_bytes: outcome.output_bytes as u64,
-        compressed: outcome.compressed,
-        savings_pct: outcome.savings_pct,
-        threshold_used: config.max_output_ratio,
-        duration_us,
-        pass_reason: outcome.pass_reason_str.clone(),
-        client_hint: config.client_hint.clone(),
-    };
-
-    let _ = log_sink.record(event).await;
-
-    Ok(StatsResult {
-        would_compress: outcome.compressed,
-        format: outcome.format_str,
-        shape_class: outcome.shape_str,
-        input_bytes,
-        estimated_output_bytes: outcome.output_bytes,
-        estimated_savings_pct: outcome.savings_pct,
-        threshold: config.max_output_ratio,
-        pass_reason: outcome.pass_reason_str,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +813,90 @@ mod tests {
             .unwrap();
         }
         assert_eq!(events.lock().expect("not poisoned").len(), 3);
+    }
+
+    /// The semaphore permit acquired at handler entry must be released
+    /// even when the pipeline times out. Otherwise, sustained timeouts
+    /// would gradually deplete `max_concurrent_calls` and wedge the server.
+    #[tokio::test]
+    async fn detect_format_releases_permit_on_timeout() {
+        let mut base = (*test_config()).clone();
+        base.pipeline_timeout_ms = 0;
+        base.max_concurrent_calls = 2;
+        let cfg = Arc::new(base);
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrent_calls));
+
+        let initial = sem.available_permits();
+        // The result may be `Ok` if the underlying spawn_blocking completes
+        // faster than the 0ms timeout fires (tokio polls the inner future
+        // at least once before checking the deadline). The contract under
+        // test is the permit lifecycle, not the error path, so we tolerate
+        // either outcome.
+        let _ = handle_detect_format(
+            DetectParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await;
+
+        // Whether the timeout fired during semaphore acquire, during the
+        // pipeline body, or never — the permit must always be released by
+        // the time the call returns. Otherwise sustained timeouts would
+        // gradually wedge the server.
+        assert_eq!(
+            sem.available_permits(),
+            initial,
+            "permit was not released after handler returned"
+        );
+    }
+
+    /// Same property for `compress_content`.
+    #[tokio::test]
+    async fn compress_content_releases_permit_on_timeout() {
+        let mut base = (*test_config()).clone();
+        base.pipeline_timeout_ms = 0;
+        base.max_concurrent_calls = 2;
+        let cfg = Arc::new(base);
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrent_calls));
+
+        let initial = sem.available_permits();
+        let _ = handle_compress_content_inner(
+            CompressParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await;
+
+        assert_eq!(sem.available_permits(), initial);
+    }
+
+    /// Same property for `compression_stats`.
+    #[tokio::test]
+    async fn compression_stats_releases_permit_on_timeout() {
+        let mut base = (*test_config()).clone();
+        base.pipeline_timeout_ms = 0;
+        base.max_concurrent_calls = 2;
+        let cfg = Arc::new(base);
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrent_calls));
+
+        let initial = sem.available_permits();
+        let _ = handle_compression_stats(
+            StatsParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await;
+
+        assert_eq!(sem.available_permits(), initial);
     }
 
     #[test]

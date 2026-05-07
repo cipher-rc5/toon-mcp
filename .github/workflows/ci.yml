@@ -44,12 +44,13 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy -- -D warnings
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      # M8: Measure coverage and enforce a 70% line coverage floor.
+      # Coverage gate. Floor raised from 70 -> 75 once non-trivial coverage
+      # was confirmed; bump again when coverage matures.
       - name: cargo llvm-cov (coverage gate)
         run: |
           cargo llvm-cov --workspace \
@@ -57,7 +58,7 @@ jobs:
             --ignore-filename-regex "crates/toon-mcp-bench"
           cargo llvm-cov report \
             --ignore-filename-regex "crates/toon-mcp-bench" \
-            --fail-under-lines 70
+            --fail-under-lines 75
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -72,3 +73,59 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --package toon-mcp-server
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit (deny warnings)
+        run: cargo audit --deny warnings
+
+  semver-checks:
+    name: cargo-semver-checks (library crates)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Detect changes to library crates
+        id: changes
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base" "$head" -- \
+               'crates/toon-mcp-core/**' 'crates/toon-mcp-logging/**' | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cargo-semver-checks
+        if: steps.changes.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: cargo semver-checks (toon-mcp-core, toon-mcp-logging)
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          cargo semver-checks check-release \
+            -p toon-mcp-core \
+            -p toon-mcp-logging

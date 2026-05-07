@@ -22,11 +22,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain
+      # Toolchain pinned via rust-toolchain.toml (1.87.0). Keeping this in
+      # sync with CI guarantees release artefacts are built by the same rustc
+      # the workspace is verified against.
+      - name: Install toolchain (pinned via rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94.0"
           targets: ${{ matrix.target }}
+
+      - name: Verify toolchain matches rust-toolchain.toml
+        run: |
+          PINNED=$(awk -F\" '/channel/ { print $2 }' rust-toolchain.toml)
+          ACTIVE=$(rustc -V | awk '{ print $2 }')
+          if [ "$PINNED" != "$ACTIVE" ]; then
+            echo "Toolchain mismatch: rust-toolchain.toml=$PINNED, active=$ACTIVE" >&2
+            exit 1
+          fi
 
       - name: Install cross
         uses: taiki-e/install-action@cross
@@ -53,11 +64,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Install toolchain (pinned via rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94.0"
           targets: aarch64-apple-darwin
+
+      - name: Verify toolchain matches rust-toolchain.toml
+        run: |
+          PINNED=$(awk -F\" '/channel/ { print $2 }' rust-toolchain.toml)
+          ACTIVE=$(rustc -V | awk '{ print $2 }')
+          if [ "$PINNED" != "$ACTIVE" ]; then
+            echo "Toolchain mismatch: rust-toolchain.toml=$PINNED, active=$ACTIVE" >&2
+            exit 1
+          fi
 
       - name: Build release binary
         run: cargo build --release --package toon-mcp-server --target aarch64-apple-darwin

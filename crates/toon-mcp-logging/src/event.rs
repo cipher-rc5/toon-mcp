@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {
-    /// UUIDv4 uniquely identifying this event.
+    /// 16-character lowercase hexadecimal identifier (xxh3-64 of an
+    /// atomic counter mixed with a nanosecond timestamp). Not a UUID;
+    /// uniqueness is guaranteed within a single process run.
     pub event_id: String,
 
     /// Unix timestamp in microseconds when the tool call was received.

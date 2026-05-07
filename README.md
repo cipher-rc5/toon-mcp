@@ -1,6 +1,6 @@
 # toon-mcp
 
-A Model Context Protocol (MCP) server that detects, classifies, and compresses structured data (JSON, JSONL, CSV, TSV) into the TOON format to reduce token consumption in LLM context windows.
+Model Context Protocol (MCP) server that detects, classifies, and compresses structured data (JSON, JSONL, CSV, TSV) into the TOON format to reduce token consumption in LLM context windows.
 
 ---
 

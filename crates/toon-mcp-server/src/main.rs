@@ -28,8 +28,8 @@ async fn main() -> Result<(), ServerError> {
     // The sink is wrapped in Arc for shared access from the server handlers.
     let sink: Arc<dyn LogSink> = if config.logging_enabled {
         let logging_config = config.logging.clone();
-        let (jsonl_sink, task) = JsonlSink::new(logging_config)?;
-        let handle = tokio::spawn(task);
+        // `start` owns the spawn so callers cannot forget the writer task.
+        let (jsonl_sink, handle) = JsonlSink::start(logging_config)?;
 
         // M3: Supervisor — treat unexpected writer task exit as fatal.
         // Log a structured error so operators can detect silent log loss.

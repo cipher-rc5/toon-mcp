@@ -129,3 +129,51 @@ not json
         assert_eq!(arr[0]["名前"], "太郎");
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    // file: crates/toon-mcp-core/src/parser/jsonl.rs (proptest_tests)
+    // description: Round-trip proptests for JsonlParser using generated object streams.
+
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::{Map, Value};
+
+    /// Strategy for a single JSON object whose values are all primitives.
+    /// `serde_json::to_string` on such a value is guaranteed to be single-line
+    /// so it round-trips cleanly through JSONL.
+    fn flat_object_strategy() -> impl Strategy<Value = Value> {
+        let primitive = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| Value::Number(n.into())),
+            "[a-zA-Z0-9 _-]{0,8}".prop_map(Value::String),
+        ];
+        prop::collection::hash_map("[a-zA-Z][a-zA-Z0-9_]{0,5}", primitive, 0..6).prop_map(|m| {
+            let mut map = Map::new();
+            for (k, v) in m {
+                map.insert(k, v);
+            }
+            Value::Object(map)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A vector of flat objects joined by `\n` parses to a `Value::Array`
+        /// with the same elements in the same order.
+        #[test]
+        fn jsonl_round_trip_preserves_objects(
+            items in prop::collection::vec(flat_object_strategy(), 0..8)
+        ) {
+            let lines: Vec<String> = items
+                .iter()
+                .map(|v| serde_json::to_string(v).expect("serialize"))
+                .collect();
+            let input = lines.join("\n");
+            let parsed = JsonlParser.parse(&input).expect("parse");
+            prop_assert_eq!(parsed, Value::Array(items));
+        }
+    }
+}

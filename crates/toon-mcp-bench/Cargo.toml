@@ -20,9 +20,16 @@ harness = false
 name    = "compression"
 harness = false
 
+[[bench]]
+name    = "jsonl_sink"
+harness = false
+
 [dependencies]
 toon-mcp-core = { path = "../toon-mcp-core" }
 
 [dev-dependencies]
 criterion.workspace  = true
 serde_json.workspace = true
+tempfile.workspace   = true
+tokio                = { workspace = true, features = ["rt", "macros"] }
+toon-mcp-logging     = { path = "../toon-mcp-logging" }

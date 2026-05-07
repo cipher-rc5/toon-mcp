@@ -15,3 +15,6 @@ serde_json.workspace  = true
 serde.workspace       = true
 csv.workspace         = true
 thiserror.workspace   = true
+
+[dev-dependencies]
+proptest.workspace = true
