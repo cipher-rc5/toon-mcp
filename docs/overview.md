@@ -53,7 +53,8 @@ toon-mcp-server  (binary, MCP wiring, tool handlers)
      +-- toon-mcp-core    (pure logic: detect, classify, compress — no I/O, no async)
      +-- toon-mcp-logging (structured event logging behind a trait interface)
 
-toon-mcp-bench   (Criterion benchmarks; depends only on toon-mcp-core)
+toon-mcp-bench   (Criterion benchmarks; sync benches depend on toon-mcp-core,
+                  async benches additionally on toon-mcp-logging)
 ```
 
 Key architectural decisions:

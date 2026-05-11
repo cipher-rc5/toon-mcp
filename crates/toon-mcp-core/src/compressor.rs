@@ -5,6 +5,7 @@
 use crate::{
     classifier::{Classifier, ClassifyConfig, ShapeClass},
     detector::{FormatDetector, InputFormat},
+    parser::{Parser, csv::CsvParser, json::JsonParser, jsonl::JsonlParser},
 };
 
 /// Maximum number of bytes accepted as input. Inputs larger than this are
@@ -39,6 +40,12 @@ pub struct CompressConfig {
     pub fold_min_depth: usize,
     /// Minimum array length to qualify as PrimitiveArray (overrides the default constant).
     pub primitive_array_min: usize,
+    /// Whether CSV/TSV parsing coerces numeric-looking fields into `Value::Number`.
+    ///
+    /// When `false`, every CSV/TSV cell remains a `Value::String`. Disable
+    /// this when inputs contain identifiers, postal codes, or leading-zero
+    /// values that should not be silently coerced.
+    pub csv_numeric_coercion: bool,
 }
 
 impl Default for CompressConfig {
@@ -52,6 +59,7 @@ impl Default for CompressConfig {
             tabular_min_rows: crate::classifier::TABULAR_MIN_ROWS,
             fold_min_depth: crate::classifier::FOLD_MIN_DEPTH,
             primitive_array_min: crate::classifier::PRIMITIVE_ARRAY_MIN,
+            csv_numeric_coercion: true,
         }
     }
 }
@@ -221,12 +229,29 @@ impl Compressor {
         }
 
         // Step 3: detect and parse.
-        // Run detect once up-front so non-`ParseFailed` errors below can
-        // still report the format that detection identified, instead of
-        // collapsing to `Unknown`.
+        // Detection runs once up-front so the appropriate parser can be
+        // dispatched with the runtime configuration (e.g. CSV numeric
+        // coercion). Non-`ParseFailed` errors still report the detected
+        // format instead of collapsing to `Unknown`.
         let detected_fmt = FormatDetector::detect(input);
-        let (fmt, value) = match FormatDetector::detect_and_parse(input) {
-            Ok(pair) => pair,
+        let parse_result = match detected_fmt {
+            InputFormat::Json => JsonParser.parse(input),
+            InputFormat::Jsonl => JsonlParser.parse(input),
+            InputFormat::Csv => CsvParser::csv()
+                .with_numeric_coercion(config.csv_numeric_coercion)
+                .parse(input),
+            InputFormat::Tsv => CsvParser::tsv()
+                .with_numeric_coercion(config.csv_numeric_coercion)
+                .parse(input),
+            InputFormat::Unknown => {
+                return CompressDecision::PassedThrough {
+                    reason: PassThroughReason::UnknownFormat,
+                    input_format: Some(InputFormat::Unknown),
+                };
+            }
+        };
+        let (fmt, value) = match parse_result {
+            Ok(v) => (detected_fmt, v),
             Err(crate::error::CoreError::ParseFailed { format, detail, .. }) => {
                 if format == InputFormat::Unknown {
                     return CompressDecision::PassedThrough {

@@ -130,9 +130,12 @@ impl FormatDetector {
     /// ```
     pub fn detect(input: &str) -> InputFormat {
         // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
+        // Use `IgnoredAny` so serde_json validates structure without
+        // allocating a `Value` tree; we re-parse with a real Value if and
+        // when the caller invokes `detect_and_parse`.
         let first_nonws = input.bytes().find(|b| !b.is_ascii_whitespace());
         if matches!(first_nonws, Some(b'{') | Some(b'['))
-            && serde_json::from_str::<serde_json::Value>(input).is_ok()
+            && serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok()
         {
             return InputFormat::Json;
         }

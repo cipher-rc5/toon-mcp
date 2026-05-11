@@ -465,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn deep_fold_chain_exceeding_internal_cap_does_not_overflow() {
+        // Build a singly-keyed nested object chain whose depth exceeds the
+        // internal FOLD_CHAIN_MAX_DEPTH cap (256). The classifier must return
+        // a ShapeClass without overflowing the stack. The exact variant is
+        // implementation-defined at this boundary; we only assert that the
+        // call returns. Constructing the tree iteratively avoids any test-side
+        // recursion that could obscure a regression.
+        const DEPTH: usize = 300;
+        let mut acc = serde_json::Value::String("leaf".into());
+        for i in 0..DEPTH {
+            let mut m = serde_json::Map::new();
+            m.insert(format!("k{i}"), acc);
+            acc = serde_json::Value::Object(m);
+        }
+        // If FOLD_CHAIN_MAX_DEPTH were missing, this would stack-overflow.
+        let _ = Classifier::classify(&acc);
+    }
+
+    #[test]
     fn primitive_array_min_zero_does_not_panic() {
         let config = ClassifyConfig {
             primitive_array_min: 0,

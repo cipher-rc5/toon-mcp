@@ -33,12 +33,24 @@ use serde_json::{Map, Number, Value};
 pub struct CsvParser {
     /// The field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delimiter: u8,
+    /// Whether to coerce fields parseable as `f64` into `Value::Number`.
+    ///
+    /// When `false`, every field is emitted as `Value::String` regardless of
+    /// content. Disable this when inputs contain identifiers, postal codes,
+    /// or leading-zero values that must not be silently coerced.
+    numeric_coercion: bool,
 }
 
 impl CsvParser {
     /// Create a new parser with the given field delimiter.
+    ///
+    /// Numeric coercion is enabled by default; use
+    /// [`Self::with_numeric_coercion`] to disable it.
     pub fn new(delimiter: u8) -> Self {
-        Self { delimiter }
+        Self {
+            delimiter,
+            numeric_coercion: true,
+        }
     }
 
     /// Create a CSV parser (comma delimiter).
@@ -49,6 +61,17 @@ impl CsvParser {
     /// Create a TSV parser (tab delimiter).
     pub fn tsv() -> Self {
         Self::new(b'\t')
+    }
+
+    /// Toggle f64 numeric coercion for parsed fields.
+    ///
+    /// When `enabled` is `true` (the default), any field that parses as `f64`
+    /// becomes a `Value::Number`. When `false`, all fields remain as
+    /// `Value::String`, which preserves identifiers, postal codes, and
+    /// leading-zero values verbatim at the cost of larger TOON output.
+    pub fn with_numeric_coercion(mut self, enabled: bool) -> Self {
+        self.numeric_coercion = enabled;
+        self
     }
 }
 
@@ -67,15 +90,20 @@ impl Parser for CsvParser {
             let mut map = Map::with_capacity(headers.len());
 
             for (key, field) in headers.iter().zip(record.iter()) {
-                let val = if let Ok(n) = field.parse::<f64>() {
-                    // Postcondition: f64 parsed successfully implies Number::from_f64 succeeds
-                    // for all finite values. Infinite/NaN fields fall through to string.
-                    Number::from_f64(n)
-                        .map(Value::Number)
-                        .unwrap_or_else(|| Value::String(field.to_owned()))
+                let val = if self.numeric_coercion {
+                    if let Ok(n) = field.parse::<f64>() {
+                        // Postcondition: f64 parsed successfully implies Number::from_f64 succeeds
+                        // for all finite values. Infinite/NaN fields fall through to string.
+                        Number::from_f64(n)
+                            .map(Value::Number)
+                            .unwrap_or_else(|| Value::String(field.to_owned()))
+                    } else {
+                        Value::String(field.to_owned())
+                    }
                 } else {
                     Value::String(field.to_owned())
                 };
+                // key.clone(): Map<String, Value> requires owned keys; headers is borrowed during iteration so we cannot move keys out.
                 map.insert(key.clone(), val);
             }
 
@@ -153,6 +181,19 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["city"], "東京");
         assert_eq!(arr[1]["name"], "Bob");
+    }
+
+    #[test]
+    fn disabled_coercion_preserves_strings() {
+        // With numeric_coercion disabled, all fields stay as Value::String —
+        // useful for inputs containing identifiers, postal codes, or
+        // leading-zero values that must not be silently coerced to f64.
+        let v = CsvParser::csv()
+            .with_numeric_coercion(false)
+            .parse("id,x\n1,2")
+            .unwrap();
+        assert!(v[0]["id"].is_string());
+        assert!(v[0]["x"].is_string());
     }
 
     #[test]

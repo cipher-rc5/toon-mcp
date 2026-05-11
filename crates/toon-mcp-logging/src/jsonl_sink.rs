@@ -36,6 +36,25 @@ use async_trait::async_trait;
 /// ```sql
 /// SELECT * FROM read_json('data/logs/**/*.jsonl');
 /// ```
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use toon_mcp_logging::{JsonlSink, JsonlSinkConfig, LogSink};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = JsonlSinkConfig {
+///     log_dir: "data/logs".into(),
+///     buffer_size: 1000,
+///     flush_interval: Duration::from_secs(60),
+/// };
+/// // `start` constructs the sink and spawns the background writer task.
+/// let (sink, _handle) = JsonlSink::start(config)?;
+/// // ... record events via the LogSink trait ...
+/// Box::new(sink).shutdown().await?;
+/// # Ok(()) }
+/// ```
 #[derive(Debug, Clone)]
 pub struct JsonlSinkConfig {
     /// Root directory for partitioned JSONL log files.
@@ -70,14 +89,16 @@ enum SinkCmd {
 pub struct JsonlSink {
     sender: mpsc::Sender<SinkCmd>,
     serialization_failed_count: Arc<AtomicU64>,
+    record_failed_count: Arc<AtomicU64>,
 }
 
 impl JsonlSink {
-    /// Construct a new sink and the background task future.
+    /// Internal/test constructor. Returns the sink and an unspawned writer-task
+    /// future that the caller MUST spawn before using the sink.
     ///
-    /// The caller MUST spawn the returned future before the sink is used.
-    /// Most callers should prefer [`JsonlSink::start`] which spawns the
-    /// writer task automatically and returns its `JoinHandle`.
+    /// **Production code should use [`JsonlSink::start`] instead** — it owns the
+    /// `tokio::spawn` so callers cannot forget to start the writer.
+    #[doc(hidden)]
     pub fn new(
         config: JsonlSinkConfig,
     ) -> Result<(Self, impl Future<Output = ()> + use<>), LogError> {
@@ -88,9 +109,11 @@ impl JsonlSink {
         }
 
         let serialization_failed_count = Arc::new(AtomicU64::new(0));
+        let record_failed_count = Arc::new(AtomicU64::new(0));
         let sink = JsonlSink {
             sender: tx,
             serialization_failed_count: Arc::clone(&serialization_failed_count),
+            record_failed_count,
         };
         let task_future = writer_task(
             rx,
@@ -123,15 +146,27 @@ impl JsonlSink {
     pub fn serialization_failed_count(&self) -> u64 {
         self.serialization_failed_count.load(Ordering::Relaxed)
     }
+
+    /// Number of `record` calls that failed because the writer-task channel
+    /// was closed (the background task has exited).
+    ///
+    /// Increments monotonically over the lifetime of the sink. A non-zero
+    /// value indicates events were lost — typically because `shutdown` was
+    /// called and then `record` was attempted on a clone, or the writer
+    /// task panicked.
+    pub fn record_failed_count(&self) -> u64 {
+        self.record_failed_count.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
 impl LogSink for JsonlSink {
     async fn record(&self, event: LogEvent) -> Result<(), LogError> {
-        self.sender
-            .send(SinkCmd::Record(event))
-            .await
-            .map_err(|e| LogError::ChannelSend(e.to_string()))
+        if let Err(e) = self.sender.send(SinkCmd::Record(event)).await {
+            self.record_failed_count.fetch_add(1, Ordering::Relaxed);
+            return Err(LogError::ChannelSend(e.to_string()));
+        }
+        Ok(())
     }
 
     /// Flush all buffered events to disk and wait for acknowledgement.
@@ -560,6 +595,33 @@ mod tests {
         let jsonl_path = dir.path().join("day=2023-11-14").join("events.jsonl");
         assert!(jsonl_path.exists());
         Box::new(sink).shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn record_failed_count_increments_when_channel_closed() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 4,
+            flush_interval: Duration::from_secs(3600),
+        };
+
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        // Intentionally drop the writer-task future without spawning it. This
+        // drops the receiver end of the mpsc channel, so the next `record`
+        // call must fail with `ChannelSend`.
+        drop(task);
+
+        let result = sink.record(make_event(1)).await;
+        assert!(
+            matches!(result, Err(LogError::ChannelSend(_))),
+            "record must fail when writer-task receiver is dropped, got {result:?}"
+        );
+        assert_eq!(
+            sink.record_failed_count(),
+            1,
+            "record_failed_count increments on send failure"
+        );
     }
 
     #[tokio::test]

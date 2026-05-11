@@ -34,7 +34,7 @@ graph TD
 - `toon-mcp-server` may call into `toon-mcp-core` and `toon-mcp-logging`
 - `toon-mcp-core` has zero workspace dependencies beyond `toon-format`, `serde_json`, `serde`, `csv`, and `thiserror`
 - `toon-mcp-logging` has no dependency on `toon-mcp-core`
-- `toon-mcp-bench` depends only on `toon-mcp-core`
+- `toon-mcp-bench` depends on `toon-mcp-core` (sync benches) and may additionally depend on `toon-mcp-logging` for dedicated async benches
 - No crate imports `rmcp` except `toon-mcp-server`
 
 ---
@@ -80,7 +80,16 @@ The runnable binary. Owns startup, configuration, and MCP protocol registration.
 
 ### `toon-mcp-bench`
 
-Criterion benchmark suite. Three benchmark files, six functions each. Depends only on `toon-mcp-core` — no server, no logging, no async runtime.
+Criterion benchmark suite. Four benchmark binaries:
+
+| Bench file | Scope | Runtime |
+|---|---|---|
+| `detection.rs` | Sync core: format detection | None |
+| `classification.rs` | Sync core: shape classification | None |
+| `compression.rs` | Sync core: full compression pipeline | None |
+| `jsonl_sink.rs` | Async logging sink: channel throughput, flush latency | `tokio` `current_thread` |
+
+The three sync core benches depend only on `toon-mcp-core` and MUST NOT start a tokio runtime. The dedicated `jsonl_sink.rs` async bench depends on `toon-mcp-logging` and is the only place a tokio runtime is permitted in this crate — it exists to measure async-specific behaviour (channel throughput, flush latency) that cannot be measured synchronously. The bench crate never depends on `toon-mcp-server`.
 
 ---
 

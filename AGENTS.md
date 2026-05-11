@@ -84,7 +84,8 @@ Layer call direction (strict — no upward calls permitted):
     toon-mcp-server  ->  toon-mcp-logging
     toon-mcp-core    ->  (no workspace deps beyond toon-format, serde_json, csv)
     toon-mcp-logging ->  (no toon-mcp-core dep)
-    toon-mcp-bench   ->  toon-mcp-core only
+    toon-mcp-bench   ->  toon-mcp-core (sync benches);
+                         additionally toon-mcp-logging for async benches only
 
 - toon-mcp-core MUST remain pure: no I/O, no async, no rmcp dependency.
 - toon-mcp-logging MUST NOT depend on toon-mcp-core.
@@ -103,8 +104,14 @@ Layer call direction (strict — no upward calls permitted):
 
 - All benchmark fixtures live in crates/toon-mcp-bench/fixtures/.
 - Benchmark harness: Criterion exclusively.
-- Benchmarks MUST NOT start a tokio runtime. They measure synchronous
-  core functions only.
+- Sync core benchmarks (detection, classification, compression) MUST NOT
+  start a tokio runtime. They measure synchronous core functions only.
+- Async-specific benchmarks (e.g. logging sink throughput) MAY start a
+  tokio runtime if all of the following hold: they live in their own
+  dedicated bench binary, they use `current_thread` runtime where possible
+  to keep measurements deterministic, and their purpose is to measure
+  async-specific behaviour (channel throughput, flush latency) that cannot
+  be measured synchronously.
 - Baseline snapshots are committed to bench/baselines/. Do not delete them.
 - Run benchmarks: `cargo bench --package toon-mcp-bench`
 
@@ -141,4 +148,4 @@ chore, revert.
 | Direct LLM API calls from server | Server is a tool provider only |
 | System prompt injection per turn | Instructions registered once in ServerInfo |
 | XML, YAML, TOML parsers (v1) | Out of scope; planned for future plugin iteration |
-| toon-mcp-bench importing server crates | Bench depends only on toon-mcp-core |
+| toon-mcp-bench importing toon-mcp-server | Bench depends on toon-mcp-core (sync benches) or toon-mcp-logging (async benches only); never on toon-mcp-server |

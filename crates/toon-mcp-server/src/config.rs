@@ -43,6 +43,12 @@ pub struct Config {
     /// Minimum array length for PrimitiveArray classification.
     pub primitive_array_min: usize,
 
+    /// Whether CSV/TSV parsing coerces numeric-looking fields into numbers.
+    ///
+    /// Set to `false` for inputs containing identifiers, postal codes, or
+    /// leading-zero values that should not be silently coerced.
+    pub csv_numeric_coercion: bool,
+
     /// Whether structured logging is enabled.
     pub logging_enabled: bool,
 
@@ -67,9 +73,17 @@ pub struct Config {
     pub max_concurrent_calls: usize,
 }
 
+/// `Default` differs from `Config::load`: it has `logging_enabled: false` so
+/// library consumers do not silently inherit a relative `data/logs` path. Use
+/// `Config::load` for env-driven behaviour.
 impl Default for Config {
-    /// Returns a `Config` populated with the same defaults as `Config::load`
-    /// when no environment variables are set.
+    /// Returns a `Config` populated with safe defaults for library consumers.
+    ///
+    /// Unlike `Config::load`, this does NOT enable logging — a relative
+    /// `data/logs` path would silently misdirect log files when the process
+    /// working directory is unexpected (e.g. under a desktop process
+    /// supervisor). Callers that want env-driven behaviour should use
+    /// [`Config::load`] instead.
     fn default() -> Self {
         Self {
             max_output_ratio: 0.85,
@@ -80,7 +94,8 @@ impl Default for Config {
             tabular_min_rows: 3,
             fold_min_depth: 3,
             primitive_array_min: 5,
-            logging_enabled: true,
+            csv_numeric_coercion: true,
+            logging_enabled: false,
             logging: JsonlSinkConfig::default(),
             log_level: "info".into(),
             client_hint: None,
@@ -104,6 +119,7 @@ impl Config {
         let tabular_min_rows = env_usize("TOON_TABULAR_MIN_ROWS", 3);
         let fold_min_depth = env_usize("TOON_FOLD_MIN_DEPTH", 3);
         let primitive_array_min = env_usize("TOON_PRIMITIVE_ARRAY_MIN", 5);
+        let csv_numeric_coercion = env_bool("TOON_CSV_NUMERIC_COERCION", true);
         let logging_enabled = env_bool("TOON_LOG_ENABLED", true);
         let log_level = std::env::var("TOON_LOG_LEVEL").unwrap_or_else(|_| "info".into());
         let pipeline_timeout_ms = env_u64("TOON_PIPELINE_TIMEOUT_MS", 30_000);
@@ -153,6 +169,7 @@ impl Config {
             tabular_min_rows,
             fold_min_depth,
             primitive_array_min,
+            csv_numeric_coercion,
             logging_enabled,
             logging: JsonlSinkConfig {
                 log_dir: log_dir_path,
@@ -285,6 +302,7 @@ mod tests {
                 ("TOON_TABULAR_MIN_ROWS", None::<&str>),
                 ("TOON_FOLD_MIN_DEPTH", None::<&str>),
                 ("TOON_PRIMITIVE_ARRAY_MIN", None::<&str>),
+                ("TOON_CSV_NUMERIC_COERCION", None::<&str>),
                 ("TOON_LOG_ENABLED", None::<&str>),
                 ("TOON_LOG_LEVEL", None::<&str>),
                 ("TOON_CLIENT_HINT", None::<&str>),
@@ -390,6 +408,22 @@ mod tests {
     fn max_concurrent_calls_override() {
         with_env("TOON_MAX_CONCURRENT_CALLS", "16", || {
             assert_eq!(Config::load().max_concurrent_calls, 16);
+        });
+    }
+
+    #[test]
+    fn csv_numeric_coercion_default() {
+        // With no env var set, csv_numeric_coercion defaults to true to
+        // preserve historical behaviour and maximise compression.
+        temp_env::with_var("TOON_CSV_NUMERIC_COERCION", None::<&str>, || {
+            assert!(Config::load().csv_numeric_coercion);
+        });
+    }
+
+    #[test]
+    fn csv_numeric_coercion_override() {
+        with_env("TOON_CSV_NUMERIC_COERCION", "false", || {
+            assert!(!Config::load().csv_numeric_coercion);
         });
     }
 }

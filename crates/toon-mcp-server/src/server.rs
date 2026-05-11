@@ -1,8 +1,11 @@
+// file: crates/toon-mcp-server/src/server.rs
+// description: rmcp ServerHandler implementation and tool router for ToonMcpServer
+
 use std::sync::Arc;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler,
-    handler::server::wrapper::Json,
+    handler::server::wrapper::{Json, Parameters},
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
@@ -44,7 +47,7 @@ impl ToonMcpServer {
                           or unknown) and basic statistics.")]
     async fn detect_format(
         &self,
-        rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<DetectParams>,
+        Parameters(params): Parameters<DetectParams>,
     ) -> Result<Json<DetectResult>, McpError> {
         handle_detect_format(
             params,
@@ -63,7 +66,7 @@ impl ToonMcpServer {
                           TOON is human-readable — interpret it directly.")]
     async fn compress_content(
         &self,
-        rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<CompressParams>,
+        Parameters(params): Parameters<CompressParams>,
     ) -> Result<Json<CompressResult>, McpError> {
         handle_compress_content_inner(
             params,
@@ -81,7 +84,7 @@ impl ToonMcpServer {
                           to decide whether compression is worthwhile.")]
     async fn compression_stats(
         &self,
-        rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<StatsParams>,
+        Parameters(params): Parameters<StatsParams>,
     ) -> Result<Json<StatsResult>, McpError> {
         handle_compression_stats(
             params,

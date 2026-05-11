@@ -9,8 +9,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify (fmt / clippy / test / audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo audit (deny warnings)
+        run: cargo audit --deny warnings
+
   build-linux:
     name: Build (${{ matrix.target }})
+    needs: [verify]
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -22,7 +52,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Toolchain pinned via rust-toolchain.toml (1.87.0). Keeping this in
+      # Toolchain pinned via rust-toolchain.toml (1.93.0). Keeping this in
       # sync with CI guarantees release artefacts are built by the same rustc
       # the workspace is verified against.
       - name: Install toolchain (pinned via rust-toolchain.toml)
@@ -58,6 +88,7 @@ jobs:
 
   build-macos:
     name: Build (aarch64-apple-darwin)
+    needs: [verify]
     runs-on: macos-latest
 
     steps:
@@ -94,7 +125,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: [build-linux, build-macos]
+    needs: [verify, build-linux, build-macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -106,6 +137,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256 checksums
+        working-directory: artifacts
+        run: |
+          sha256sum toon-mcp-server-* > checksums.sha256
+          cat checksums.sha256
+
       - name: Create GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,4 +153,5 @@ jobs:
             --generate-notes \
             artifacts/toon-mcp-server-x86_64-unknown-linux-gnu \
             artifacts/toon-mcp-server-aarch64-unknown-linux-gnu \
-            artifacts/toon-mcp-server-aarch64-apple-darwin
+            artifacts/toon-mcp-server-aarch64-apple-darwin \
+            artifacts/checksums.sha256

@@ -49,6 +49,7 @@ fn test_config() -> Config {
         tabular_min_rows: 3,
         fold_min_depth: 3,
         primitive_array_min: 5,
+        csv_numeric_coercion: true,
         logging_enabled: false,
         logging: toon_mcp_logging::JsonlSinkConfig::default(),
         log_level: "error".into(),

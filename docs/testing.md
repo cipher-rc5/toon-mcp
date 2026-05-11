@@ -47,17 +47,20 @@ in-memory `tokio::io::duplex` transport and the rmcp client API to verify
 that tool names are routed to the correct handler, JSON parameters are
 deserialised correctly, and responses are well-formed.
 
-### Benchmarks (18 Criterion functions)
+### Benchmarks (Criterion)
 
-Three benchmark binaries live in `crates/toon-mcp-bench/benches/`, each backed
+Four benchmark binaries live in `crates/toon-mcp-bench/benches/`, each backed
 by fixtures in `crates/toon-mcp-bench/fixtures/`. Baselines are committed to
-`bench/baselines/main/`.
+`bench/baselines/main/`. The `jsonl_sink` async-throughput benchmark lives
+separately from the sync core benches and is the only one that starts a tokio
+runtime (`current_thread`, for deterministic measurement).
 
-| Bench file | Group | Functions |
-|------------|-------|-----------|
-| `detection.rs` | `detect_format` | 6 |
-| `classification.rs` | `classify_shape` | 6 |
-| `compression.rs` | `pipeline` | 6 |
+| Bench file | Group | Scope |
+|------------|-------|-------|
+| `detection.rs` | `detect_format` | Sync core |
+| `classification.rs` | `classify_shape` | Sync core |
+| `compression.rs` | `pipeline` | Sync core |
+| `jsonl_sink.rs` | `jsonl_sink` | Async logging sink throughput |
 
 ---
 

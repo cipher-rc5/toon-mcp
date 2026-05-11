@@ -39,7 +39,7 @@ toon-mcp/
 
 ### Prerequisites
 
-- Rust toolchain pinned to **1.87.0** (managed by `rust-toolchain.toml` — `rustup` picks this up automatically)
+- Rust toolchain pinned to **1.93.0** (managed by `rust-toolchain.toml` — `rustup` picks this up automatically)
 - No Docker, no external services required
 
 ### Build
@@ -76,6 +76,7 @@ All variables are optional. The server runs with sensible defaults without a `.e
 | `TOON_TABULAR_MIN_ROWS` | `3` | Minimum row count for an array to be classified as tabular. |
 | `TOON_FOLD_MIN_DEPTH` | `3` | Minimum single-key chain depth to trigger fold-chain classification. |
 | `TOON_PRIMITIVE_ARRAY_MIN` | `5` | Minimum element count for a primitive array classification. |
+| `TOON_CSV_NUMERIC_COERCION` | `true` | When `false`, CSV/TSV cells that parse as numbers stay as strings. Set to `false` for inputs containing identifiers, postal codes, or leading-zero values that should not be coerced. |
 | `TOON_LOG_ENABLED` | `true` | Enable structured event logging. |
 | `TOON_LOG_DIR` | `data/logs` | Directory for JSONL log partitions. Must be an absolute path when used from Claude Desktop. When used from opencode (project-relative), `data/logs` resolves correctly from the repository root. |
 | `TOON_LOG_BUFFER_SIZE` | `1000` | Number of events buffered before a forced flush. |

@@ -14,7 +14,7 @@ Only the latest commit on the `main` branch is actively maintained.
 **Do not open a public GitHub issue for security vulnerabilities.**
 
 Report vulnerabilities by emailing the maintainers directly via the contact
-address listed on the [GitHub repository](https://github.com/anomalyco/toon-mcp).
+address listed on the [GitHub repository](https://github.com/cipher-rc5/toon-mcp).
 
 Include the following in your report:
 

@@ -26,37 +26,20 @@ async fn main() -> Result<(), ServerError> {
 
     // Construct the log sink and spawn the background writer task.
     // The sink is wrapped in Arc for shared access from the server handlers.
-    let sink: Arc<dyn LogSink> = if config.logging_enabled {
-        let logging_config = config.logging.clone();
-        // `start` owns the spawn so callers cannot forget the writer task.
-        let (jsonl_sink, handle) = JsonlSink::start(logging_config)?;
+    let (sink, supervisor_handle): (Arc<dyn LogSink>, Option<tokio::task::JoinHandle<()>>) =
+        if config.logging_enabled {
+            let logging_config = config.logging.clone();
+            // `start` owns the spawn so callers cannot forget the writer task.
+            let (jsonl_sink, handle) = JsonlSink::start(logging_config)?;
 
-        // M3: Supervisor — treat unexpected writer task exit as fatal.
-        // Log a structured error so operators can detect silent log loss.
-        tokio::spawn(async move {
-            match handle.await {
-                Ok(()) => {
-                    // Normal exit only happens on Shutdown command; unexpected
-                    // here means the task completed without being told to.
-                    error!(
-                        component = "jsonl_sink_writer",
-                        "writer task exited unexpectedly; subsequent log events will be dropped"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        component = "jsonl_sink_writer",
-                        error = %e,
-                        "writer task panicked; subsequent log events will be dropped"
-                    );
-                }
-            }
-        });
+            // M3: Supervisor — treat unexpected writer task exit as fatal.
+            // Log a structured error so operators can detect silent log loss.
+            let supervisor = tokio::spawn(supervise_writer_task(handle));
 
-        Arc::new(jsonl_sink)
-    } else {
-        Arc::new(NoopSink)
-    };
+            (Arc::new(jsonl_sink), Some(supervisor))
+        } else {
+            (Arc::new(NoopSink), None)
+        };
 
     let server = ToonMcpServer::new(config.clone(), Arc::clone(&sink));
     let service = server
@@ -119,8 +102,42 @@ async fn main() -> Result<(), ServerError> {
     // Drop the Arc so the writer task's channel receiver sees closure.
     drop(sink);
 
+    // Await the supervisor task so the writer fully drains before exit. The
+    // supervisor itself only completes once the writer JoinHandle resolves,
+    // so this guarantees no pending events are lost on shutdown.
+    if let Some(supervisor_handle) = supervisor_handle {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle)
+            .await
+            .is_err()
+        {
+            warn!("writer-task supervisor did not complete within 5 s");
+        }
+    }
+
     info!("toon-mcp-server exiting");
     Ok(())
+}
+
+/// Supervise the JSONL writer task: log a structured error if it exits or
+/// panics so operators can detect silent log loss.
+pub(crate) async fn supervise_writer_task(handle: tokio::task::JoinHandle<()>) {
+    match handle.await {
+        Ok(()) => {
+            // Normal exit only happens on Shutdown command; unexpected here
+            // means the task completed without being told to.
+            error!(
+                component = "jsonl_sink_writer",
+                "writer task exited unexpectedly; subsequent log events will be dropped"
+            );
+        }
+        Err(e) => {
+            error!(
+                component = "jsonl_sink_writer",
+                error = %e,
+                "writer task panicked; subsequent log events will be dropped"
+            );
+        }
+    }
 }
 
 /// Initialise the tracing subscriber with the given filter string.
@@ -131,4 +148,27 @@ fn init_tracing(log_level: &str) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The writer-task supervisor must absorb panics from the writer task
+    /// without propagating them. Otherwise a panicking writer would also
+    /// take down the supervisor task and leave operators with no signal.
+    #[tokio::test]
+    async fn supervise_writer_task_absorbs_panic() {
+        let h = tokio::spawn(async { panic!("boom") });
+        // Call returns normally — no panic propagation.
+        supervise_writer_task(h).await;
+    }
+
+    /// The supervisor must also handle a normal (clean) task exit without
+    /// panicking, logging the unexpected-exit message instead.
+    #[tokio::test]
+    async fn supervise_writer_task_handles_clean_exit() {
+        let h = tokio::spawn(async {});
+        supervise_writer_task(h).await;
+    }
 }

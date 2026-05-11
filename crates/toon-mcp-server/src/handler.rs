@@ -1,3 +1,6 @@
+// file: crates/toon-mcp-server/src/handler.rs
+// description: Tool handler implementations for detect_format, compress_content, compression_stats
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +27,9 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
-/// Avoids OS RNG; collision requires 2^64 events within the same nanosecond.
+/// Avoids OS RNG. The output is a 64-bit xxh3 hash; under the birthday paradox,
+/// collisions become non-negligible around 2^32 (~4.3 billion) generated IDs.
+/// Practically irrelevant for an MCP server but worth knowing for high-throughput consumers.
 fn new_event_id() -> String {
     let seq = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
@@ -65,10 +70,22 @@ where
                     "pipeline_timeout: {op_name} did not complete within \
                      {pipeline_timeout_ms}ms (TOON_PIPELINE_TIMEOUT_MS)"
                 ),
-                None,
+                Some(serde_json::json!({
+                    "code": "pipeline_timeout",
+                    "timeout_ms": pipeline_timeout_ms,
+                    "op": op_name,
+                })),
             )
         })?
-        .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))
+        .map_err(|e| {
+            McpError::internal_error(
+                format!("spawn_blocking failed: {e}"),
+                Some(serde_json::json!({
+                    "code": "spawn_blocking_failed",
+                    "op": op_name,
+                })),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +103,7 @@ impl From<&Config> for CompressConfig {
             tabular_min_rows: c.tabular_min_rows,
             fold_min_depth: c.fold_min_depth,
             primitive_array_min: c.primitive_array_min,
+            csv_numeric_coercion: c.csv_numeric_coercion,
         }
     }
 }
@@ -306,7 +324,10 @@ pub(crate) async fn handle_compress_content_inner(
         // L2 + H3: named struct, no second detect call.
         // Match is exhaustive over `CompressDecision` (no wildcard) so any new
         // variant produces a compile-time error.
-        let outcome = match &decision {
+        // Move `input` into the pass-through output to avoid a String clone;
+        // `decision` is consumed here so the compressed branch can take `toon`
+        // by value.
+        let outcome = match decision {
             CompressDecision::Compressed {
                 toon,
                 toon_bytes,
@@ -315,19 +336,19 @@ pub(crate) async fn handle_compress_content_inner(
                 shape_class,
                 ..
             } => CompressOutcome {
-                output: toon.clone(),
+                output: toon,
                 compressed: true,
                 format_str: input_format.as_str().into(),
                 shape_str: shape_class.as_str().into(),
-                output_bytes: *toon_bytes,
-                savings_pct: *savings_pct,
+                output_bytes: toon_bytes,
+                savings_pct,
                 pass_reason_str: None,
             },
             CompressDecision::PassedThrough {
                 reason,
                 input_format,
             } => CompressOutcome {
-                output: input.clone(),
+                output: input,
                 compressed: false,
                 format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
                 shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
@@ -536,6 +557,7 @@ mod tests {
             tabular_min_rows: 3,
             fold_min_depth: 3,
             primitive_array_min: 5,
+            csv_numeric_coercion: true,
             logging_enabled: false,
             logging: toon_mcp_logging::JsonlSinkConfig::default(),
             log_level: "info".into(),
