@@ -330,6 +330,7 @@ cargo fmt && cargo clippy -- -D warnings && cargo test --workspace
 | [docs/algorithms.md](docs/algorithms.md) | Format detection, shape classification, and compression pipeline algorithms |
 | [docs/configuration.md](docs/configuration.md) | Full configuration reference with tuning guidance |
 | [docs/logging.md](docs/logging.md) | LogSink trait, event schema, log storage layout, and query examples |
+| [docs/runbook.md](docs/runbook.md) | Operator runbook: diagnostics and remediation for production incidents |
 
 ---
 

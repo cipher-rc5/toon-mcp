@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -90,6 +91,7 @@ pub struct JsonlSink {
     sender: mpsc::Sender<SinkCmd>,
     serialization_failed_count: Arc<AtomicU64>,
     record_failed_count: Arc<AtomicU64>,
+    record_dropped_count: Arc<AtomicU64>,
 }
 
 impl JsonlSink {
@@ -110,10 +112,12 @@ impl JsonlSink {
 
         let serialization_failed_count = Arc::new(AtomicU64::new(0));
         let record_failed_count = Arc::new(AtomicU64::new(0));
+        let record_dropped_count = Arc::new(AtomicU64::new(0));
         let sink = JsonlSink {
             sender: tx,
             serialization_failed_count: Arc::clone(&serialization_failed_count),
             record_failed_count,
+            record_dropped_count,
         };
         let task_future = writer_task(
             rx,
@@ -151,22 +155,51 @@ impl JsonlSink {
     /// was closed (the background task has exited).
     ///
     /// Increments monotonically over the lifetime of the sink. A non-zero
-    /// value indicates events were lost — typically because `shutdown` was
-    /// called and then `record` was attempted on a clone, or the writer
-    /// task panicked.
+    /// value indicates events were lost due to a *channel-closed* condition
+    /// — typically because `shutdown` was called and then `record` was
+    /// attempted on a clone, or the writer task panicked. This is distinct
+    /// from [`Self::record_dropped_count`], which counts events dropped due
+    /// to a *channel-full* condition (expected backpressure behaviour).
     pub fn record_failed_count(&self) -> u64 {
         self.record_failed_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of `record` calls that were dropped because the writer-task
+    /// channel was full (backpressure).
+    ///
+    /// Increments monotonically over the lifetime of the sink. `record` is
+    /// fire-and-forget at the handler boundary: when the bounded channel is
+    /// saturated, the event is silently dropped (this counter ticks up) and
+    /// the call returns `Ok(())` rather than blocking the handler. A
+    /// non-zero value indicates the writer task is not keeping up with the
+    /// inbound event rate; consider increasing `buffer_size` or reducing
+    /// `flush_interval`. This is distinct from [`Self::record_failed_count`],
+    /// which counts channel-closed failures.
+    pub fn record_dropped_count(&self) -> u64 {
+        self.record_dropped_count.load(Ordering::Relaxed)
     }
 }
 
 #[async_trait]
 impl LogSink for JsonlSink {
     async fn record(&self, event: LogEvent) -> Result<(), LogError> {
-        if let Err(e) = self.sender.send(SinkCmd::Record(event)).await {
-            self.record_failed_count.fetch_add(1, Ordering::Relaxed);
-            return Err(LogError::ChannelSend(e.to_string()));
+        // `record` is fire-and-forget at the handler boundary: under
+        // saturation we drop the event and return `Ok(())` rather than
+        // blocking the handler. A closed channel, however, is a real error
+        // operators must see (the writer task is dead).
+        match self.sender.try_send(SinkCmd::Record(event)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.record_dropped_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.record_failed_count.fetch_add(1, Ordering::Relaxed);
+                Err(LogError::ChannelSend(
+                    "writer task channel is closed".into(),
+                ))
+            }
         }
-        Ok(())
     }
 
     /// Flush all buffered events to disk and wait for acknowledgement.
@@ -385,16 +418,10 @@ async fn flush_pending(
 
 /// Returns a `YYYY-MM-DD` string from a microsecond Unix timestamp.
 fn day_partition_key(ts_us: i64) -> String {
-    use chrono::{DateTime, TimeZone, Utc};
-    let secs = ts_us / 1_000_000;
-    let nanos = ((ts_us % 1_000_000).unsigned_abs() * 1_000) as u32;
-    // Use timestamp_opt which returns LocalResult; fall back to Unix epoch on
-    // out-of-range values (not expected in practice).
-    let dt: DateTime<Utc> = Utc
-        .timestamp_opt(secs, nanos)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().expect("epoch is valid"));
-    dt.format("%Y-%m-%d").to_string()
+    jiff::Timestamp::from_microsecond(ts_us)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .strftime("%Y-%m-%d")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -622,6 +649,49 @@ mod tests {
             1,
             "record_failed_count increments on send failure"
         );
+    }
+
+    /// When the writer-task channel is full, `record` must drop the event
+    /// rather than block the caller, increment `record_dropped_count`, and
+    /// return `Ok(())`. This is the fire-and-forget backpressure contract.
+    #[tokio::test]
+    async fn record_drops_when_channel_full() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 1,
+            flush_interval: Duration::from_secs(3600),
+        };
+
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        // Intentionally do NOT spawn the writer task: the receiver lives
+        // inside `task` and stays alive while we hold the future. The
+        // channel capacity is 1, so the first `record` fills the buffer
+        // and the second must hit `Full`.
+        let first = sink.record(make_event(1)).await;
+        assert!(
+            first.is_ok(),
+            "first record fills the buffer, got {first:?}"
+        );
+
+        let second = sink.record(make_event(2)).await;
+        assert!(
+            second.is_ok(),
+            "record on a full channel must return Ok (event dropped), got {second:?}"
+        );
+        assert_eq!(
+            sink.record_dropped_count(),
+            1,
+            "record_dropped_count increments on channel-full"
+        );
+        assert_eq!(
+            sink.record_failed_count(),
+            0,
+            "record_failed_count must NOT increment on channel-full"
+        );
+
+        // Keep the writer-task future alive until the assertions above run.
+        drop(task);
     }
 
     #[tokio::test]

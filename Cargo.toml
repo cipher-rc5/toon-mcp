@@ -42,11 +42,8 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 # Utilities
 anyhow = "=1.0.102"
-# Default features dropped — we only need `Utc::now()`, microsecond
-# timestamps, and `format("%Y-%m-%d")`. Disabling defaults trims
-# `iana-time-zone` from the dependency tree.
-chrono = { version = "=0.4.44", default-features = false, features = ["serde", "now"] }
 dotenvy = "=0.15.7"
+jiff = "=0.2.24"
 temp-env = "=0.3.6"
 tempfile = "=3.27.0"
 thiserror = "=2.0.18"

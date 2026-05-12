@@ -1,0 +1,52 @@
+# file: fuzz/Cargo.toml
+# description: cargo-fuzz harness crate for toon-mcp-core parser entry points
+#
+# This crate is intentionally NOT a member of the root [workspace], because
+# cargo-fuzz requires the nightly toolchain and libfuzzer-sys uses
+# cfg(fuzzing) instrumentation that is incompatible with stable builds of the
+# rest of the workspace. See CONTRIBUTING.md "Fuzz Testing".
+
+[package]
+name = "toon-mcp-fuzz"
+version = "0.0.0"
+authors = ["cipher-rc5"]
+license = "MIT"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.12"
+toon-mcp-core = { path = "../crates/toon-mcp-core" }
+
+# Each fuzz target compiles as a separate binary; bench = false suppresses
+# the default test/bench harness so libfuzzer-sys can drive the binary.
+[[bin]]
+name = "detect_and_parse"
+path = "fuzz_targets/detect_and_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonl_parse"
+path = "fuzz_targets/jsonl_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csv_parse"
+path = "fuzz_targets/csv_parse.rs"
+test = false
+doc = false
+bench = false

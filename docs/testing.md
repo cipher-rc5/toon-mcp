@@ -78,6 +78,13 @@ Truncated JSON mid-array or mid-object is not explicitly covered. The
 underlying `serde_json` error path is exercised but not the specific
 truncation case.
 
+A `cargo-fuzz` harness exists in `fuzz/` that targets the four
+untrusted-input entry points (`FormatDetector::detect_and_parse`,
+`JsonParser::parse`, `JsonlParser::parse`, and `CsvParser::parse`). Fuzzing
+is not part of CI and requires the nightly toolchain plus `cargo-fuzz`. See
+[CONTRIBUTING.md](../CONTRIBUTING.md#fuzz-testing) for setup and run
+instructions.
+
 ---
 
 ## Pre-Commit Gate

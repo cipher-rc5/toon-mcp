@@ -69,3 +69,32 @@ All workspace dependencies in `Cargo.toml` use exact (`=`) version pins. When ad
 3. Note the bump in `CHANGELOG.md`.
 
 Dependabot opens weekly PRs for patch-level updates; review and merge them promptly to avoid accumulation.
+
+## Fuzz Testing
+
+The `fuzz/` directory contains a `cargo-fuzz` harness for the parser surface
+(JSON, JSONL, CSV/TSV, and the format-detection entry point). Fuzzing requires
+the nightly Rust toolchain and is not part of CI.
+
+```bash
+# One-time setup
+rustup install nightly
+cargo install cargo-fuzz
+
+# Run a target (Ctrl-C to stop)
+cd fuzz
+cargo +nightly fuzz run detect_and_parse
+cargo +nightly fuzz run json_parse
+cargo +nightly fuzz run jsonl_parse
+cargo +nightly fuzz run csv_parse
+```
+
+If a target finds a crashing input it is written to `fuzz/artifacts/<target>/`
+and the failing bytes are printed to stderr. Reproduce locally with:
+
+```bash
+cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<id>
+```
+
+Please report any reproducible crash as a security advisory (see SECURITY.md)
+before opening a public issue.

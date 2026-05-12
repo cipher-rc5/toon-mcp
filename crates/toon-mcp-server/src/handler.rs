@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
 use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
@@ -206,7 +205,7 @@ pub async fn handle_detect_format(
 
         let event = LogEvent {
             event_id: event_id.clone(),
-            ts_us: Utc::now().timestamp_micros(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
             tool_name: "detect_format".into(),
             input_format: fmt.as_str().into(),
             shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
@@ -360,7 +359,7 @@ pub(crate) async fn handle_compress_content_inner(
 
         let event = LogEvent {
             event_id: event_id.clone(),
-            ts_us: Utc::now().timestamp_micros(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
             tool_name: "compress_content".into(),
             input_format: outcome.format_str.clone(),
             shape_class: outcome.shape_str.clone(),
@@ -507,7 +506,7 @@ pub async fn handle_compression_stats(
 
         let event = LogEvent {
             event_id: event_id.clone(),
-            ts_us: Utc::now().timestamp_micros(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
             tool_name: "compression_stats".into(),
             input_format: outcome.format_str.clone(),
             shape_class: outcome.shape_str.clone(),

@@ -105,13 +105,12 @@ async fn main() -> Result<(), ServerError> {
     // Await the supervisor task so the writer fully drains before exit. The
     // supervisor itself only completes once the writer JoinHandle resolves,
     // so this guarantees no pending events are lost on shutdown.
-    if let Some(supervisor_handle) = supervisor_handle {
-        if tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle)
+    if let Some(supervisor_handle) = supervisor_handle
+        && tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle)
             .await
             .is_err()
-        {
-            warn!("writer-task supervisor did not complete within 5 s");
-        }
+    {
+        warn!("writer-task supervisor did not complete within 5 s");
     }
 
     info!("toon-mcp-server exiting");

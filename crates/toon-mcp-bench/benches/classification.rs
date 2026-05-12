@@ -4,7 +4,7 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use toon_mcp_core::{Classifier, FormatDetector};
 
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
@@ -71,5 +71,57 @@ fn bench_classification(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_classification);
+fn build_wide_object(width: usize) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for i in 0..width {
+        map.insert(format!("k{i}"), serde_json::Value::String(format!("v{i}")));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn build_wide_array_scalars(width: usize) -> serde_json::Value {
+    let mut arr = Vec::with_capacity(width);
+    for i in 0..width {
+        arr.push(serde_json::Value::String(format!("v{i}")));
+    }
+    serde_json::Value::Array(arr)
+}
+
+fn build_nested_wide(width: usize, depth: usize) -> serde_json::Value {
+    let mut acc = build_wide_object(width);
+    for i in 0..depth {
+        let mut m = serde_json::Map::new();
+        m.insert(format!("wrap{i}"), acc);
+        acc = serde_json::Value::Object(m);
+    }
+    acc
+}
+
+fn bench_descendant_worst_case(c: &mut Criterion) {
+    let mut group = c.benchmark_group("descendant_scan_worst_case");
+    for width in [10, 100, 1000] {
+        let input = build_wide_object(width);
+        group.bench_with_input(
+            BenchmarkId::new("wide_object_all_scalars", width),
+            &input,
+            |b, v| b.iter(|| Classifier::classify(black_box(v))),
+        );
+        let input = build_wide_array_scalars(width);
+        group.bench_with_input(
+            BenchmarkId::new("wide_array_of_scalars", width),
+            &input,
+            |b, v| b.iter(|| Classifier::classify(black_box(v))),
+        );
+    }
+    // Depth-cap interaction: one fixed-width, fixed-depth measurement.
+    let input = build_nested_wide(100, 9);
+    group.bench_with_input(
+        BenchmarkId::new("nested_wide_object_at_cap", "100x9"),
+        &input,
+        |b, v| b.iter(|| Classifier::classify(black_box(v))),
+    );
+    group.finish();
+}
+
+criterion_group!(benches, bench_classification, bench_descendant_worst_case);
 criterion_main!(benches);
