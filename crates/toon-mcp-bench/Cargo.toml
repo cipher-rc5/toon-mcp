@@ -1,35 +1,35 @@
 [package]
-name        = "toon-mcp-bench"
-version.workspace     = true
-edition.workspace     = true
-license.workspace     = true
-repository.workspace  = true
-authors.workspace     = true
+name = "toon-mcp-bench"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
 description = "Criterion benchmarks for toon-mcp-core"
-publish     = false
 
 [[bench]]
-name    = "detection"
+name = "detection"
 harness = false
 
 [[bench]]
-name    = "classification"
+name = "classification"
 harness = false
 
 [[bench]]
-name    = "compression"
+name = "compression"
 harness = false
 
 [[bench]]
-name    = "jsonl_sink"
+name = "jsonl_sink"
 harness = false
 
 [dependencies]
 toon-mcp-core = { path = "../toon-mcp-core" }
 
 [dev-dependencies]
-criterion.workspace  = true
+criterion.workspace = true
 serde_json.workspace = true
-tempfile.workspace   = true
-tokio                = { workspace = true, features = ["rt", "macros"] }
-toon-mcp-logging     = { path = "../toon-mcp-logging" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+toon-mcp-logging = { path = "../toon-mcp-logging" }

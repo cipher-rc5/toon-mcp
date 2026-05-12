@@ -423,19 +423,19 @@ lives.
 
 ```rust
 pub struct LogEvent {
-    pub event_id:        String,         // UUIDv4
-    pub ts_us:           i64,            // unix timestamp microseconds
-    pub tool_name:       String,         // "compress_content" | "compression_stats" | "detect_format"
-    pub input_format:    String,         // InputFormat::to_str()
-    pub shape_class:     String,         // ShapeClass::to_str()
-    pub input_bytes:     u64,
-    pub output_bytes:    u64,
-    pub compressed:      bool,
-    pub savings_pct:     f64,            // 0.0 if not compressed
-    pub threshold_used:  f64,
-    pub duration_us:     u64,            // wall time: detect + classify + encode
-    pub pass_reason:     Option<String>, // set when compressed = false
-    pub client_hint:     Option<String>, // "opencode" | "claude-desktop" | None
+    pub event_id: String,     // UUIDv4
+    pub ts_us: i64,           // unix timestamp microseconds
+    pub tool_name: String,    // "compress_content" | "compression_stats" | "detect_format"
+    pub input_format: String, // InputFormat::to_str()
+    pub shape_class: String,  // ShapeClass::to_str()
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub compressed: bool,
+    pub savings_pct: f64, // 0.0 if not compressed
+    pub threshold_used: f64,
+    pub duration_us: u64,            // wall time: detect + classify + encode
+    pub pass_reason: Option<String>, // set when compressed = false
+    pub client_hint: Option<String>, // "opencode" | "claude-desktop" | None
 }
 ```
 
@@ -545,42 +545,48 @@ impl ServerHandler for ToonMcpServer {
 
 ```rust
 // detect_format
-pub struct DetectParams { pub input: String }
+pub struct DetectParams {
+    pub input: String,
+}
 
 pub struct DetectResult {
-    pub format:        String,
-    pub input_bytes:   usize,
-    pub line_count:    Option<usize>,
-    pub column_count:  Option<usize>,
+    pub format: String,
+    pub input_bytes: usize,
+    pub line_count: Option<usize>,
+    pub column_count: Option<usize>,
 }
 
 // compress_content
-pub struct CompressParams { pub input: String }
+pub struct CompressParams {
+    pub input: String,
+}
 
 pub struct CompressResult {
-    pub output:        String,
-    pub compressed:    bool,
-    pub format:        String,
-    pub shape_class:   String,
-    pub input_bytes:   usize,
-    pub output_bytes:  usize,
-    pub savings_pct:   f64,
-    pub duration_us:   u64,
-    pub pass_reason:   Option<String>,
+    pub output: String,
+    pub compressed: bool,
+    pub format: String,
+    pub shape_class: String,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub savings_pct: f64,
+    pub duration_us: u64,
+    pub pass_reason: Option<String>,
 }
 
 // compression_stats (dry run — no encoding performed)
-pub struct StatsParams { pub input: String }
+pub struct StatsParams {
+    pub input: String,
+}
 
 pub struct StatsResult {
-    pub would_compress:         bool,
-    pub format:                 String,
-    pub shape_class:            String,
-    pub input_bytes:            usize,
+    pub would_compress: bool,
+    pub format: String,
+    pub shape_class: String,
+    pub input_bytes: usize,
     pub estimated_output_bytes: usize,
-    pub estimated_savings_pct:  f64,
-    pub threshold:              f64,
-    pub pass_reason:            Option<String>,
+    pub estimated_savings_pct: f64,
+    pub threshold: f64,
+    pub pass_reason: Option<String>,
 }
 ```
 
@@ -634,20 +640,20 @@ The benchmarking crate is pluggable in two senses:
 
 ```toml
 [package]
-name    = "toon-mcp-bench"
+name = "toon-mcp-bench"
 version = "0.1.0"
 edition.workspace = true
 
 [[bench]]
-name    = "detection"
+name = "detection"
 harness = false
 
 [[bench]]
-name    = "classification"
+name = "classification"
 harness = false
 
 [[bench]]
-name    = "compression"
+name = "compression"
 harness = false
 
 [dependencies]
@@ -888,22 +894,22 @@ ORDER BY occurrences DESC;
 
 All values loaded from environment via `dotenvy`. Defaults shown.
 
-| Variable                       | Default                        | Description                                          |
-|--------------------------------|--------------------------------|------------------------------------------------------|
-| `TOON_COMPRESSION_THRESHOLD`   | `0.85`                         | Encode only if toon_len < input_len * threshold      |
-| `TOON_MIN_BYTES`               | `256`                          | Skip classification below this byte count            |
-| `TOON_KEY_FOLDING`             | `true`                         | Enable TOON key folding for FoldChain shapes         |
-| `TOON_DELIMITER`               | `comma`                        | comma, tab, or pipe                                  |
-| `TOON_TABULAR_MIN_ROWS`        | `3`                            | Minimum array length for Tabular classification      |
-| `TOON_FOLD_MIN_DEPTH`          | `3`                            | Minimum chain depth for FoldChain                    |
-| `TOON_PRIMITIVE_ARRAY_MIN`     | `5`                            | Minimum length for PrimitiveArray                    |
-| `TOON_LOG_ENABLED`             | `true`                         | Set false to use NoopSink                            |
-| `TOON_LOG_DB_PATH`             | `data/interactions.duckdb`     | DuckDB file path                                     |
-| `TOON_LOG_PARQUET_DIR`         | `data/parquet`                 | Parquet export root                                  |
-| `TOON_LOG_FLUSH_INTERVAL_SECS` | `300`                          | Periodic Parquet flush interval in seconds           |
-| `TOON_LOG_BUFFER_SIZE`         | `1000`                         | mpsc channel capacity (backpressure threshold)       |
-| `TOON_LOG_LEVEL`               | `info`                         | tracing filter string                                |
-| `TOON_CLIENT_HINT`             | `""`                           | Tag log rows: "opencode" or "claude-desktop"         |
+| Variable                       | Default                    | Description                                     |
+| ------------------------------ | -------------------------- | ----------------------------------------------- |
+| `TOON_COMPRESSION_THRESHOLD`   | `0.85`                     | Encode only if toon_len < input_len * threshold |
+| `TOON_MIN_BYTES`               | `256`                      | Skip classification below this byte count       |
+| `TOON_KEY_FOLDING`             | `true`                     | Enable TOON key folding for FoldChain shapes    |
+| `TOON_DELIMITER`               | `comma`                    | comma, tab, or pipe                             |
+| `TOON_TABULAR_MIN_ROWS`        | `3`                        | Minimum array length for Tabular classification |
+| `TOON_FOLD_MIN_DEPTH`          | `3`                        | Minimum chain depth for FoldChain               |
+| `TOON_PRIMITIVE_ARRAY_MIN`     | `5`                        | Minimum length for PrimitiveArray               |
+| `TOON_LOG_ENABLED`             | `true`                     | Set false to use NoopSink                       |
+| `TOON_LOG_DB_PATH`             | `data/interactions.duckdb` | DuckDB file path                                |
+| `TOON_LOG_PARQUET_DIR`         | `data/parquet`             | Parquet export root                             |
+| `TOON_LOG_FLUSH_INTERVAL_SECS` | `300`                      | Periodic Parquet flush interval in seconds      |
+| `TOON_LOG_BUFFER_SIZE`         | `1000`                     | mpsc channel capacity (backpressure threshold)  |
+| `TOON_LOG_LEVEL`               | `info`                     | tracing filter string                           |
+| `TOON_CLIENT_HINT`             | `""`                       | Tag log rows: "opencode" or "claude-desktop"    |
 
 ---
 
@@ -932,7 +938,7 @@ file. No code change is required — only the host config differs.
 **Config file location:**
 
 | OS      | Path                                                              |
-|---------|-------------------------------------------------------------------|
+| ------- | ----------------------------------------------------------------- |
 | macOS   | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows | `%APPDATA%\Claude\claude_desktop_config.json`                     |
 | Linux   | `~/.config/Claude/claude_desktop_config.json`                     |
@@ -977,10 +983,10 @@ The toon tools (`detect_format`, `compress_content`, `compression_stats`)
 should appear in the tools panel. If they do not appear, check the MCP
 server log at the path below for startup errors:
 
-| OS    | Log path                                          |
-|-------|---------------------------------------------------|
-| macOS | `~/Library/Logs/Claude/mcp-server-toon.log`       |
-| Linux | `~/.config/Claude/logs/mcp-server-toon.log`       |
+| OS    | Log path                                    |
+| ----- | ------------------------------------------- |
+| macOS | `~/Library/Logs/Claude/mcp-server-toon.log` |
+| Linux | `~/.config/Claude/logs/mcp-server-toon.log` |
 
 ---
 
@@ -991,47 +997,47 @@ server log at the path below for startup errors:
 ```toml
 [workspace]
 resolver = "2"
-members  = [
-    "crates/toon-mcp-core",
-    "crates/toon-mcp-logging",
-    "crates/toon-mcp-server",
-    "crates/toon-mcp-bench",
+members = [
+  "crates/toon-mcp-core",
+  "crates/toon-mcp-logging",
+  "crates/toon-mcp-server",
+  "crates/toon-mcp-bench",
 ]
 
 [workspace.dependencies]
 # MCP
-rmcp               = { version = "0.14", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "0.14", features = ["server", "transport-io", "macros", "schemars"] }
 
 # TOON
-toon-format        = "0.4"
+toon-format = "0.4"
 
 # Serialization
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-schemars           = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
 
 # CSV/TSV parsing
-csv                = "1.3"
+csv = "1.3"
 
 # Async
-tokio              = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-async-trait        = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
 
 # Database
-duckdb             = { version = "1.1", features = ["bundled"] }
+duckdb = { version = "1.1", features = ["bundled"] }
 
 # Benchmarking
-criterion          = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # Observability
-tracing            = "0.1"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
-dotenvy            = "0.15"
-thiserror          = "2"
-uuid               = { version = "1", features = ["v4"] }
-chrono             = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 [workspace.package]
 edition = "2024"
@@ -1048,42 +1054,42 @@ channel = "1.93.0"
 
 ```toml
 [package]
-name    = "toon-mcp-core"
+name = "toon-mcp-core"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
 toon-format.workspace = true
-serde_json.workspace  = true
-serde.workspace       = true
-csv.workspace         = true
-thiserror.workspace   = true
+serde_json.workspace = true
+serde.workspace = true
+csv.workspace = true
+thiserror.workspace = true
 ```
 
 ### Per-crate Cargo.toml (toon-mcp-logging)
 
 ```toml
 [package]
-name    = "toon-mcp-logging"
+name = "toon-mcp-logging"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-duckdb.workspace       = true
-tokio.workspace        = true
-async-trait.workspace  = true
-serde.workspace        = true
-thiserror.workspace    = true
-uuid.workspace         = true
-chrono.workspace       = true
-tracing.workspace      = true
+duckdb.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
 ```
 
 ### Per-crate Cargo.toml (toon-mcp-server)
 
 ```toml
 [package]
-name    = "toon-mcp-server"
+name = "toon-mcp-server"
 version = "0.1.0"
 edition.workspace = true
 
@@ -1092,40 +1098,40 @@ name = "toon-mcp-server"
 path = "src/main.rs"
 
 [dependencies]
-toon-mcp-core    = { path = "../toon-mcp-core" }
+toon-mcp-core = { path = "../toon-mcp-core" }
 toon-mcp-logging = { path = "../toon-mcp-logging" }
-rmcp.workspace         = true
-serde.workspace        = true
-serde_json.workspace   = true
-schemars.workspace     = true
-tokio.workspace        = true
-async-trait.workspace  = true
-thiserror.workspace    = true
-dotenvy.workspace      = true
-tracing.workspace      = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace         = true
-chrono.workspace       = true
+uuid.workspace = true
+chrono.workspace = true
 ```
 
 ### Per-crate Cargo.toml (toon-mcp-bench)
 
 ```toml
 [package]
-name    = "toon-mcp-bench"
+name = "toon-mcp-bench"
 version = "0.1.0"
 edition.workspace = true
 
 [[bench]]
-name    = "detection"
+name = "detection"
 harness = false
 
 [[bench]]
-name    = "classification"
+name = "classification"
 harness = false
 
 [[bench]]
-name    = "compression"
+name = "compression"
 harness = false
 
 [dependencies]
@@ -1154,16 +1160,16 @@ criterion.workspace = true
 Load references below using your fetch tool only when the immediate task
 requires them. Do not preload all references on every turn.
 
-| Reference | When to load |
-|-----------|--------------|
-| https://docs.rs/rmcp/latest/rmcp/ | Any work on server.rs, handler.rs, or MCP protocol |
-| https://docs.rs/toon-format/latest/toon_format/ | Any work on detector.rs, classifier.rs, or compressor.rs |
-| https://docs.rs/duckdb/latest/duckdb/ | Any work on duckdb_sink.rs or schema changes |
-| https://docs.rs/csv/latest/csv/ | Any work on parser/csv.rs |
-| https://docs.rs/tokio/latest/tokio/ | Any async work, spawn_blocking, mpsc, oneshot |
-| https://docs.rs/criterion/latest/criterion/ | Any work in toon-mcp-bench |
-| https://doc.rust-lang.org/std/ | Standard library questions |
-| https://www.conventionalcommits.org/en/v1.0.0/#specification | Before writing any commit message |
+| Reference                                                    | When to load                                             |
+| ------------------------------------------------------------ | -------------------------------------------------------- |
+| https://docs.rs/rmcp/latest/rmcp/                            | Any work on server.rs, handler.rs, or MCP protocol       |
+| https://docs.rs/toon-format/latest/toon_format/              | Any work on detector.rs, classifier.rs, or compressor.rs |
+| https://docs.rs/duckdb/latest/duckdb/                        | Any work on duckdb_sink.rs or schema changes             |
+| https://docs.rs/csv/latest/csv/                              | Any work on parser/csv.rs                                |
+| https://docs.rs/tokio/latest/tokio/                          | Any async work, spawn_blocking, mpsc, oneshot            |
+| https://docs.rs/criterion/latest/criterion/                  | Any work in toon-mcp-bench                               |
+| https://doc.rust-lang.org/std/                               | Standard library questions                               |
+| https://www.conventionalcommits.org/en/v1.0.0/#specification | Before writing any commit message                        |
 
 ---
 
@@ -1273,21 +1279,21 @@ chore, revert.
 
 ## What This Codebase Is Not
 
-| Forbidden | Reason |
-|-----------|--------|
-| rayon | Tokio runtime conflict; spawn_blocking is sufficient |
-| async-std or smol | Tokio is the sole async runtime |
-| libsql | Wrong tool; dedicated writer task eliminates Send+Sync problem |
-| Arc<Mutex<duckdb::Connection>> | Replaced by writer task + mpsc channel |
-| Box<dyn Error> in public APIs | Untyped error surface |
-| .unwrap() outside tests/main | Panics on production paths |
-| anyhow in library crates | Leaks opaque errors to callers |
-| Wildcard dependency versions | Reproducibility |
-| Emojis anywhere | Consistency |
-| Direct LLM API calls from server | Server is a tool provider only |
-| System prompt injection per turn | Instructions registered once in ServerInfo |
-| parquet crate (Apache Arrow) | DuckDB COPY TO handles Parquet natively |
-| XML, YAML, TOML parsers (v1) | Out of scope; planned for future plugin iteration |
+| Forbidden                                | Reason                                                                                                           |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| rayon                                    | Tokio runtime conflict; spawn_blocking is sufficient                                                             |
+| async-std or smol                        | Tokio is the sole async runtime                                                                                  |
+| libsql                                   | Wrong tool; dedicated writer task eliminates Send+Sync problem                                                   |
+| Arc<Mutex<duckdb::Connection>>           | Replaced by writer task + mpsc channel                                                                           |
+| Box<dyn Error> in public APIs            | Untyped error surface                                                                                            |
+| .unwrap() outside tests/main             | Panics on production paths                                                                                       |
+| anyhow in library crates                 | Leaks opaque errors to callers                                                                                   |
+| Wildcard dependency versions             | Reproducibility                                                                                                  |
+| Emojis anywhere                          | Consistency                                                                                                      |
+| Direct LLM API calls from server         | Server is a tool provider only                                                                                   |
+| System prompt injection per turn         | Instructions registered once in ServerInfo                                                                       |
+| parquet crate (Apache Arrow)             | DuckDB COPY TO handles Parquet natively                                                                          |
+| XML, YAML, TOML parsers (v1)             | Out of scope; planned for future plugin iteration                                                                |
 | toon-mcp-bench importing toon-mcp-server | Bench depends on toon-mcp-core (sync benches) or toon-mcp-logging (async benches only); never on toon-mcp-server |
 ```
 
@@ -1298,9 +1304,7 @@ chore, revert.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": [
-    "AGENTS.md"
-  ],
+  "instructions": ["AGENTS.md"],
   "mcp": {
     "toon": {
       "type": "local",

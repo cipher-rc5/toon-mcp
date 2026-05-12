@@ -1,1 +1,9 @@
-{"group_id":"pipeline","function_id":"pipeline_below_min_bytes","value_str":null,"throughput":{"Bytes":7},"full_id":"pipeline/pipeline_below_min_bytes","directory_name":"pipeline/pipeline_below_min_bytes","title":"pipeline/pipeline_below_min_bytes"}
+{
+  "group_id": "pipeline",
+  "function_id": "pipeline_below_min_bytes",
+  "value_str": null,
+  "throughput": { "Bytes": 7 },
+  "full_id": "pipeline/pipeline_below_min_bytes",
+  "directory_name": "pipeline/pipeline_below_min_bytes",
+  "title": "pipeline/pipeline_below_min_bytes"
+}

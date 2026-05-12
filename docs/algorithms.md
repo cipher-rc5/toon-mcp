@@ -73,7 +73,10 @@ fn probe_jsonl(input: &str) -> bool {
         .filter(|l| !l.is_empty())
         .take(2)
         .collect();
-    lines.len() >= 2 && lines.iter().all(|l| serde_json::from_str::<Value>(l).is_ok())
+    lines.len() >= 2
+        && lines
+            .iter()
+            .all(|l| serde_json::from_str::<Value>(l).is_ok())
 }
 ```
 
@@ -192,13 +195,13 @@ flowchart TD
 
 ### ShapeClass Enum
 
-| Class | TOON benefit | Example |
-|---|---|---|
-| `Tabular` | High — repeated keys eliminated, rows encoded compactly | JSON array of uniform objects, CSV, uniform JSONL |
-| `FoldChain` | High — deeply nested single-key objects flattened | `{ "a": { "b": { "c": { "d": "val" } } } }` |
-| `PrimitiveArray` | Moderate — dense numeric/string encoding | `[1, 2, 3, 4, 5, 6, 7]` |
-| `Mixed` | Low-moderate — partial structural benefit | Heterogeneous arrays with some objects |
-| `PassThrough` | None — TOON would not reduce size | Single string, single number, scalar object |
+| Class            | TOON benefit                                            | Example                                           |
+| ---------------- | ------------------------------------------------------- | ------------------------------------------------- |
+| `Tabular`        | High — repeated keys eliminated, rows encoded compactly | JSON array of uniform objects, CSV, uniform JSONL |
+| `FoldChain`      | High — deeply nested single-key objects flattened       | `{ "a": { "b": { "c": { "d": "val" } } } }`       |
+| `PrimitiveArray` | Moderate — dense numeric/string encoding                | `[1, 2, 3, 4, 5, 6, 7]`                           |
+| `Mixed`          | Low-moderate — partial structural benefit               | Heterogeneous arrays with some objects            |
+| `PassThrough`    | None — TOON would not reduce size                       | Single string, single number, scalar object       |
 
 ### Tabular Detection
 
@@ -245,11 +248,11 @@ A chain of depth 6 (like `fixtures/deep_fold.json`) produces a path like `level_
 
 All three numeric thresholds are configurable via environment variables and passed to `Classifier::classify_with` at call time:
 
-| Threshold | Constant | Default |
-|---|---|---|
-| `tabular_min_rows` | `TABULAR_MIN_ROWS` | `3` |
-| `fold_min_depth` | `FOLD_MIN_DEPTH` | `3` |
-| `primitive_array_min` | `PRIMITIVE_ARRAY_MIN` | `5` |
+| Threshold             | Constant              | Default |
+| --------------------- | --------------------- | ------- |
+| `tabular_min_rows`    | `TABULAR_MIN_ROWS`    | `3`     |
+| `fold_min_depth`      | `FOLD_MIN_DEPTH`      | `3`     |
+| `primitive_array_min` | `PRIMITIVE_ARRAY_MIN` | `5`     |
 
 ---
 
@@ -260,10 +263,12 @@ All three numeric thresholds are configurable via environment variables and pass
 TOON encoding is delegated to the `toon-format` crate via `toon_format::encode`. The server configures two parameters:
 
 **`KeyFoldingMode`** — controlled by `TOON_KEY_FOLDING`:
+
 - When enabled, nested single-key objects are collapsed into dot-notation paths: `{ "a": { "b": "val" } }` → `a.b: val`
 - Applied most aggressively to `FoldChain` shaped inputs
 
 **`Delimiter`** — controlled by `TOON_DELIMITER` (`comma`, `tab`, `pipe`):
+
 - The character separating values within a tabular row
 - `tab` tends to produce smaller output for text-heavy columns; `comma` is more readable
 
@@ -354,11 +359,11 @@ flowchart TD
 
 The `toon-mcp-bench` crate measures each stage independently:
 
-| Benchmark file | What it measures |
-|---|---|
-| `benches/detection.rs` | `FormatDetector::detect` only — 6 input shapes |
-| `benches/classification.rs` | `Classifier::classify` only — pre-parsed values, 6 shape classes |
-| `benches/compression.rs` | Full `Compressor::decide` pipeline — 6 input shapes including pass-through paths |
+| Benchmark file              | What it measures                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------- |
+| `benches/detection.rs`      | `FormatDetector::detect` only — 6 input shapes                                   |
+| `benches/classification.rs` | `Classifier::classify` only — pre-parsed values, 6 shape classes                 |
+| `benches/compression.rs`    | Full `Compressor::decide` pipeline — 6 input shapes including pass-through paths |
 
 All benchmarks use Criterion with `Throughput::Bytes` measurement, enabling bytes/sec comparison across input sizes. Baseline snapshots are committed to `bench/baselines/`.
 
@@ -366,14 +371,14 @@ All benchmarks use Criterion with `Throughput::Bytes` measurement, enabling byte
 
 ## Complexity Notes
 
-| Stage | Complexity | Notes |
-|---|---|---|
-| Format detection | O(L) where L = first few lines | JSONL and CSV probes read at most 3 lines |
-| JSON parsing | O(N) | Standard `serde_json` DFS |
-| JSONL parsing | O(N) | Linear scan of all lines |
-| CSV parsing | O(N) | Linear scan of all rows |
-| Tabular classification | O(R x C) where R = rows, C = columns | Uniform-key check is O(C) per row |
-| Fold chain classification | O(D) where D = chain depth | Recursive descent, terminates on first non-singleton or non-object |
-| TOON encoding | O(N) | Single-pass encoding by `toon-format` |
+| Stage                     | Complexity                           | Notes                                                              |
+| ------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
+| Format detection          | O(L) where L = first few lines       | JSONL and CSV probes read at most 3 lines                          |
+| JSON parsing              | O(N)                                 | Standard `serde_json` DFS                                          |
+| JSONL parsing             | O(N)                                 | Linear scan of all lines                                           |
+| CSV parsing               | O(N)                                 | Linear scan of all rows                                            |
+| Tabular classification    | O(R x C) where R = rows, C = columns | Uniform-key check is O(C) per row                                  |
+| Fold chain classification | O(D) where D = chain depth           | Recursive descent, terminates on first non-singleton or non-object |
+| TOON encoding             | O(N)                                 | Single-pass encoding by `toon-format`                              |
 
 All stages are well within microsecond range for typical LLM context payloads (< 1 MB). The benchmark suite provides concrete throughput numbers for regression tracking.

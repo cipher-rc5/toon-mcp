@@ -25,16 +25,16 @@ All tests are inline `#[cfg(test)]` modules — there are no separate `tests/`
 directories. `toon-mcp-bench` contributes 0 unit tests (benchmark binaries use
 `harness = false` and only run via `cargo bench`, not `cargo test`).
 
-| Layer | Location | Style | Count |
-|-------|----------|-------|-------|
-| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs` | `#[test]` | 17 |
-| Format detector | `crates/toon-mcp-core/src/detector.rs` | `#[test]` | 19 |
-| Shape classifier | `crates/toon-mcp-core/src/classifier.rs` | `#[test]` | 12 |
-| Compressor pipeline | `crates/toon-mcp-core/src/compressor.rs` | `#[test]` | 8 |
-| JSONL sink | `crates/toon-mcp-logging/src/jsonl_sink.rs` | `#[tokio::test]` | 5 |
-| Tool handlers | `crates/toon-mcp-server/src/handler.rs` | `#[tokio::test]` | 15 |
-| Config loading | `crates/toon-mcp-server/src/config.rs` | `#[test]` | 10 |
-| MCP transport | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 5 |
+| Layer                      | Location                                        | Style            | Count |
+| -------------------------- | ----------------------------------------------- | ---------------- | ----- |
+| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs`          | `#[test]`        | 17    |
+| Format detector            | `crates/toon-mcp-core/src/detector.rs`          | `#[test]`        | 19    |
+| Shape classifier           | `crates/toon-mcp-core/src/classifier.rs`        | `#[test]`        | 12    |
+| Compressor pipeline        | `crates/toon-mcp-core/src/compressor.rs`        | `#[test]`        | 8     |
+| JSONL sink                 | `crates/toon-mcp-logging/src/jsonl_sink.rs`     | `#[tokio::test]` | 5     |
+| Tool handlers              | `crates/toon-mcp-server/src/handler.rs`         | `#[tokio::test]` | 15    |
+| Config loading             | `crates/toon-mcp-server/src/config.rs`          | `#[test]`        | 10    |
+| MCP transport              | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 5     |
 
 Doc-tests in `toon-mcp-core` add a further 14 runnable examples.
 
@@ -55,12 +55,12 @@ by fixtures in `crates/toon-mcp-bench/fixtures/`. Baselines are committed to
 separately from the sync core benches and is the only one that starts a tokio
 runtime (`current_thread`, for deterministic measurement).
 
-| Bench file | Group | Scope |
-|------------|-------|-------|
-| `detection.rs` | `detect_format` | Sync core |
-| `classification.rs` | `classify_shape` | Sync core |
-| `compression.rs` | `pipeline` | Sync core |
-| `jsonl_sink.rs` | `jsonl_sink` | Async logging sink throughput |
+| Bench file          | Group            | Scope                         |
+| ------------------- | ---------------- | ----------------------------- |
+| `detection.rs`      | `detect_format`  | Sync core                     |
+| `classification.rs` | `classify_shape` | Sync core                     |
+| `compression.rs`    | `pipeline`       | Sync core                     |
+| `jsonl_sink.rs`     | `jsonl_sink`     | Async logging sink throughput |
 
 ---
 

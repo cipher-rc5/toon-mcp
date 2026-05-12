@@ -14,6 +14,13 @@ incident section follows the same structure:
 All DuckDB queries assume `TOON_LOG_DIR` is `data/logs`. Substitute your
 configured path where applicable.
 
+Production assumptions:
+
+- Logs are best-effort telemetry, not audit-grade records.
+- Exactly one `toon-mcp-server` process should write to a given `TOON_LOG_DIR`.
+- Config is loaded once at startup; every config change requires a restart.
+- `TOON_PIPELINE_TIMEOUT_MS` returns errors to callers, but started blocking work can continue until completion.
+
 ---
 
 ## 1. High Memory Usage
@@ -125,7 +132,7 @@ Restart after changes.
 
 ### Note: pipeline timeout does not cancel in-flight work
 
-`TOON_PIPELINE_TIMEOUT_MS` causes the *handler* to return an error to
+`TOON_PIPELINE_TIMEOUT_MS` causes the _handler_ to return an error to
 the client when the deadline elapses, but the underlying
 `spawn_blocking` task continues to run to completion on the blocking
 thread pool. Under a sustained stream of expensive inputs, blocking
@@ -137,7 +144,7 @@ for requests that returned timeout errors.
 
 **Mitigation:** lower `TOON_MAX_INPUT_BYTES` to bound the per-call CPU
 budget, and tune `TOON_MAX_CONCURRENT_CALLS` so the semaphore (which
-*does* gate admission) is the real backpressure mechanism. A future
+_does_ gate admission) is the real backpressure mechanism. A future
 enhancement could integrate cooperative cancellation into the
 compressor pipeline; this is not implemented today.
 
@@ -294,13 +301,13 @@ LIMIT 30;
 
 Tune the relevant config variables and restart:
 
-| `pass_reason` | Knob |
-|---|---|
-| `below_min_bytes` | `TOON_MIN_BYTES` |
-| `insufficient_savings` | `TOON_COMPRESSION_THRESHOLD` |
-| `shape_not_beneficial` | `TOON_TABULAR_MIN_ROWS`, `TOON_FOLD_MIN_DEPTH`, `TOON_PRIMITIVE_ARRAY_MIN` |
-| `parse_failed:*` | Fix upstream payload; consider `TOON_CSV_NUMERIC_COERCION=false` for ID-like CSV columns |
-| `unknown_format` | No action |
+| `pass_reason`          | Knob                                                                                     |
+| ---------------------- | ---------------------------------------------------------------------------------------- |
+| `below_min_bytes`      | `TOON_MIN_BYTES`                                                                         |
+| `insufficient_savings` | `TOON_COMPRESSION_THRESHOLD`                                                             |
+| `shape_not_beneficial` | `TOON_TABULAR_MIN_ROWS`, `TOON_FOLD_MIN_DEPTH`, `TOON_PRIMITIVE_ARRAY_MIN`               |
+| `parse_failed:*`       | Fix upstream payload; consider `TOON_CSV_NUMERIC_COERCION=false` for ID-like CSV columns |
+| `unknown_format`       | No action                                                                                |
 
 See `docs/configuration.md` for tuning guidance and example aggressive /
 conservative profiles.
@@ -450,6 +457,10 @@ Run through these at deploy time and on a recurring basis:
   your retention window. Optionally export old data to Parquet using
   the DuckDB `COPY ... TO ... (FORMAT PARQUET)` query in
   `docs/logging.md`.
+- Resource sizing: set `TOON_MAX_INPUT_BYTES`, `TOON_MAX_CONCURRENT_CALLS`,
+  and `TOON_PIPELINE_TIMEOUT_MS` deliberately for the host. For small/shared
+  hosts start with `1 MiB`, `2`-`4`, and `10000`; for a normal developer
+  workstation the defaults `10 MiB`, `8`, and `30000` are reasonable.
 - Startup line — confirm config loaded as intended:
 
   ```text
@@ -461,3 +472,55 @@ Run through these at deploy time and on a recurring basis:
   ```text
   status="ready" component="toon-mcp-server" "toon-mcp-server ready"
   ```
+
+---
+
+## MCP Client Troubleshooting
+
+### opencode
+
+Symptoms:
+
+- The tool is unavailable after starting opencode.
+- Logs are written somewhere other than the repository `data/logs` directory.
+
+Checks:
+
+```bash
+cargo build --release
+test -x ./target/release/toon-mcp-server
+opencode
+```
+
+Verify `opencode.json` points at `./target/release/toon-mcp-server` and that opencode is started from the repository root. Relative `TOON_LOG_DIR=data/logs` is intended to resolve from that working directory.
+
+### Claude Desktop
+
+Symptoms:
+
+- Claude shows the MCP server as failed or disconnected.
+- stderr includes `No such file or directory` for the command or log path.
+- JSONL logs appear under `$HOME/data/logs` instead of the project directory.
+
+Checks:
+
+- Use an absolute `command` path to the release binary.
+- Use absolute paths for every filesystem value in `env`, especially `TOON_LOG_DIR`.
+- Restart Claude Desktop after editing `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
+Common fix:
+
+```json
+{
+  "mcpServers": {
+    "toon": {
+      "command": "/Users/you/projects/toon-mcp/target/release/toon-mcp-server",
+      "env": {
+        "TOON_LOG_DIR": "/Users/you/projects/toon-mcp/data/logs",
+        "TOON_MAX_CONCURRENT_CALLS": "8",
+        "TOON_CLIENT_HINT": "claude-desktop"
+      }
+    }
+  }
+}
+```

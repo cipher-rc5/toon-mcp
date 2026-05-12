@@ -73,6 +73,10 @@ pub struct Config {
     /// once. When the limit is reached, new calls wait up to
     /// `pipeline_timeout_ms` for a permit before returning a busy error.
     pub max_concurrent_calls: usize,
+
+    /// Whether unparseable environment variables fail startup instead of
+    /// falling back to defaults.
+    pub strict_config: bool,
 }
 
 /// `Default` differs from `Config::load`: it has `logging_enabled: false` so
@@ -103,6 +107,7 @@ impl Default for Config {
             client_hint: None,
             pipeline_timeout_ms: 30_000,
             max_concurrent_calls: 8,
+            strict_config: false,
         }
     }
 }
@@ -116,27 +121,38 @@ impl Config {
     /// to a value that violates a documented constraint (e.g. zero for a
     /// positive-integer variable, or a compression threshold outside
     /// `[0.0, 1.0]`). Unparseable values (typos) are logged at `warn` and fall
-    /// back to the default — only deliberately out-of-range values are rejected.
+    /// back to the default unless `TOON_CONFIG_STRICT=true`, in which case
+    /// they are rejected.
     pub fn load() -> Result<Self, ServerError> {
-        let max_output_ratio = env_f64_in_range("TOON_COMPRESSION_THRESHOLD", 0.85, 0.0, 1.0)?;
-        let min_bytes = env_usize("TOON_MIN_BYTES", 256);
-        let max_input_bytes = env_usize_positive("TOON_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)?;
-        let key_folding = env_bool("TOON_KEY_FOLDING", true);
-        let delimiter = env_delimiter("TOON_DELIMITER", Delimiter::Comma);
-        let tabular_min_rows = env_usize("TOON_TABULAR_MIN_ROWS", 3);
-        let fold_min_depth = env_usize("TOON_FOLD_MIN_DEPTH", 3);
-        let primitive_array_min = env_usize("TOON_PRIMITIVE_ARRAY_MIN", 5);
-        let csv_numeric_coercion = env_bool("TOON_CSV_NUMERIC_COERCION", true);
-        let logging_enabled = env_bool("TOON_LOG_ENABLED", true);
+        let strict_config = env_bool_result("TOON_CONFIG_STRICT", false, false)?;
+        let max_output_ratio =
+            env_f64_in_range("TOON_COMPRESSION_THRESHOLD", 0.85, 0.0, 1.0, strict_config)?;
+        let min_bytes = env_usize("TOON_MIN_BYTES", 256, strict_config)?;
+        let max_input_bytes = env_usize_positive(
+            "TOON_MAX_INPUT_BYTES",
+            DEFAULT_MAX_INPUT_BYTES,
+            strict_config,
+        )?;
+        let key_folding = env_bool_result("TOON_KEY_FOLDING", true, strict_config)?;
+        let delimiter = env_delimiter("TOON_DELIMITER", Delimiter::Comma, strict_config)?;
+        let tabular_min_rows = env_usize("TOON_TABULAR_MIN_ROWS", 3, strict_config)?;
+        let fold_min_depth = env_usize("TOON_FOLD_MIN_DEPTH", 3, strict_config)?;
+        let primitive_array_min = env_usize("TOON_PRIMITIVE_ARRAY_MIN", 5, strict_config)?;
+        let csv_numeric_coercion =
+            env_bool_result("TOON_CSV_NUMERIC_COERCION", true, strict_config)?;
+        let logging_enabled = env_bool_result("TOON_LOG_ENABLED", true, strict_config)?;
         let log_level = std::env::var("TOON_LOG_LEVEL").unwrap_or_else(|_| "info".into());
-        let pipeline_timeout_ms = env_u64_positive("TOON_PIPELINE_TIMEOUT_MS", 30_000)?;
-        let max_concurrent_calls = env_usize_positive("TOON_MAX_CONCURRENT_CALLS", 8)?;
+        let pipeline_timeout_ms =
+            env_u64_positive("TOON_PIPELINE_TIMEOUT_MS", 30_000, strict_config)?;
+        let max_concurrent_calls =
+            env_usize_positive("TOON_MAX_CONCURRENT_CALLS", 8, strict_config)?;
         let client_hint = std::env::var("TOON_CLIENT_HINT")
             .ok()
             .filter(|s| !s.is_empty());
 
-        let flush_interval_secs = env_u64_positive("TOON_LOG_FLUSH_INTERVAL_SECS", 300)?;
-        let buffer_size = env_usize_positive("TOON_LOG_BUFFER_SIZE", 1000)?;
+        let flush_interval_secs =
+            env_u64_positive("TOON_LOG_FLUSH_INTERVAL_SECS", 300, strict_config)?;
+        let buffer_size = env_usize_positive("TOON_LOG_BUFFER_SIZE", 1000, strict_config)?;
         let log_dir = std::env::var("TOON_LOG_DIR").unwrap_or_else(|_| "data/logs".into());
 
         if min_bytes == 0 {
@@ -179,6 +195,7 @@ impl Config {
             client_hint,
             pipeline_timeout_ms,
             max_concurrent_calls,
+            strict_config,
         })
     }
 }
@@ -190,6 +207,7 @@ fn env_f64_in_range(
     default: f64,
     min: f64,
     max: f64,
+    strict: bool,
 ) -> Result<f64, ServerError> {
     match std::env::var(key) {
         Ok(val) => match val.parse::<f64>() {
@@ -205,6 +223,13 @@ fn env_f64_in_range(
                 }
             }
             Err(_) => {
+                if strict {
+                    return Err(ServerError::InvalidConfig {
+                        var: key,
+                        value: val,
+                        reason: "value must be parseable as f64",
+                    });
+                }
                 tracing::warn!(
                     key,
                     raw = %val,
@@ -218,34 +243,18 @@ fn env_f64_in_range(
     }
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
+fn env_usize(key: &'static str, default: usize, strict: bool) -> Result<usize, ServerError> {
     match std::env::var(key) {
         Ok(val) => match val.parse::<usize>() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::warn!(
-                    key,
-                    raw = %val,
-                    default,
-                    "invalid usize value for {key}; using default {default}"
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
-
-fn env_usize_positive(key: &'static str, default: usize) -> Result<usize, ServerError> {
-    match std::env::var(key) {
-        Ok(val) => match val.parse::<usize>() {
-            Ok(0) => Err(ServerError::InvalidConfig {
-                var: key,
-                value: val,
-                reason: "value must be >= 1",
-            }),
             Ok(v) => Ok(v),
             Err(_) => {
+                if strict {
+                    return Err(ServerError::InvalidConfig {
+                        var: key,
+                        value: val,
+                        reason: "value must be parseable as usize",
+                    });
+                }
                 tracing::warn!(
                     key,
                     raw = %val,
@@ -259,7 +268,41 @@ fn env_usize_positive(key: &'static str, default: usize) -> Result<usize, Server
     }
 }
 
-fn env_u64_positive(key: &'static str, default: u64) -> Result<u64, ServerError> {
+fn env_usize_positive(
+    key: &'static str,
+    default: usize,
+    strict: bool,
+) -> Result<usize, ServerError> {
+    match std::env::var(key) {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(0) => Err(ServerError::InvalidConfig {
+                var: key,
+                value: val,
+                reason: "value must be >= 1",
+            }),
+            Ok(v) => Ok(v),
+            Err(_) => {
+                if strict {
+                    return Err(ServerError::InvalidConfig {
+                        var: key,
+                        value: val,
+                        reason: "value must be parseable as usize",
+                    });
+                }
+                tracing::warn!(
+                    key,
+                    raw = %val,
+                    default,
+                    "invalid usize value for {key}; using default {default}"
+                );
+                Ok(default)
+            }
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u64_positive(key: &'static str, default: u64, strict: bool) -> Result<u64, ServerError> {
     match std::env::var(key) {
         Ok(val) => match val.parse::<u64>() {
             Ok(0) => Err(ServerError::InvalidConfig {
@@ -269,6 +312,13 @@ fn env_u64_positive(key: &'static str, default: u64) -> Result<u64, ServerError>
             }),
             Ok(v) => Ok(v),
             Err(_) => {
+                if strict {
+                    return Err(ServerError::InvalidConfig {
+                        var: key,
+                        value: val,
+                        reason: "value must be parseable as u64",
+                    });
+                }
                 tracing::warn!(
                     key,
                     raw = %val,
@@ -282,38 +332,56 @@ fn env_u64_positive(key: &'static str, default: u64) -> Result<u64, ServerError>
     }
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
+fn env_bool_result(key: &'static str, default: bool, strict: bool) -> Result<bool, ServerError> {
     match std::env::var(key).as_deref() {
-        Ok("true") | Ok("1") | Ok("yes") => true,
-        Ok("false") | Ok("0") | Ok("no") => false,
+        Ok("true") | Ok("1") | Ok("yes") => Ok(true),
+        Ok("false") | Ok("0") | Ok("no") => Ok(false),
         Ok(val) => {
+            if strict {
+                return Err(ServerError::InvalidConfig {
+                    var: key,
+                    value: val.to_owned(),
+                    reason: "value must be a boolean: true, false, 1, 0, yes, or no",
+                });
+            }
             tracing::warn!(
                 key,
                 raw = val,
                 default,
                 "invalid bool value for {key}; using default {default}"
             );
-            default
+            Ok(default)
         }
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
-fn env_delimiter(key: &str, default: Delimiter) -> Delimiter {
+fn env_delimiter(
+    key: &'static str,
+    default: Delimiter,
+    strict: bool,
+) -> Result<Delimiter, ServerError> {
     match std::env::var(key).as_deref() {
-        Ok("comma") => Delimiter::Comma,
-        Ok("tab") => Delimiter::Tab,
-        Ok("pipe") => Delimiter::Pipe,
+        Ok("comma") => Ok(Delimiter::Comma),
+        Ok("tab") => Ok(Delimiter::Tab),
+        Ok("pipe") => Ok(Delimiter::Pipe),
         Ok(val) => {
+            if strict {
+                return Err(ServerError::InvalidConfig {
+                    var: key,
+                    value: val.to_owned(),
+                    reason: "value must be one of: comma, tab, pipe",
+                });
+            }
             tracing::warn!(
                 key,
                 raw = val,
                 "invalid delimiter value for {key}; accepted: comma, tab, pipe; \
                  using default"
             );
-            default
+            Ok(default)
         }
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
@@ -328,7 +396,7 @@ mod tests {
     /// Helper: run a closure with a single scoped env var.
     /// Uses the `temp-env` crate for safe, thread-isolated env var overrides.
     fn with_env<F: FnOnce()>(key: &str, val: &str, f: F) {
-        temp_env::with_var(key, Some(val), f);
+        temp_env::with_vars([(key, Some(val)), ("TOON_CONFIG_STRICT", None::<&str>)], f);
     }
 
     #[test]
@@ -350,6 +418,7 @@ mod tests {
                 ("TOON_CLIENT_HINT", None::<&str>),
                 ("TOON_PIPELINE_TIMEOUT_MS", None::<&str>),
                 ("TOON_MAX_CONCURRENT_CALLS", None::<&str>),
+                ("TOON_CONFIG_STRICT", None::<&str>),
             ],
             || {
                 let config = Config::load().expect("defaults must load successfully");
@@ -365,6 +434,7 @@ mod tests {
                 assert!(config.client_hint.is_none());
                 assert_eq!(config.pipeline_timeout_ms, 30_000);
                 assert_eq!(config.max_concurrent_calls, 8);
+                assert!(!config.strict_config);
             },
         );
     }
@@ -379,18 +449,62 @@ mod tests {
 
     #[test]
     fn invalid_f64_falls_back_to_default() {
-        with_env("TOON_COMPRESSION_THRESHOLD", "not_a_number", || {
-            let config = Config::load().expect("unparseable falls back to default");
-            assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
-        });
+        temp_env::with_vars(
+            [
+                ("TOON_CONFIG_STRICT", None::<&str>),
+                ("TOON_COMPRESSION_THRESHOLD", Some("not_a_number")),
+            ],
+            || {
+                let config = Config::load().expect("unparseable falls back to default");
+                assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
+            },
+        );
     }
 
     #[test]
     fn invalid_usize_falls_back_to_default() {
-        with_env("TOON_MIN_BYTES", "abc", || {
-            let config = Config::load().expect("unparseable usize falls back to default");
-            assert_eq!(config.min_bytes, 256);
-        });
+        temp_env::with_vars(
+            [
+                ("TOON_CONFIG_STRICT", None::<&str>),
+                ("TOON_MIN_BYTES", Some("abc")),
+            ],
+            || {
+                let config = Config::load().expect("unparseable usize falls back to default");
+                assert_eq!(config.min_bytes, 256);
+            },
+        );
+    }
+
+    #[test]
+    fn strict_config_rejects_unparseable_f64() {
+        temp_env::with_vars(
+            [
+                ("TOON_CONFIG_STRICT", Some("true")),
+                ("TOON_COMPRESSION_THRESHOLD", Some("not_a_number")),
+            ],
+            || match Config::load() {
+                Err(ServerError::InvalidConfig { var, .. }) => {
+                    assert_eq!(var, "TOON_COMPRESSION_THRESHOLD");
+                }
+                other => panic!("expected InvalidConfig for strict f64, got {other:?}"),
+            },
+        );
+    }
+
+    #[test]
+    fn strict_config_rejects_unparseable_bool() {
+        temp_env::with_vars(
+            [
+                ("TOON_CONFIG_STRICT", Some("true")),
+                ("TOON_LOG_ENABLED", Some("maybe")),
+            ],
+            || match Config::load() {
+                Err(ServerError::InvalidConfig { var, .. }) => {
+                    assert_eq!(var, "TOON_LOG_ENABLED");
+                }
+                other => panic!("expected InvalidConfig for strict bool, got {other:?}"),
+            },
+        );
     }
 
     #[test]

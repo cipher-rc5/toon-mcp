@@ -31,6 +31,6 @@ pub use classifier::{
 pub use compressor::{
     CompressConfig, CompressDecision, Compressor, DEFAULT_MAX_INPUT_BYTES, PassThroughReason,
 };
-pub use detector::{FormatDetector, InputFormat};
+pub use detector::{DetectionConfidence, DetectionMetadata, FormatDetector, InputFormat};
 pub use error::CoreError;
 pub use parser::Parser;

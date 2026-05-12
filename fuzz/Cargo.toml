@@ -10,9 +10,9 @@
 name = "toon-mcp-fuzz"
 version = "0.0.0"
 authors = ["cipher-rc5"]
+edition = "2024"
 license = "MIT"
 publish = false
-edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true

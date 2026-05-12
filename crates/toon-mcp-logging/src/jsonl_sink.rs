@@ -6,6 +6,7 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -15,7 +16,11 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{error, info, warn};
 
-use crate::{error::LogError, event::LogEvent, sink::LogSink};
+use crate::{
+    error::LogError,
+    event::LogEvent,
+    sink::{LogDiagnostics, LogSink},
+};
 use async_trait::async_trait;
 
 /// Configuration for the JSONL sink.
@@ -83,6 +88,14 @@ enum SinkCmd {
     Shutdown(oneshot::Sender<Result<(), LogError>>),
 }
 
+struct WriterDiagnostics {
+    serialization_failed_count: Arc<AtomicU64>,
+    record_failed_count: Arc<AtomicU64>,
+    record_dropped_count: Arc<AtomicU64>,
+    writer_failed_count: Arc<AtomicU64>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
 /// A `LogSink` that appends events as JSONL to daily-partitioned files.
 ///
 /// The writer task owns the open file handles and is the sole writer. Readers
@@ -92,6 +105,8 @@ pub struct JsonlSink {
     serialization_failed_count: Arc<AtomicU64>,
     record_failed_count: Arc<AtomicU64>,
     record_dropped_count: Arc<AtomicU64>,
+    writer_failed_count: Arc<AtomicU64>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl JsonlSink {
@@ -113,20 +128,28 @@ impl JsonlSink {
         let serialization_failed_count = Arc::new(AtomicU64::new(0));
         let record_failed_count = Arc::new(AtomicU64::new(0));
         let record_dropped_count = Arc::new(AtomicU64::new(0));
+        let writer_failed_count = Arc::new(AtomicU64::new(0));
+        let last_error = Arc::new(Mutex::new(None));
         let sink = JsonlSink {
             sender: tx,
             serialization_failed_count: Arc::clone(&serialization_failed_count),
             record_failed_count: Arc::clone(&record_failed_count),
             record_dropped_count: Arc::clone(&record_dropped_count),
+            writer_failed_count: Arc::clone(&writer_failed_count),
+            last_error: Arc::clone(&last_error),
         };
         let task_future = writer_task(
             rx,
             config.log_dir,
             config.flush_interval,
             config.buffer_size,
-            serialization_failed_count,
-            record_failed_count,
-            record_dropped_count,
+            WriterDiagnostics {
+                serialization_failed_count,
+                record_failed_count,
+                record_dropped_count,
+                writer_failed_count,
+                last_error,
+            },
         );
 
         Ok((sink, task_future))
@@ -180,6 +203,12 @@ impl JsonlSink {
     pub fn record_dropped_count(&self) -> u64 {
         self.record_dropped_count.load(Ordering::Relaxed)
     }
+
+    /// Number of flush attempts that failed after events were accepted by the
+    /// writer task.
+    pub fn writer_failed_count(&self) -> u64 {
+        self.writer_failed_count.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
@@ -193,14 +222,30 @@ impl LogSink for JsonlSink {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.record_dropped_count.fetch_add(1, Ordering::Relaxed);
+                set_last_error(&self.last_error, "writer task channel is full".into());
                 Ok(())
             }
             Err(TrySendError::Closed(_)) => {
                 self.record_failed_count.fetch_add(1, Ordering::Relaxed);
-                Err(LogError::ChannelSend(
-                    "writer task channel is closed".into(),
-                ))
+                let message = "writer task channel is closed".to_string();
+                set_last_error(&self.last_error, message.clone());
+                Err(LogError::ChannelSend(message))
             }
+        }
+    }
+
+    fn diagnostics(&self) -> LogDiagnostics {
+        let capacity = self.sender.max_capacity();
+        let available = self.sender.capacity();
+        LogDiagnostics {
+            record_dropped_count: self.record_dropped_count.load(Ordering::Relaxed),
+            record_failed_count: self.record_failed_count.load(Ordering::Relaxed),
+            serialization_failed_count: self.serialization_failed_count.load(Ordering::Relaxed),
+            writer_failed_count: self.writer_failed_count.load(Ordering::Relaxed),
+            last_error: self.last_error.lock().ok().and_then(|guard| guard.clone()),
+            queue_capacity: Some(capacity),
+            queue_queued: Some(capacity.saturating_sub(available)),
+            queue_available: Some(available),
         }
     }
 
@@ -237,9 +282,7 @@ async fn writer_task(
     log_dir: PathBuf,
     flush_interval: Duration,
     buffer_size: usize,
-    serialization_failed_count: Arc<AtomicU64>,
-    record_failed_count: Arc<AtomicU64>,
-    record_dropped_count: Arc<AtomicU64>,
+    diagnostics: WriterDiagnostics,
 ) {
     let mut pending: Vec<LogEvent> = Vec::with_capacity(buffer_size);
     // Open file handles keyed by YYYY-MM-DD partition string.
@@ -259,7 +302,9 @@ async fn writer_task(
                                 &mut pending,
                                 &log_dir,
                                 &mut file_handles,
-                                &serialization_failed_count,
+                                &diagnostics.serialization_failed_count,
+                                &diagnostics.writer_failed_count,
+                                &diagnostics.last_error,
                             ).await {
                                 warn!("JsonlSink flush (buffer full) failed: {e}");
                             }
@@ -269,7 +314,9 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &serialization_failed_count,
+                            &diagnostics.serialization_failed_count,
+                            &diagnostics.writer_failed_count,
+                            &diagnostics.last_error,
                         )
                         .await;
                         let _ = ack.send(result);
@@ -279,18 +326,22 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &serialization_failed_count,
+                            &diagnostics.serialization_failed_count,
+                            &diagnostics.writer_failed_count,
+                            &diagnostics.last_error,
                         )
                         .await;
                         let _ = ack.send(result);
-                        let s = serialization_failed_count.load(Ordering::Relaxed);
-                        let f = record_failed_count.load(Ordering::Relaxed);
-                        let d = record_dropped_count.load(Ordering::Relaxed);
+                        let s = diagnostics.serialization_failed_count.load(Ordering::Relaxed);
+                        let f = diagnostics.record_failed_count.load(Ordering::Relaxed);
+                        let d = diagnostics.record_dropped_count.load(Ordering::Relaxed);
+                        let w = diagnostics.writer_failed_count.load(Ordering::Relaxed);
                         tracing::info!(
                             component = "jsonl_sink",
                             record_failed_count = f,
                             record_dropped_count = d,
                             serialization_failed_count = s,
+                            writer_failed_count = w,
                             "JsonlSink counters"
                         );
                         info!("JsonlSink writer task: shutdown complete");
@@ -301,7 +352,9 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &serialization_failed_count,
+                            &diagnostics.serialization_failed_count,
+                            &diagnostics.writer_failed_count,
+                            &diagnostics.last_error,
                         ).await {
                             warn!("JsonlSink flush (channel closed) failed: {e}");
                         }
@@ -317,18 +370,22 @@ async fn writer_task(
                         &mut pending,
                         &log_dir,
                         &mut file_handles,
-                        &serialization_failed_count,
+                        &diagnostics.serialization_failed_count,
+                        &diagnostics.writer_failed_count,
+                        &diagnostics.last_error,
                     ).await {
                         warn!("JsonlSink flush (periodic) failed: {e}");
                     }
-                let s = serialization_failed_count.load(Ordering::Relaxed);
-                let f = record_failed_count.load(Ordering::Relaxed);
-                let d = record_dropped_count.load(Ordering::Relaxed);
+                let s = diagnostics.serialization_failed_count.load(Ordering::Relaxed);
+                let f = diagnostics.record_failed_count.load(Ordering::Relaxed);
+                let d = diagnostics.record_dropped_count.load(Ordering::Relaxed);
+                let w = diagnostics.writer_failed_count.load(Ordering::Relaxed);
                 tracing::info!(
                     component = "jsonl_sink",
                     record_failed_count = f,
                     record_dropped_count = d,
                     serialization_failed_count = s,
+                    writer_failed_count = w,
                     "JsonlSink counters"
                 );
             }
@@ -346,6 +403,8 @@ async fn flush_pending(
     log_dir: &Path,
     file_handles: &mut HashMap<String, std::fs::File>,
     serialization_failed_count: &AtomicU64,
+    writer_failed_count: &AtomicU64,
+    last_error: &Mutex<Option<String>>,
 ) -> Result<(), LogError> {
     if pending.is_empty() {
         return Ok(());
@@ -429,15 +488,28 @@ async fn flush_pending(
     .await
     .map_err(|e| {
         error!("JsonlSink spawn_blocking task failed: {e}");
-        LogError::IoError(std::io::Error::other(format!("spawn_blocking failed: {e}")))
+        let message = format!("spawn_blocking failed: {e}");
+        writer_failed_count.fetch_add(1, Ordering::Relaxed);
+        set_last_error(last_error, message.clone());
+        LogError::IoError(std::io::Error::other(message))
     })?;
 
     // Restore the file handles regardless of outcome.
     *file_handles = handles_snapshot;
 
-    result?;
+    if let Err(err) = result {
+        writer_failed_count.fetch_add(1, Ordering::Relaxed);
+        set_last_error(last_error, err.to_string());
+        return Err(err);
+    }
     pending.clear();
     Ok(())
+}
+
+fn set_last_error(last_error: &Mutex<Option<String>>, message: String) {
+    if let Ok(mut guard) = last_error.lock() {
+        *guard = Some(message);
+    }
 }
 
 /// Returns a `YYYY-MM-DD` string from a microsecond Unix timestamp.
@@ -732,6 +804,28 @@ mod tests {
         sink.flush().await.expect("flush");
         assert_eq!(sink.serialization_failed_count(), 0);
         Box::new(sink).shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_writer_failures() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 100,
+            flush_interval: Duration::from_secs(3600),
+        };
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        tokio::spawn(task);
+
+        sink.record(make_event(1)).await.expect("record succeeds");
+        std::fs::remove_dir_all(dir.path()).expect("log directory removed");
+        std::fs::write(dir.path(), b"not a directory").expect("file replaces log directory");
+
+        let result = sink.flush().await;
+        assert!(result.is_err(), "flush must report filesystem failure");
+        let diagnostics = sink.diagnostics();
+        assert_eq!(diagnostics.writer_failed_count, 1);
+        assert!(diagnostics.last_error.is_some());
     }
 
     /// Regression test: the periodic counter-summary log path (and the

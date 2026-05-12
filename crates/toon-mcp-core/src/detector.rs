@@ -21,6 +21,38 @@ pub enum InputFormat {
     Unknown,
 }
 
+/// Confidence bucket for format detection results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectionConfidence {
+    /// Detection was backed by a full parser validation or an exact fallback.
+    Certain,
+    /// Detection was based on a format heuristic rather than a full parse.
+    Heuristic,
+}
+
+impl DetectionConfidence {
+    /// Return a stable lowercase string identifier for logging and display.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DetectionConfidence::Certain => "certain",
+            DetectionConfidence::Heuristic => "heuristic",
+        }
+    }
+}
+
+/// Metadata returned by format detection for clients that need ambiguity data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectionMetadata {
+    /// Detected format selected by the normal detection precedence rules.
+    pub format: InputFormat,
+    /// Confidence bucket for the selected format.
+    pub confidence: DetectionConfidence,
+    /// Whether more than one detector matched the input.
+    pub ambiguous: bool,
+    /// All formats that matched, in detection precedence order.
+    pub candidates: Vec<InputFormat>,
+}
+
 impl InputFormat {
     /// Return a stable lowercase string identifier for logging and display.
     ///
@@ -129,6 +161,13 @@ impl FormatDetector {
     /// assert_eq!(FormatDetector::detect("plain text"), InputFormat::Unknown);
     /// ```
     pub fn detect(input: &str) -> InputFormat {
+        Self::detect_with_metadata(input).format
+    }
+
+    /// Detect the format of `input` and include confidence/ambiguity metadata.
+    pub fn detect_with_metadata(input: &str) -> DetectionMetadata {
+        let mut candidates = Vec::new();
+
         // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
         // Use `IgnoredAny` so serde_json validates structure without
         // allocating a `Value` tree; we re-parse with a real Value if and
@@ -137,25 +176,37 @@ impl FormatDetector {
         if matches!(first_nonws, Some(b'{') | Some(b'['))
             && serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok()
         {
-            return InputFormat::Json;
+            candidates.push(InputFormat::Json);
         }
 
         // 2. JSONL probe — try first two non-empty lines.
         if Self::probe_jsonl(input) {
-            return InputFormat::Jsonl;
+            candidates.push(InputFormat::Jsonl);
         }
 
         // 3. CSV probe — comma delimiter.
         if Self::probe_delimited(input, b',') {
-            return InputFormat::Csv;
+            candidates.push(InputFormat::Csv);
         }
 
         // 4. TSV probe — tab delimiter.
         if Self::probe_delimited(input, b'\t') {
-            return InputFormat::Tsv;
+            candidates.push(InputFormat::Tsv);
         }
 
-        InputFormat::Unknown
+        let format = candidates.first().copied().unwrap_or(InputFormat::Unknown);
+        let confidence = match format {
+            InputFormat::Json | InputFormat::Unknown => DetectionConfidence::Certain,
+            InputFormat::Jsonl | InputFormat::Csv | InputFormat::Tsv => {
+                DetectionConfidence::Heuristic
+            }
+        };
+        DetectionMetadata {
+            format,
+            confidence,
+            ambiguous: candidates.len() > 1,
+            candidates,
+        }
     }
 
     /// Detect the format and immediately parse to a normalised `serde_json::Value`.
@@ -259,6 +310,24 @@ mod tests {
     fn detect_csv() {
         let input = "id,name,score\n1,Alice,9.5\n2,Bob,8.0";
         assert_eq!(FormatDetector::detect(input), InputFormat::Csv);
+    }
+
+    #[test]
+    fn detect_metadata_marks_json_certain() {
+        let meta = FormatDetector::detect_with_metadata(r#"{"key":"value"}"#);
+        assert_eq!(meta.format, InputFormat::Json);
+        assert_eq!(meta.confidence, DetectionConfidence::Certain);
+        assert!(!meta.ambiguous);
+        assert_eq!(meta.candidates, vec![InputFormat::Json]);
+    }
+
+    #[test]
+    fn detect_metadata_marks_csv_heuristic() {
+        let meta = FormatDetector::detect_with_metadata("id,name\n1,Alice");
+        assert_eq!(meta.format, InputFormat::Csv);
+        assert_eq!(meta.confidence, DetectionConfidence::Heuristic);
+        assert!(!meta.ambiguous);
+        assert_eq!(meta.candidates, vec![InputFormat::Csv]);
     }
 
     #[test]

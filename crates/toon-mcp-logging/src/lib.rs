@@ -27,4 +27,4 @@ pub use event::LogEvent;
 pub use jsonl_sink::{JsonlSink, JsonlSinkConfig};
 pub use memory_sink::MemorySink;
 pub use noop_sink::NoopSink;
-pub use sink::LogSink;
+pub use sink::{LogDiagnostics, LogSink};

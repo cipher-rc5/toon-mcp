@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust **1.94.0** (set via `rust-toolchain.toml`; `rustup` picks this up automatically)
+- Rust **1.93.0** (set via `rust-toolchain.toml`; `rustup` picks this up automatically)
 - A working `cargo` installation
 
 ## Running the test suite
@@ -39,9 +39,10 @@ cargo fmt
 
 ## Branch and PR model
 
-- Work against `main`. Branch off `main` for every change.
+- Work against `master`. Branch off `master` for every change.
 - Branch names: `feat/<short-description>`, `fix/<short-description>`, `chore/<short-description>`.
-- Open a pull request against `main`. All CI checks (fmt, clippy, test, doc, coverage ≥ 70%) must pass before merge.
+- Open a pull request against `master`. CI also runs on `main` while both branch names exist, but `master` is the active development branch.
+- All CI checks (fmt, clippy, test, doc, audit, semver where applicable, coverage >= 75%) must pass before merge.
 - Squash-merge is preferred to keep the history linear.
 - Update `CHANGELOG.md` under `[Unreleased]` as part of the PR.
 
@@ -49,16 +50,23 @@ cargo fmt
 
 This crate follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-| Change type | Version bump |
-|---|---|
-| New MCP tool exposed to callers | **minor** |
-| Removal or rename of an existing MCP tool or its parameters | **major** |
-| Change to a public Rust API (`pub` type, function, or trait) that breaks downstream code | **major** |
-| Backward-compatible addition to a public Rust API | **minor** |
-| Bug fix, performance improvement, internal refactor, dependency update | **patch** |
-| Breaking change to configuration env-var names or semantics | **major** |
+| Change type                                                                              | Version bump |
+| ---------------------------------------------------------------------------------------- | ------------ |
+| New MCP tool exposed to callers                                                          | **minor**    |
+| Removal or rename of an existing MCP tool or its parameters                              | **major**    |
+| Change to a public Rust API (`pub` type, function, or trait) that breaks downstream code | **major**    |
+| Backward-compatible addition to a public Rust API                                        | **minor**    |
+| Bug fix, performance improvement, internal refactor, dependency update                   | **patch**    |
+| Breaking change to configuration env-var names or semantics                              | **major**    |
 
 Pre-1.0 note: the project is currently at `0.1.x`. Until `1.0.0` is tagged, minor bumps may carry breaking changes per semver §4, but we aim to avoid this.
+
+## Compatibility Policy
+
+- Supported Rust: the exact toolchain pinned in `rust-toolchain.toml` (`1.93.0` at the time of writing).
+- Supported release artifacts: Linux GNU and macOS on `x86_64` and `aarch64`, matching `.github/workflows/release.yml`.
+- Supported MCP clients: stdio MCP clients that can launch a local binary and pass environment variables, including opencode and Claude Desktop.
+- API stability: before `1.0.0`, MCP tool schemas, public Rust APIs, and environment variable semantics may change in a minor release. Document breaking changes in `CHANGELOG.md`.
 
 ## Dependency pinning
 

@@ -1,13 +1,13 @@
 [package]
-name        = "toon-mcp-server"
-version.workspace     = true
-edition.workspace     = true
-license.workspace     = true
-repository.workspace  = true
-authors.workspace     = true
+name = "toon-mcp-server"
+version.workspace = true
+authors.workspace = true
+categories = ["command-line-utilities"]
+edition.workspace = true
+keywords = ["toon", "mcp", "compression", "llm", "server"]
+license.workspace = true
+repository.workspace = true
 description = "MCP server binary for TOON-format compression of structured data"
-keywords    = ["toon", "mcp", "compression", "llm", "server"]
-categories  = ["command-line-utilities"]
 
 [[bin]]
 name = "toon-mcp-server"
@@ -18,22 +18,22 @@ name = "toon_mcp_server"
 path = "src/lib.rs"
 
 [dependencies]
-toon-mcp-core    = { path = "../toon-mcp-core" }
+dotenvy.workspace = true
+jiff.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toon-format.workspace = true
+toon-mcp-core = { path = "../toon-mcp-core" }
 toon-mcp-logging = { path = "../toon-mcp-logging" }
-rmcp.workspace         = true
-serde.workspace        = true
-serde_json.workspace   = true
-schemars.workspace     = true
-tokio.workspace        = true
-thiserror.workspace    = true
-dotenvy.workspace      = true
-tracing.workspace      = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
-jiff.workspace         = true
-toon-format.workspace  = true
-xxhash-rust.workspace  = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
+anyhow = "=1.0.102"
+rmcp = { version = "=1.6.0", features = ["server", "transport-io", "macros", "schemars", "client"] }
 temp-env = "=0.3.6"
-rmcp     = { version = "=1.6.0", features = ["server", "transport-io", "macros", "schemars", "client"] }
-anyhow   = "=1.0.102"

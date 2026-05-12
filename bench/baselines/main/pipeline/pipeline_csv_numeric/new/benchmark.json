@@ -1,1 +1,9 @@
-{"group_id":"pipeline","function_id":"pipeline_csv_numeric","value_str":null,"throughput":{"Bytes":32895},"full_id":"pipeline/pipeline_csv_numeric","directory_name":"pipeline/pipeline_csv_numeric","title":"pipeline/pipeline_csv_numeric"}
+{
+  "group_id": "pipeline",
+  "function_id": "pipeline_csv_numeric",
+  "value_str": null,
+  "throughput": { "Bytes": 32895 },
+  "full_id": "pipeline/pipeline_csv_numeric",
+  "directory_name": "pipeline/pipeline_csv_numeric",
+  "title": "pipeline/pipeline_csv_numeric"
+}

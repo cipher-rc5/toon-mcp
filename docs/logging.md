@@ -49,11 +49,11 @@ Handlers call `record` with fire-and-forget semantics — the returned `Result` 
 
 ## Available Sink Implementations
 
-| Sink | Use case |
-|---|---|
-| `JsonlSink` | Production — writes hive-partitioned JSONL to `TOON_LOG_DIR` |
+| Sink         | Use case                                                                     |
+| ------------ | ---------------------------------------------------------------------------- |
+| `JsonlSink`  | Production — writes hive-partitioned JSONL to `TOON_LOG_DIR`                 |
 | `MemorySink` | Unit tests — accumulates events in `Arc<Mutex<Vec<LogEvent>>>` for assertion |
-| `NoopSink` | Benchmarks or disabled logging — drops all events immediately |
+| `NoopSink`   | Benchmarks or disabled logging — drops all events immediately                |
 
 The server selects the sink at startup based on `TOON_LOG_ENABLED`:
 
@@ -74,30 +74,30 @@ flowchart LR
 
 Every tool invocation produces one `LogEvent` with the following fields:
 
-| Field | Type | Description |
-|---|---|---|
-| `event_id` | `String` (UUIDv4) | Unique identifier for this event |
-| `ts_us` | `i64` | Unix timestamp in microseconds |
-| `tool_name` | `String` | `"compress_content"`, `"compression_stats"`, or `"detect_format"` |
-| `input_format` | `String` | `"json"`, `"jsonl"`, `"csv"`, `"tsv"`, or `"unknown"` |
-| `shape_class` | `String` | `"tabular"`, `"fold_chain"`, `"primitive_array"`, `"mixed"`, or `"pass_through"` |
-| `input_bytes` | `u64` | Byte length of the raw input string |
-| `output_bytes` | `u64` | Byte length of the output (equals `input_bytes` when not compressed) |
-| `compressed` | `bool` | Whether compression was applied |
-| `savings_pct` | `f64` | Fraction of bytes saved (0.0 when not compressed) |
-| `threshold_used` | `f64` | The `TOON_COMPRESSION_THRESHOLD` value active at call time |
-| `duration_us` | `u64` | Wall-clock time in microseconds for the detect + classify + encode pipeline |
-| `pass_reason` | `Option<String>` | If `compressed=false`, the reason (see below) |
-| `client_hint` | `Option<String>` | Value of `TOON_CLIENT_HINT` at startup, or `null` |
+| Field            | Type              | Description                                                                      |
+| ---------------- | ----------------- | -------------------------------------------------------------------------------- |
+| `event_id`       | `String`          | 16-character lowercase hex identifier; unique within one process run, not cryptographic and not globally unique |
+| `ts_us`          | `i64`             | Unix timestamp in microseconds                                                   |
+| `tool_name`      | `String`          | `"compress_content"`, `"compression_stats"`, or `"detect_format"`                |
+| `input_format`   | `String`          | `"json"`, `"jsonl"`, `"csv"`, `"tsv"`, or `"unknown"`                            |
+| `shape_class`    | `String`          | `"tabular"`, `"fold_chain"`, `"primitive_array"`, `"mixed"`, or `"pass_through"` |
+| `input_bytes`    | `u64`             | Byte length of the raw input string                                              |
+| `output_bytes`   | `u64`             | Byte length of the output (equals `input_bytes` when not compressed)             |
+| `compressed`     | `bool`            | Whether compression was applied                                                  |
+| `savings_pct`    | `f64`             | Fraction of bytes saved (0.0 when not compressed)                                |
+| `threshold_used` | `f64`             | The `TOON_COMPRESSION_THRESHOLD` value active at call time                       |
+| `duration_us`    | `u64`             | Wall-clock time in microseconds for the detect + classify + encode pipeline      |
+| `pass_reason`    | `Option<String>`  | If `compressed=false`, the reason (see below)                                    |
+| `client_hint`    | `Option<String>`  | Value of `TOON_CLIENT_HINT` at startup, or `null`                                |
 
 ### `pass_reason` values
 
-| Value | Meaning |
-|---|---|
-| `"unknown_format"` | Format detection returned `Unknown` |
-| `"below_min_bytes"` | Input shorter than `TOON_MIN_BYTES` |
-| `"insufficient_savings"` | Compression succeeded but savings below threshold |
-| `"shape_not_beneficial"` | Classifier returned `PassThrough` |
+| Value                              | Meaning                                                    |
+| ---------------------------------- | ---------------------------------------------------------- |
+| `"unknown_format"`                 | Format detection returned `Unknown`                        |
+| `"below_min_bytes"`                | Input shorter than `TOON_MIN_BYTES`                        |
+| `"insufficient_savings"`           | Compression succeeded but savings below threshold          |
+| `"shape_not_beneficial"`           | Classifier returned `PassThrough`                          |
 | `"parse_failed:<format>:<detail>"` | Parsing succeeded format detection but failed actual parse |
 
 ---
@@ -299,11 +299,28 @@ The `Arc<Mutex<Vec<LogEvent>>>` handle returned by `MemorySink::new()` can be cl
 
 ---
 
+## Durability Semantics
+
+JSONL logs are best-effort telemetry, not audit-grade records. Tool handlers preserve response success even when logging fails, and handler-level code currently discards `LogSink::record` errors. The writer task batches events in memory and flushes on buffer size, timer, explicit shutdown flush, or sink shutdown.
+
+Operational consequences:
+
+- A process crash can lose events that were accepted into the in-memory channel but not flushed.
+- A disk, permission, or channel failure can drop log events while tool calls continue.
+- `writer.flush()` flushes the process buffer to the OS; the implementation does not call `sync_data` or `sync_all` for fsync-style durability.
+- There is no inter-process locking. Run at most one `toon-mcp-server` process per `TOON_LOG_DIR`.
+
+Use these logs for observability, capacity planning, and troubleshooting. Do not use them as the sole audit trail for regulated or billing-critical events without adding durable queueing, fsync policy, and multi-process coordination.
+
+---
+
 ## Log Retention
 
 toon-mcp does not implement log rotation or retention. The `data/logs/` directory grows indefinitely. To manage storage:
 
-- Use a cron job or systemd timer to archive or delete old partition directories
+- Use a cron job, systemd timer, or launchd job to archive or delete old partition directories (`day=YYYY-MM-DD/`).
+- Pick a retention window before enabling production logging. A typical local deployment keeps 7-30 days of JSONL online and exports older data to compressed storage if needed.
+- Keep separate `TOON_LOG_DIR` values per environment and process to avoid accidental retention or deletion overlap.
 - DuckDB can export to Parquet for compact long-term storage:
 
 ```sql
@@ -313,4 +330,10 @@ COPY (
     FROM read_json('data/logs/**/*.jsonl')
     WHERE to_timestamp(ts_us / 1_000_000) < now() - INTERVAL '30 days'
 ) TO 'archive/logs.parquet' (FORMAT PARQUET);
+```
+
+Example cleanup command for partitions older than 30 days:
+
+```bash
+find /absolute/path/to/toon-mcp/data/logs -maxdepth 1 -type d -name 'day=*' -mtime +30 -print -exec rm -rf {} \;
 ```

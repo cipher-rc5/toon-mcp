@@ -1,1 +1,9 @@
-{"group_id":"detect_format","function_id":"detect_csv_large","value_str":null,"throughput":{"Bytes":32895},"full_id":"detect_format/detect_csv_large","directory_name":"detect_format/detect_csv_large","title":"detect_format/detect_csv_large"}
+{
+  "group_id": "detect_format",
+  "function_id": "detect_csv_large",
+  "value_str": null,
+  "throughput": { "Bytes": 32895 },
+  "full_id": "detect_format/detect_csv_large",
+  "directory_name": "detect_format/detect_csv_large",
+  "title": "detect_format/detect_csv_large"
+}

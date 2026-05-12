@@ -1,1 +1,9 @@
-{"group_id":"classify_shape","function_id":"classify_mixed","value_str":null,"throughput":null,"full_id":"classify_shape/classify_mixed","directory_name":"classify_shape/classify_mixed","title":"classify_shape/classify_mixed"}
+{
+  "group_id": "classify_shape",
+  "function_id": "classify_mixed",
+  "value_str": null,
+  "throughput": null,
+  "full_id": "classify_shape/classify_mixed",
+  "directory_name": "classify_shape/classify_mixed",
+  "title": "classify_shape/classify_mixed"
+}

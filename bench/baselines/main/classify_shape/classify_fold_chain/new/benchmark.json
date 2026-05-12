@@ -1,1 +1,9 @@
-{"group_id":"classify_shape","function_id":"classify_fold_chain","value_str":null,"throughput":null,"full_id":"classify_shape/classify_fold_chain","directory_name":"classify_shape/classify_fold_chain","title":"classify_shape/classify_fold_chain"}
+{
+  "group_id": "classify_shape",
+  "function_id": "classify_fold_chain",
+  "value_str": null,
+  "throughput": null,
+  "full_id": "classify_shape/classify_fold_chain",
+  "directory_name": "classify_shape/classify_fold_chain",
+  "title": "classify_shape/classify_fold_chain"
+}

@@ -45,49 +45,49 @@ graph TD
 
 The computational heart of the system. Deliberately pure — no I/O, no async, no network, no runtime.
 
-| Module | Role |
-|---|---|
-| `detector.rs` | Probe input bytes to determine format (JSON / JSONL / CSV / TSV / Unknown) |
-| `parser/` | Parse raw strings into `serde_json::Value` — one submodule per format |
-| `classifier.rs` | Walk the `Value` tree and assign a `ShapeClass` |
-| `compressor.rs` | Orchestrate the full pipeline; decide compress vs. pass-through |
-| `error.rs` | Typed errors via `thiserror` |
+| Module          | Role                                                                       |
+| --------------- | -------------------------------------------------------------------------- |
+| `detector.rs`   | Probe input bytes to determine format (JSON / JSONL / CSV / TSV / Unknown) |
+| `parser/`       | Parse raw strings into `serde_json::Value` — one submodule per format      |
+| `classifier.rs` | Walk the `Value` tree and assign a `ShapeClass`                            |
+| `compressor.rs` | Orchestrate the full pipeline; decide compress vs. pass-through            |
+| `error.rs`      | Typed errors via `thiserror`                                               |
 
 ### `toon-mcp-logging`
 
 Async event recording. Decoupled from the core pipeline via the `LogSink` trait — the server never imports a concrete sink directly from handler code.
 
-| Module | Role |
-|---|---|
-| `sink.rs` | `LogSink` async trait |
-| `event.rs` | `LogEvent` struct (all fields flat, all serializable) |
-| `jsonl_sink.rs` | Production sink: buffers events in memory, flushes to hive-partitioned JSONL via `spawn_blocking`; holds file handles open between flushes |
-| `memory_sink.rs` | Test sink: accumulates events in a `Vec` behind `Arc<Mutex<>>` |
-| `noop_sink.rs` | Zero-cost sink for benchmarks or disabled logging |
-| `error.rs` | `LogError` |
+| Module           | Role                                                                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `sink.rs`        | `LogSink` async trait                                                                                                                      |
+| `event.rs`       | `LogEvent` struct (all fields flat, all serializable)                                                                                      |
+| `jsonl_sink.rs`  | Production sink: buffers events in memory, flushes to hive-partitioned JSONL via `spawn_blocking`; holds file handles open between flushes |
+| `memory_sink.rs` | Test sink: accumulates events in a `Vec` behind `Arc<Mutex<>>`                                                                             |
+| `noop_sink.rs`   | Zero-cost sink for benchmarks or disabled logging                                                                                          |
+| `error.rs`       | `LogError`                                                                                                                                 |
 
 ### `toon-mcp-server`
 
 The runnable binary. Owns startup, configuration, and MCP protocol registration.
 
-| Module | Role |
-|---|---|
-| `main.rs` | Tokio entry point: load config, construct sink, spawn background task, serve stdio |
-| `config.rs` | Parse `TOON_*` env vars into a typed `Config` struct |
-| `server.rs` | Register `ToonMcpServer` with `rmcp`, declare tool router, set server info |
+| Module       | Role                                                                                     |
+| ------------ | ---------------------------------------------------------------------------------------- |
+| `main.rs`    | Tokio entry point: load config, construct sink, spawn background task, serve stdio       |
+| `config.rs`  | Parse `TOON_*` env vars into a typed `Config` struct                                     |
+| `server.rs`  | Register `ToonMcpServer` with `rmcp`, declare tool router, set server info               |
 | `handler.rs` | All three tool implementations: `detect_format`, `compress_content`, `compression_stats` |
-| `error.rs` | `ServerError` for startup failures |
+| `error.rs`   | `ServerError` for startup failures                                                       |
 
 ### `toon-mcp-bench`
 
 Criterion benchmark suite. Four benchmark binaries:
 
-| Bench file | Scope | Runtime |
-|---|---|---|
-| `detection.rs` | Sync core: format detection | None |
-| `classification.rs` | Sync core: shape classification | None |
-| `compression.rs` | Sync core: full compression pipeline | None |
-| `jsonl_sink.rs` | Async logging sink: channel throughput, flush latency | `tokio` `current_thread` |
+| Bench file          | Scope                                                 | Runtime                  |
+| ------------------- | ----------------------------------------------------- | ------------------------ |
+| `detection.rs`      | Sync core: format detection                           | None                     |
+| `classification.rs` | Sync core: shape classification                       | None                     |
+| `compression.rs`    | Sync core: full compression pipeline                  | None                     |
+| `jsonl_sink.rs`     | Async logging sink: channel throughput, flush latency | `tokio` `current_thread` |
 
 The three sync core benches depend only on `toon-mcp-core` and MUST NOT start a tokio runtime. The dedicated `jsonl_sink.rs` async bench depends on `toon-mcp-logging` and is the only place a tokio runtime is permitted in this crate — it exists to measure async-specific behaviour (channel throughput, flush latency) that cannot be measured synchronously. The bench crate never depends on `toon-mcp-server`. The async-benches exception is documented in [ADR-0001](adr/0001-async-benches.md).
 
@@ -241,10 +241,10 @@ savings_pct = 1.0 - (toon_bytes as f64 / original_bytes as f64)
 
 ## Error Handling Strategy
 
-| Crate | Error type | Approach |
-|---|---|---|
-| `toon-mcp-core` | `CoreError` | `thiserror` enum, propagated with `?` |
-| `toon-mcp-logging` | `LogError` | `thiserror` enum, silently discarded by handlers |
-| `toon-mcp-server` | `ServerError` | `thiserror` enum, fatal — exits process on startup failure |
+| Crate              | Error type    | Approach                                                   |
+| ------------------ | ------------- | ---------------------------------------------------------- |
+| `toon-mcp-core`    | `CoreError`   | `thiserror` enum, propagated with `?`                      |
+| `toon-mcp-logging` | `LogError`    | `thiserror` enum, silently discarded by handlers           |
+| `toon-mcp-server`  | `ServerError` | `thiserror` enum, fatal — exits process on startup failure |
 
 No `Box<dyn Error>` in any public API. No `anyhow` in library crates. `.unwrap()` and `.expect()` are permitted only in tests and in `main.rs` where a panic is acceptable.

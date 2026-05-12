@@ -1,7 +1,7 @@
 // file: crates/toon-mcp-server/tests/mcp_transport.rs
 // description: MCP transport integration tests — verify tool routing and wire protocol
 
-//! These tests verify that the `ToonMcpServer` correctly registers its three
+//! These tests verify that the `ToonMcpServer` correctly registers its MCP
 //! tools via the rmcp `tool_router!` macro, dispatches tool calls to the
 //! correct handler functions, deserialises JSON parameters, and returns
 //! well-formed JSON-RPC responses over an in-memory duplex transport.
@@ -53,6 +53,7 @@ fn test_config() -> Config {
         logging_enabled: false,
         logging: toon_mcp_logging::JsonlSinkConfig::default(),
         log_level: "error".into(),
+        strict_config: false,
         client_hint: None,
         pipeline_timeout_ms: 30_000,
         max_concurrent_calls: 8,
@@ -269,6 +270,48 @@ async fn compression_stats_tool_routes_and_returns_stats() -> anyhow::Result<()>
         "expected estimated_output_bytes"
     );
     assert!(parsed["threshold"].is_number(), "expected threshold");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Verify that the diagnostics tool routes and returns logging health fields.
+#[tokio::test]
+async fn toon_diagnostics_tool_routes_and_returns_health() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+
+    let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
+    let _server_handle = tokio::spawn(async move {
+        let _ = server.serve(server_transport).await?.waiting().await;
+        anyhow::Ok(())
+    });
+
+    let client = TestClient.serve(client_transport).await?;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("toon_diagnostics")
+                .with_arguments(serde_json::json!({}).as_object().unwrap().clone()),
+        )
+        .await?;
+
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "expected successful result, got: {result:?}"
+    );
+
+    let text = first_text(&result);
+    let parsed: serde_json::Value = serde_json::from_str(text)?;
+    assert!(parsed["logging"].is_object(), "expected logging object");
+    assert!(parsed["handler"].is_object(), "expected handler object");
+    assert!(
+        parsed["logging"]["record_dropped_count"].is_number(),
+        "expected record_dropped_count"
+    );
+    assert!(
+        parsed["handler"]["pipeline_timeout_count"].is_number(),
+        "expected pipeline_timeout_count"
+    );
 
     client.cancel().await?;
     Ok(())

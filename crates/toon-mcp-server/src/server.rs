@@ -16,8 +16,9 @@ use toon_mcp_logging::LogSink;
 use crate::{
     config::Config,
     handler::{
-        CompressParams, CompressResult, DetectParams, DetectResult, StatsParams, StatsResult,
-        handle_compress_content_inner, handle_compression_stats, handle_detect_format,
+        CompressParams, CompressResult, DetectParams, DetectResult, DiagnosticsParams,
+        DiagnosticsResult, StatsParams, StatsResult, handle_compress_content_inner,
+        handle_compression_stats, handle_detect_format, handle_toon_diagnostics,
     },
 };
 
@@ -87,6 +88,25 @@ impl ToonMcpServer {
         Parameters(params): Parameters<StatsParams>,
     ) -> Result<Json<StatsResult>, McpError> {
         handle_compression_stats(
+            params,
+            Arc::clone(&self.config),
+            Arc::clone(&self.log_sink),
+            Arc::clone(&self.semaphore),
+        )
+        .await
+        .map(Json)
+    }
+
+    #[tool(
+        description = "Return production diagnostics for logging health, log-loss counters, \
+                          writer failures, queue saturation, pipeline timeouts, request \
+                          durations, and concurrency permits."
+    )]
+    async fn toon_diagnostics(
+        &self,
+        Parameters(params): Parameters<DiagnosticsParams>,
+    ) -> Result<Json<DiagnosticsResult>, McpError> {
+        handle_toon_diagnostics(
             params,
             Arc::clone(&self.config),
             Arc::clone(&self.log_sink),

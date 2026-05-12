@@ -22,14 +22,14 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 
 ### Compression Behavior
 
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `TOON_COMPRESSION_THRESHOLD` | `f64` (0.0–1.0) | `0.85` | Maximum fraction of the original byte count that the TOON output may occupy. An input of 10,000 bytes with `threshold=0.85` must produce output ≤ 8,500 bytes to be considered compressed. |
-| `TOON_MIN_BYTES` | `usize` | `256` | Inputs shorter than this byte count are passed through without any processing. Avoids overhead on small strings that will never compress meaningfully. |
-| `TOON_MAX_INPUT_BYTES` | `usize` | `10485760` | Hard upper bound on input size in bytes (default 10 MiB). Inputs larger than this are rejected immediately without parsing, preventing unbounded memory use. |
-| `TOON_KEY_FOLDING` | `bool` | `true` | Enable TOON key-folding mode. When enabled, deeply nested single-key objects are collapsed to dot-notation paths. Disable if your consumer of TOON output does not support key folding. |
-| `TOON_DELIMITER` | `string` | `comma` | The delimiter character used between values in TOON tabular output. Accepted values: `comma`, `tab`, `pipe`. |
-| `TOON_CSV_NUMERIC_COERCION` | `bool` | `true` | When enabled, CSV/TSV cells that parse as numbers become JSON numbers in the normalised intermediate. Set to `false` for inputs containing identifiers, postal codes, or leading-zero values that must round-trip as strings. |
+| Variable                     | Type            | Default    | Description                                                                                                                                                                                                                   |
+| ---------------------------- | --------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TOON_COMPRESSION_THRESHOLD` | `f64` (0.0–1.0) | `0.85`     | Maximum fraction of the original byte count that the TOON output may occupy. An input of 10,000 bytes with `threshold=0.85` must produce output ≤ 8,500 bytes to be considered compressed.                                    |
+| `TOON_MIN_BYTES`             | `usize`         | `256`      | Inputs shorter than this byte count are passed through without any processing. Avoids overhead on small strings that will never compress meaningfully.                                                                        |
+| `TOON_MAX_INPUT_BYTES`       | `usize`         | `10485760` | Hard upper bound on input size in bytes (default 10 MiB). Inputs larger than this are rejected immediately without parsing, preventing unbounded memory use.                                                                  |
+| `TOON_KEY_FOLDING`           | `bool`          | `true`     | Enable TOON key-folding mode. When enabled, deeply nested single-key objects are collapsed to dot-notation paths. Disable if your consumer of TOON output does not support key folding.                                       |
+| `TOON_DELIMITER`             | `string`        | `comma`    | The delimiter character used between values in TOON tabular output. Accepted values: `comma`, `tab`, `pipe`.                                                                                                                  |
+| `TOON_CSV_NUMERIC_COERCION`  | `bool`          | `true`     | When enabled, CSV/TSV cells that parse as numbers become JSON numbers in the normalised intermediate. Set to `false` for inputs containing identifiers, postal codes, or leading-zero values that must round-trip as strings. |
 
 **`TOON_MAX_INPUT_BYTES`** caps the largest payload the server will accept. Tune it down when the host process is memory-constrained or the upstream client is known to never send payloads above a smaller bound — the rejection happens before any allocation, so a tighter cap is the cheapest form of back-pressure. Tune it up only when you have observed legitimate inputs being rejected with `input_too_large`. Watch the runbook (`docs/runbook.md`) for the matching error code and triage steps.
 
@@ -37,12 +37,12 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 
 ### Concurrency and Timeouts
 
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `TOON_PIPELINE_TIMEOUT_MS` | `u64` (milliseconds) | `30000` | Per-call pipeline timeout in milliseconds. A call exceeding this duration returns a typed timeout error rather than blocking indefinitely. Also bounds how long a call will wait for a concurrency permit before giving up. |
-| `TOON_MAX_CONCURRENT_CALLS` | `usize` | `8` | Maximum number of concurrent blocking pipeline calls. Controls how many `spawn_blocking` dispatches can be in-flight at once. When the limit is reached, new calls wait up to `TOON_PIPELINE_TIMEOUT_MS` for a permit before returning a busy error. |
+| Variable                    | Type                 | Default | Description                                                                                                                                                                                                                                          |
+| --------------------------- | -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TOON_PIPELINE_TIMEOUT_MS`  | `u64` (milliseconds) | `30000` | Per-call pipeline timeout in milliseconds. A call exceeding this duration returns a typed timeout error rather than blocking indefinitely. Also bounds how long a call will wait for a concurrency permit before giving up.                          |
+| `TOON_MAX_CONCURRENT_CALLS` | `usize`              | `8`     | Maximum number of concurrent blocking pipeline calls. Controls how many `spawn_blocking` dispatches can be in-flight at once. When the limit is reached, new calls wait up to `TOON_PIPELINE_TIMEOUT_MS` for a permit before returning a busy error. |
 
-**`TOON_PIPELINE_TIMEOUT_MS`** is the per-call upper bound on blocking work plus permit-wait. Tune it down if you would rather surface a fast `timeout` error to the client than have the agent stall while a pathological input is processed — small payloads should always finish in well under a second. Tune it up only when very large inputs (near `TOON_MAX_INPUT_BYTES`) are legitimately producing timeout errors on a slow machine. Symptom to watch for: a sudden spike in `timeout` errors in the JSONL log under load — that is usually permit-wait, not parse time, so consider raising `TOON_MAX_CONCURRENT_CALLS` first. See `docs/runbook.md` for the triage flow.
+**`TOON_PIPELINE_TIMEOUT_MS`** is the per-call upper bound for permit wait and for the handler-visible blocking pipeline result. If the timeout fires after `spawn_blocking` has started, the handler returns an error but the underlying blocking task continues until it finishes; use `TOON_MAX_INPUT_BYTES` and `TOON_MAX_CONCURRENT_CALLS` as the hard admission controls. Tune the timeout down if you would rather surface a fast `timeout` error to the client than have the agent stall while a pathological input is processed. Tune it up only when very large inputs (near `TOON_MAX_INPUT_BYTES`) legitimately time out on a slow machine. See `docs/runbook.md` for the triage flow.
 
 **`TOON_MAX_CONCURRENT_CALLS`** caps how many CPU-bound pipeline tasks can run simultaneously on the blocking pool. Tune it down on shared/low-core hosts where unbounded concurrency would starve other workloads. Tune it up when the JSONL log shows a sustained pattern of `busy` rejections while host CPU still has headroom — the default `8` is conservative for modern multi-core machines. See `docs/runbook.md` for the relationship between busy errors, timeouts, and CPU saturation.
 
@@ -50,26 +50,26 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 
 These control the minimum structural requirements for each shape class. Inputs that fall below the threshold are classified as `PassThrough` and not compressed.
 
-| Variable | Type | Default | Corresponding constant |
-|---|---|---|---|
-| `TOON_TABULAR_MIN_ROWS` | `usize` | `3` | `TABULAR_MIN_ROWS` |
-| `TOON_FOLD_MIN_DEPTH` | `usize` | `3` | `FOLD_MIN_DEPTH` |
-| `TOON_PRIMITIVE_ARRAY_MIN` | `usize` | `5` | `PRIMITIVE_ARRAY_MIN` |
+| Variable                   | Type    | Default | Corresponding constant |
+| -------------------------- | ------- | ------- | ---------------------- |
+| `TOON_TABULAR_MIN_ROWS`    | `usize` | `3`     | `TABULAR_MIN_ROWS`     |
+| `TOON_FOLD_MIN_DEPTH`      | `usize` | `3`     | `FOLD_MIN_DEPTH`       |
+| `TOON_PRIMITIVE_ARRAY_MIN` | `usize` | `5`     | `PRIMITIVE_ARRAY_MIN`  |
 
 ### Logging
 
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `TOON_LOG_ENABLED` | `bool` | `true` | Enable structured event logging to JSONL files. When `false`, a `NoopSink` is used and no events are written. |
-| `TOON_LOG_DIR` | `string` | `data/logs` | Directory where hive-partitioned JSONL log files are written. **Must be an absolute path** when the server is launched by Claude Desktop. |
-| `TOON_LOG_BUFFER_SIZE` | `usize` | `1000` | Number of events held in memory before the background writer task forces a flush to disk. |
-| `TOON_LOG_FLUSH_INTERVAL_SECS` | `u64` | `300` | Periodic flush interval in seconds. Events older than this will be flushed even if the buffer is not full. |
+| Variable                       | Type     | Default     | Description                                                                                                                               |
+| ------------------------------ | -------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `TOON_LOG_ENABLED`             | `bool`   | `true`      | Enable structured event logging to JSONL files. When `false`, a `NoopSink` is used and no events are written.                             |
+| `TOON_LOG_DIR`                 | `string` | `data/logs` | Directory where hive-partitioned JSONL log files are written. **Must be an absolute path** when the server is launched by Claude Desktop. |
+| `TOON_LOG_BUFFER_SIZE`         | `usize`  | `1000`      | Number of events held in memory before the background writer task forces a flush to disk.                                                 |
+| `TOON_LOG_FLUSH_INTERVAL_SECS` | `u64`    | `300`       | Periodic flush interval in seconds. Events older than this will be flushed even if the buffer is not full.                                |
 
 ### Observability
 
-| Variable | Type | Default | Description |
-|---|---|---|---|
-| `TOON_LOG_LEVEL` | `string` | `info` | Tracing log level for stderr output. Accepted values: `trace`, `debug`, `info`, `warn`, `error`. |
+| Variable           | Type     | Default  | Description                                                                                                                                                                                            |
+| ------------------ | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TOON_LOG_LEVEL`   | `string` | `info`   | Tracing log level for stderr output. Accepted values: `trace`, `debug`, `info`, `warn`, `error`.                                                                                                       |
 | `TOON_CLIENT_HINT` | `string` | _(none)_ | Arbitrary label attached to every `LogEvent`. Use this to distinguish traffic from different MCP clients when multiple clients share the same server (e.g., `"opencode"`, `"claude-desktop"`, `"ci"`). |
 
 ---
@@ -78,8 +78,8 @@ These control the minimum structural requirements for each shape class. Inputs t
 
 `env_bool` accepts the following values case-insensitively:
 
-| Truthy | Falsy |
-|---|---|
+| Truthy             | Falsy              |
+| ------------------ | ------------------ |
 | `true`, `1`, `yes` | `false`, `0`, `no` |
 
 Any other value causes `Config::load()` to log a warning and use the default.
@@ -90,11 +90,11 @@ Any other value causes `Config::load()` to log a warning and use the default.
 
 `env_delimiter` accepts (case-insensitive):
 
-| Value | Delimiter character |
-|---|---|
-| `comma` | `,` |
-| `tab` | `\t` |
-| `pipe` | `\|` |
+| Value   | Delimiter character |
+| ------- | ------------------- |
+| `comma` | `,`                 |
+| `tab`   | `\t`                |
+| `pipe`  | `\|`                |
 
 ---
 
@@ -180,6 +180,24 @@ TOON_LOG_BUFFER_SIZE=5000
 TOON_LOG_FLUSH_INTERVAL_SECS=60
 ```
 
+### Small/shared host resource cap
+
+```bash
+TOON_MAX_INPUT_BYTES=1048576
+TOON_MAX_CONCURRENT_CALLS=2
+TOON_PIPELINE_TIMEOUT_MS=10000
+```
+
+### Larger local workstation
+
+```bash
+TOON_MAX_INPUT_BYTES=10485760
+TOON_MAX_CONCURRENT_CALLS=8
+TOON_PIPELINE_TIMEOUT_MS=30000
+```
+
+Raise `TOON_MAX_CONCURRENT_CALLS` above `8` only after confirming that `server busy` errors are real admission pressure and CPU/RSS have headroom.
+
 ### Claude Desktop absolute paths
 
 ```json
@@ -187,10 +205,7 @@ TOON_LOG_FLUSH_INTERVAL_SECS=60
   "mcpServers": {
     "toon": {
       "command": "/Users/you/projects/toon-mcp/target/release/toon-mcp-server",
-      "env": {
-        "TOON_LOG_DIR": "/Users/you/projects/toon-mcp/data/logs",
-        "TOON_CLIENT_HINT": "claude-desktop"
-      }
+      "env": { "TOON_LOG_DIR": "/Users/you/projects/toon-mcp/data/logs", "TOON_CLIENT_HINT": "claude-desktop" }
     }
   }
 }
@@ -260,28 +275,30 @@ let compress_config = CompressConfig {
 
 The accepted range or value-set for each variable is the **contract**:
 
-| Variable | Accepted values |
-|---|---|
-| `TOON_COMPRESSION_THRESHOLD` | finite `f64` in `[0.0, 1.0]` |
-| `TOON_MIN_BYTES` | non-negative `usize` |
-| `TOON_MAX_INPUT_BYTES` | positive `usize` |
-| `TOON_KEY_FOLDING` | one of `true`, `1`, `yes`, `false`, `0`, `no` (case-insensitive) |
-| `TOON_DELIMITER` | one of `comma`, `tab`, `pipe` |
-| `TOON_TABULAR_MIN_ROWS` | non-negative `usize` |
-| `TOON_FOLD_MIN_DEPTH` | non-negative `usize` |
-| `TOON_PRIMITIVE_ARRAY_MIN` | non-negative `usize` |
-| `TOON_CSV_NUMERIC_COERCION` | one of `true`, `1`, `yes`, `false`, `0`, `no` |
-| `TOON_PIPELINE_TIMEOUT_MS` | positive `u64` |
-| `TOON_MAX_CONCURRENT_CALLS` | positive `usize` |
-| `TOON_LOG_ENABLED` | one of `true`, `1`, `yes`, `false`, `0`, `no` |
-| `TOON_LOG_DIR` | string (absolute path required for Claude Desktop) |
-| `TOON_LOG_BUFFER_SIZE` | positive `usize` |
-| `TOON_LOG_FLUSH_INTERVAL_SECS` | positive `u64` |
-| `TOON_LOG_LEVEL` | one of `trace`, `debug`, `info`, `warn`, `error` |
-| `TOON_CLIENT_HINT` | non-empty string, or unset |
+| Variable                       | Accepted values                                                  |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `TOON_COMPRESSION_THRESHOLD`   | finite `f64` in `[0.0, 1.0]`                                     |
+| `TOON_MIN_BYTES`               | non-negative `usize`; `0` is accepted and disables the gate       |
+| `TOON_MAX_INPUT_BYTES`         | positive `usize`                                                 |
+| `TOON_KEY_FOLDING`             | one of `true`, `1`, `yes`, `false`, `0`, `no` (case-insensitive) |
+| `TOON_DELIMITER`               | one of `comma`, `tab`, `pipe`                                    |
+| `TOON_TABULAR_MIN_ROWS`        | non-negative `usize`                                             |
+| `TOON_FOLD_MIN_DEPTH`          | non-negative `usize`                                             |
+| `TOON_PRIMITIVE_ARRAY_MIN`     | non-negative `usize`                                             |
+| `TOON_CSV_NUMERIC_COERCION`    | one of `true`, `1`, `yes`, `false`, `0`, `no`                    |
+| `TOON_PIPELINE_TIMEOUT_MS`     | positive `u64`                                                   |
+| `TOON_MAX_CONCURRENT_CALLS`    | positive `usize`                                                 |
+| `TOON_LOG_ENABLED`             | one of `true`, `1`, `yes`, `false`, `0`, `no`                    |
+| `TOON_LOG_DIR`                 | string (absolute path required for Claude Desktop)               |
+| `TOON_LOG_BUFFER_SIZE`         | positive `usize`                                                 |
+| `TOON_LOG_FLUSH_INTERVAL_SECS` | positive `u64`                                                   |
+| `TOON_LOG_LEVEL`               | one of `trace`, `debug`, `info`, `warn`, `error`                 |
+| `TOON_CLIENT_HINT`             | non-empty string, or unset                                       |
 
-Values outside the documented range are rejected at startup with a typed
-error. Watch stderr during startup to verify all values loaded correctly:
+Values outside positive/ranged contracts are rejected at startup with a typed
+error. Unparseable boolean, delimiter, integer, and floating-point typos are
+logged as warnings and fall back to defaults. Watch stderr during startup to
+verify all values loaded correctly:
 
 ```
 [INFO] toon_mcp_server::config: loaded config max_output_ratio=0.85 min_bytes=256 ...
@@ -292,4 +309,5 @@ error. Watch stderr during startup to verify all values loaded correctly:
 ## See Also
 
 - `docs/runbook.md` — incident triage for `input_too_large`, `timeout`, and `busy` errors, plus the JSONL log fields used to diagnose them.
+- `docs/production.md` — production readiness, resource sizing, and durability guidance.
 - `README.md` — quick-start environment variable reference.

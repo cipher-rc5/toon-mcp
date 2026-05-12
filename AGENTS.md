@@ -12,15 +12,15 @@
 Load references below using your fetch tool only when the immediate task
 requires them. Do not preload all references on every turn.
 
-| Reference | When to load |
-|-----------|--------------|
-| https://docs.rs/rmcp/latest/rmcp/ | Any work on server.rs, handler.rs, or MCP protocol |
-| https://docs.rs/toon-format/latest/toon_format/ | Any work on detector.rs, classifier.rs, or compressor.rs |
-| https://docs.rs/csv/latest/csv/ | Any work on parser/csv.rs |
-| https://docs.rs/tokio/latest/tokio/ | Any async work, spawn_blocking, mpsc, oneshot |
-| https://docs.rs/criterion/latest/criterion/ | Any work in toon-mcp-bench |
-| https://doc.rust-lang.org/std/ | Standard library questions |
-| https://www.conventionalcommits.org/en/v1.0.0/#specification | Before writing any commit message |
+| Reference                                                    | When to load                                             |
+| ------------------------------------------------------------ | -------------------------------------------------------- |
+| https://docs.rs/rmcp/latest/rmcp/                            | Any work on server.rs, handler.rs, or MCP protocol       |
+| https://docs.rs/toon-format/latest/toon_format/              | Any work on detector.rs, classifier.rs, or compressor.rs |
+| https://docs.rs/csv/latest/csv/                              | Any work on parser/csv.rs                                |
+| https://docs.rs/tokio/latest/tokio/                          | Any async work, spawn_blocking, mpsc, oneshot            |
+| https://docs.rs/criterion/latest/criterion/                  | Any work in toon-mcp-bench                               |
+| https://doc.rust-lang.org/std/                               | Standard library questions                               |
+| https://www.conventionalcommits.org/en/v1.0.0/#specification | Before writing any commit message                        |
 
 ---
 
@@ -134,18 +134,18 @@ chore, revert.
 
 ## What This Codebase Is Not
 
-| Forbidden | Reason |
-|-----------|--------|
-| rayon | Tokio runtime conflict; spawn_blocking is sufficient |
-| async-std or smol | Tokio is the sole async runtime |
-| libsql | Wrong tool; dedicated writer task eliminates Send+Sync problem |
-| Arc<Mutex<File>> in JsonlSink | Replaced by writer task + mpsc channel |
-| Box<dyn Error> in public APIs | Untyped error surface |
-| .unwrap() outside tests/main | Panics on production paths |
-| anyhow in library crates | Leaks opaque errors to callers |
-| Wildcard dependency versions | Reproducibility |
-| Emojis anywhere | Consistency |
-| Direct LLM API calls from server | Server is a tool provider only |
-| System prompt injection per turn | Instructions registered once in ServerInfo |
-| XML, YAML, TOML parsers (v1) | Out of scope; planned for future plugin iteration |
+| Forbidden                                | Reason                                                                                                           |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| rayon                                    | Tokio runtime conflict; spawn_blocking is sufficient                                                             |
+| async-std or smol                        | Tokio is the sole async runtime                                                                                  |
+| libsql                                   | Wrong tool; dedicated writer task eliminates Send+Sync problem                                                   |
+| Arc<Mutex<File>> in JsonlSink            | Replaced by writer task + mpsc channel                                                                           |
+| Box<dyn Error> in public APIs            | Untyped error surface                                                                                            |
+| .unwrap() outside tests/main             | Panics on production paths                                                                                       |
+| anyhow in library crates                 | Leaks opaque errors to callers                                                                                   |
+| Wildcard dependency versions             | Reproducibility                                                                                                  |
+| Emojis anywhere                          | Consistency                                                                                                      |
+| Direct LLM API calls from server         | Server is a tool provider only                                                                                   |
+| System prompt injection per turn         | Instructions registered once in ServerInfo                                                                       |
+| XML, YAML, TOML parsers (v1)             | Out of scope; planned for future plugin iteration                                                                |
 | toon-mcp-bench importing toon-mcp-server | Bench depends on toon-mcp-core (sync benches) or toon-mcp-logging (async benches only); never on toon-mcp-server |

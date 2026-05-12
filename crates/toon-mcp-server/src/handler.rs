@@ -9,10 +9,13 @@ use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
-use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, FormatDetector, InputFormat};
+use toon_mcp_core::{
+    CompressConfig, CompressDecision, Compressor, DetectionMetadata, FormatDetector, InputFormat,
+    parser::csv::CsvParser,
+};
 use toon_mcp_logging::{LogEvent, LogSink};
 
 use crate::config::Config;
@@ -24,6 +27,12 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
 }
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static HANDLER_LOG_RECORD_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static HANDLER_LOG_RECORD_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static REQUEST_SUCCEEDED_COUNT: AtomicU64 = AtomicU64::new(0);
+static REQUEST_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_DURATION_US_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
 /// Avoids OS RNG. The output is a 64-bit xxh3 hash; under the birthday paradox,
@@ -39,6 +48,59 @@ fn new_event_id() -> String {
     buf[..8].copy_from_slice(&seq.to_le_bytes());
     buf[8..].copy_from_slice(&ts.to_le_bytes());
     format!("{:016x}", xxh3_64(&buf))
+}
+
+fn record_success_duration(duration_us: u64) {
+    REQUEST_SUCCEEDED_COUNT.fetch_add(1, Ordering::Relaxed);
+    REQUEST_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
+    let mut current = REQUEST_DURATION_US_MAX.load(Ordering::Relaxed);
+    while duration_us > current {
+        match REQUEST_DURATION_US_MAX.compare_exchange_weak(
+            current,
+            duration_us,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
+    let event_id = event.event_id.clone();
+    let tool_name = event.tool_name.clone();
+    let before = log_sink.diagnostics();
+
+    match log_sink.record(event).await {
+        Ok(()) => {
+            let after = log_sink.diagnostics();
+            let dropped = after
+                .record_dropped_count
+                .saturating_sub(before.record_dropped_count);
+            if dropped > 0 {
+                HANDLER_LOG_RECORD_DROPPED_COUNT.fetch_add(dropped, Ordering::Relaxed);
+                warn!(
+                    component = "handler_logging",
+                    tool_name,
+                    event_id,
+                    dropped,
+                    total_dropped = after.record_dropped_count,
+                    "log event dropped by logging sink"
+                );
+            }
+        }
+        Err(err) => {
+            HANDLER_LOG_RECORD_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                component = "handler_logging",
+                tool_name,
+                event_id,
+                error = %err,
+                "log event failed; preserving successful tool response"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +126,7 @@ where
     tokio::time::timeout(timeout, tokio::task::spawn_blocking(f))
         .await
         .map_err(|_| {
+            PIPELINE_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
             McpError::internal_error(
                 format!(
                     "pipeline_timeout: {op_name} did not complete within \
@@ -120,6 +183,41 @@ struct CompressOutcome {
     output_bytes: usize,
     savings_pct: f64,
     pass_reason_str: Option<String>,
+    detection_metadata: DetectionMetadata,
+    numeric_coercion_used: Option<bool>,
+    lossy_coercion_possible: Option<bool>,
+}
+
+fn detection_candidates_as_strings(metadata: &DetectionMetadata) -> Vec<String> {
+    metadata
+        .candidates
+        .iter()
+        .map(|fmt| fmt.as_str().to_owned())
+        .collect()
+}
+
+fn csv_coercion_visibility(
+    fmt: InputFormat,
+    input: &str,
+    numeric_coercion: bool,
+) -> (Option<bool>, Option<bool>) {
+    let parser = match fmt {
+        InputFormat::Csv => CsvParser::csv(),
+        InputFormat::Tsv => CsvParser::tsv(),
+        _ => return (None, None),
+    }
+    .with_numeric_coercion(numeric_coercion);
+
+    match parser.coercion_metadata(input) {
+        Ok(metadata) => (
+            Some(metadata.numeric_coercion_used),
+            Some(metadata.lossy_coercion_possible),
+        ),
+        Err(err) => {
+            tracing::debug!(%err, "could not compute CSV coercion metadata");
+            (Some(false), Some(false))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +245,17 @@ pub struct DetectResult {
     /// Number of columns in the first header row (populated for CSV/TSV inputs).
     #[schemars(schema_with = "schema_as_integer")]
     pub column_count: Option<usize>,
+    /// Detection confidence: `"certain"` for validated JSON/unknown, or
+    /// `"heuristic"` for JSONL/CSV/TSV probes.
+    pub detection_confidence: String,
+    /// Whether multiple format detectors matched this input.
+    pub detection_ambiguous: bool,
+    /// All matching formats in detection precedence order.
+    pub detection_candidates: Vec<String>,
+    /// Whether CSV/TSV numeric coercion would affect at least one field.
+    pub numeric_coercion_used: Option<bool>,
+    /// Whether CSV/TSV numeric coercion may discard textual intent.
+    pub lossy_coercion_possible: Option<bool>,
 }
 
 /// Handle the `detect_format` MCP tool.
@@ -188,18 +297,29 @@ pub async fn handle_detect_format(
 
     async move {
         let pipeline_timeout_ms = config.pipeline_timeout_ms;
+        let csv_numeric_coercion = config.csv_numeric_coercion;
         let start = Instant::now();
         // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
         // performs a full serde_json::from_str and CSV allocation which must not
         // run on the tokio executor.
-        let (fmt, line_count, column_count) =
+        let (metadata, line_count, column_count, numeric_coercion_used, lossy_coercion_possible) =
             run_pipeline("detection", pipeline_timeout_ms, move || {
-                let fmt = FormatDetector::detect(&input);
+                let metadata = FormatDetector::detect_with_metadata(&input);
+                let fmt = metadata.format;
                 let line_count = FormatDetector::jsonl_line_count(fmt, &input);
                 let column_count = FormatDetector::column_count(fmt, &input);
-                (fmt, line_count, column_count)
+                let (numeric_coercion_used, lossy_coercion_possible) =
+                    csv_coercion_visibility(fmt, &input, csv_numeric_coercion);
+                (
+                    metadata,
+                    line_count,
+                    column_count,
+                    numeric_coercion_used,
+                    lossy_coercion_possible,
+                )
             })
             .await?;
+        let fmt = metadata.format;
 
         let duration_us = start.elapsed().as_micros() as u64;
 
@@ -219,13 +339,19 @@ pub async fn handle_detect_format(
             client_hint: config.client_hint.clone(),
         };
 
-        let _ = log_sink.record(event).await;
+        record_success_duration(duration_us);
+        record_log_event(&log_sink, event).await;
 
         Ok(DetectResult {
             format: fmt.as_str().into(),
             input_bytes,
             line_count,
             column_count,
+            detection_confidence: metadata.confidence.as_str().into(),
+            detection_ambiguous: metadata.ambiguous,
+            detection_candidates: detection_candidates_as_strings(&metadata),
+            numeric_coercion_used,
+            lossy_coercion_possible,
         })
     }
     .instrument(span)
@@ -268,6 +394,16 @@ pub struct CompressResult {
     pub duration_us: u64,
     /// Reason compression was skipped (when `compressed` is false).
     pub pass_reason: Option<String>,
+    /// Detection confidence for the selected input format.
+    pub detection_confidence: String,
+    /// Whether multiple format detectors matched this input.
+    pub detection_ambiguous: bool,
+    /// All matching formats in detection precedence order.
+    pub detection_candidates: Vec<String>,
+    /// Whether CSV/TSV numeric coercion affected at least one parsed field.
+    pub numeric_coercion_used: Option<bool>,
+    /// Whether CSV/TSV numeric coercion may have discarded textual intent.
+    pub lossy_coercion_possible: Option<bool>,
 }
 
 /// Handle the `compress_content` MCP tool.
@@ -312,11 +448,24 @@ pub(crate) async fn handle_compress_content_inner(
         let start = Instant::now();
 
         // L1: Return (input, decision) so input is available for pass-through output.
-        let (input, decision) = run_pipeline("compression", pipeline_timeout_ms, move || {
-            let decision = Compressor::decide(&input, &compress_config);
-            (input, decision)
-        })
-        .await?;
+        let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
+            run_pipeline("compression", pipeline_timeout_ms, move || {
+                let detection_metadata = FormatDetector::detect_with_metadata(&input);
+                let (numeric_coercion_used, lossy_coercion_possible) = csv_coercion_visibility(
+                    detection_metadata.format,
+                    &input,
+                    compress_config.csv_numeric_coercion,
+                );
+                let decision = Compressor::decide(&input, &compress_config);
+                (
+                    input,
+                    decision,
+                    detection_metadata,
+                    numeric_coercion_used,
+                    lossy_coercion_possible,
+                )
+            })
+            .await?;
 
         let duration_us = start.elapsed().as_micros() as u64;
 
@@ -342,6 +491,9 @@ pub(crate) async fn handle_compress_content_inner(
                 output_bytes: toon_bytes,
                 savings_pct,
                 pass_reason_str: None,
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
             },
             CompressDecision::PassedThrough {
                 reason,
@@ -354,8 +506,13 @@ pub(crate) async fn handle_compress_content_inner(
                 output_bytes: input_bytes,
                 savings_pct: 0.0,
                 pass_reason_str: Some(reason.as_str().into()),
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
             },
         };
+
+        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
 
         let event = LogEvent {
             event_id: event_id.clone(),
@@ -373,7 +530,8 @@ pub(crate) async fn handle_compress_content_inner(
             client_hint: config.client_hint.clone(),
         };
 
-        let _ = log_sink.record(event).await;
+        record_success_duration(duration_us);
+        record_log_event(&log_sink, event).await;
 
         Ok(CompressResult {
             output: outcome.output,
@@ -385,6 +543,11 @@ pub(crate) async fn handle_compress_content_inner(
             savings_pct: outcome.savings_pct,
             duration_us,
             pass_reason: outcome.pass_reason_str,
+            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
+            detection_ambiguous: outcome.detection_metadata.ambiguous,
+            detection_candidates,
+            numeric_coercion_used: outcome.numeric_coercion_used,
+            lossy_coercion_possible: outcome.lossy_coercion_possible,
         })
     }
     .instrument(span)
@@ -423,6 +586,16 @@ pub struct StatsResult {
     pub threshold: f64,
     /// Reason compression would be skipped (when `would_compress` is false).
     pub pass_reason: Option<String>,
+    /// Detection confidence for the selected input format.
+    pub detection_confidence: String,
+    /// Whether multiple format detectors matched this input.
+    pub detection_ambiguous: bool,
+    /// All matching formats in detection precedence order.
+    pub detection_candidates: Vec<String>,
+    /// Whether CSV/TSV numeric coercion would affect at least one parsed field.
+    pub numeric_coercion_used: Option<bool>,
+    /// Whether CSV/TSV numeric coercion may discard textual intent.
+    pub lossy_coercion_possible: Option<bool>,
 }
 
 /// Handle the `compression_stats` MCP tool.
@@ -465,10 +638,23 @@ pub async fn handle_compression_stats(
         let pipeline_timeout_ms = config.pipeline_timeout_ms;
         let start = Instant::now();
 
-        let decision = run_pipeline("compression", pipeline_timeout_ms, move || {
-            Compressor::decide(&input, &compress_config)
-        })
-        .await?;
+        let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
+            run_pipeline("compression", pipeline_timeout_ms, move || {
+                let detection_metadata = FormatDetector::detect_with_metadata(&input);
+                let (numeric_coercion_used, lossy_coercion_possible) = csv_coercion_visibility(
+                    detection_metadata.format,
+                    &input,
+                    compress_config.csv_numeric_coercion,
+                );
+                let decision = Compressor::decide(&input, &compress_config);
+                (
+                    decision,
+                    detection_metadata,
+                    numeric_coercion_used,
+                    lossy_coercion_possible,
+                )
+            })
+            .await?;
 
         let duration_us = start.elapsed().as_micros() as u64;
 
@@ -489,6 +675,9 @@ pub async fn handle_compression_stats(
                 output_bytes: *toon_bytes,
                 savings_pct: *savings_pct,
                 pass_reason_str: None,
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
             },
             CompressDecision::PassedThrough {
                 reason,
@@ -501,8 +690,13 @@ pub async fn handle_compression_stats(
                 output_bytes: input_bytes,
                 savings_pct: 0.0,
                 pass_reason_str: Some(reason.as_str().into()),
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
             },
         };
+
+        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
 
         let event = LogEvent {
             event_id: event_id.clone(),
@@ -520,7 +714,8 @@ pub async fn handle_compression_stats(
             client_hint: config.client_hint.clone(),
         };
 
-        let _ = log_sink.record(event).await;
+        record_success_duration(duration_us);
+        record_log_event(&log_sink, event).await;
 
         Ok(StatsResult {
             would_compress: outcome.compressed,
@@ -531,10 +726,135 @@ pub async fn handle_compression_stats(
             estimated_savings_pct: outcome.savings_pct,
             threshold: config.max_output_ratio,
             pass_reason: outcome.pass_reason_str,
+            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
+            detection_ambiguous: outcome.detection_metadata.ambiguous,
+            detection_candidates,
+            numeric_coercion_used: outcome.numeric_coercion_used,
+            lossy_coercion_possible: outcome.lossy_coercion_possible,
         })
     }
     .instrument(span)
     .await
+}
+
+// ---------------------------------------------------------------------------
+// toon_diagnostics
+// ---------------------------------------------------------------------------
+
+/// Input parameters for `toon_diagnostics`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiagnosticsParams {}
+
+/// Logging diagnostics returned by `toon_diagnostics`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LoggingDiagnosticsResult {
+    /// Number of events dropped because the bounded writer queue was full.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub record_dropped_count: u64,
+    /// Number of record attempts that failed because the writer channel closed.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub record_failed_count: u64,
+    /// Number of events skipped because JSON serialization failed.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub serialization_failed_count: u64,
+    /// Number of writer flush attempts that failed after accepting events.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub writer_failed_count: u64,
+    /// Last writer, queue, or channel error observed by the sink.
+    pub last_error: Option<String>,
+    /// Total bounded queue capacity, if applicable.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub queue_capacity: Option<usize>,
+    /// Currently queued commands, if applicable.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub queue_queued: Option<usize>,
+    /// Currently available queue slots, if applicable.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub queue_available: Option<usize>,
+}
+
+/// Handler-level diagnostics returned by `toon_diagnostics`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct HandlerDiagnosticsResult {
+    /// Number of logging record failures observed and downgraded by handlers.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub log_record_failed_count: u64,
+    /// Number of logging drops observed and downgraded by handlers.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub log_record_dropped_count: u64,
+    /// Number of pipeline timeout responses returned by handlers.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub pipeline_timeout_count: u64,
+    /// Number of successful tool requests included in duration gauges.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub request_succeeded_count: u64,
+    /// Sum of successful request durations in microseconds.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub request_duration_us_total: u64,
+    /// Maximum successful request duration in microseconds.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub request_duration_us_max: u64,
+    /// Average successful request duration in microseconds.
+    pub request_duration_us_avg: f64,
+}
+
+/// Output from `toon_diagnostics`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DiagnosticsResult {
+    /// Whether structured logging is configured as enabled.
+    pub logging_enabled: bool,
+    /// Runtime logging sink diagnostics.
+    pub logging: LoggingDiagnosticsResult,
+    /// Handler-level counters and request-duration gauges.
+    pub handler: HandlerDiagnosticsResult,
+    /// Current available concurrency permits.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub semaphore_available_permits: usize,
+    /// Configured maximum concurrent calls.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub max_concurrent_calls: usize,
+}
+
+/// Handle the `toon_diagnostics` MCP tool.
+pub async fn handle_toon_diagnostics(
+    _params: DiagnosticsParams,
+    config: Arc<Config>,
+    log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
+) -> Result<DiagnosticsResult, McpError> {
+    let log = log_sink.diagnostics();
+    let succeeded = REQUEST_SUCCEEDED_COUNT.load(Ordering::Relaxed);
+    let duration_total = REQUEST_DURATION_US_TOTAL.load(Ordering::Relaxed);
+    let duration_avg = if succeeded == 0 {
+        0.0
+    } else {
+        duration_total as f64 / succeeded as f64
+    };
+
+    Ok(DiagnosticsResult {
+        logging_enabled: config.logging_enabled,
+        logging: LoggingDiagnosticsResult {
+            record_dropped_count: log.record_dropped_count,
+            record_failed_count: log.record_failed_count,
+            serialization_failed_count: log.serialization_failed_count,
+            writer_failed_count: log.writer_failed_count,
+            last_error: log.last_error,
+            queue_capacity: log.queue_capacity,
+            queue_queued: log.queue_queued,
+            queue_available: log.queue_available,
+        },
+        handler: HandlerDiagnosticsResult {
+            log_record_failed_count: HANDLER_LOG_RECORD_FAILED_COUNT.load(Ordering::Relaxed),
+            log_record_dropped_count: HANDLER_LOG_RECORD_DROPPED_COUNT.load(Ordering::Relaxed),
+            pipeline_timeout_count: PIPELINE_TIMEOUT_COUNT.load(Ordering::Relaxed),
+            request_succeeded_count: succeeded,
+            request_duration_us_total: duration_total,
+            request_duration_us_max: REQUEST_DURATION_US_MAX.load(Ordering::Relaxed),
+            request_duration_us_avg: duration_avg,
+        },
+        semaphore_available_permits: semaphore.available_permits(),
+        max_concurrent_calls: config.max_concurrent_calls,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +864,7 @@ pub async fn handle_compression_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toon_mcp_logging::{MemorySink, NoopSink};
+    use toon_mcp_logging::{JsonlSink, JsonlSinkConfig, MemorySink, NoopSink};
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
@@ -563,6 +883,7 @@ mod tests {
             client_hint: None,
             pipeline_timeout_ms: 30_000,
             max_concurrent_calls: 8,
+            strict_config: false,
         })
     }
 
@@ -572,6 +893,15 @@ mod tests {
 
     fn test_semaphore(config: &Config) -> Arc<Semaphore> {
         Arc::new(Semaphore::new(config.max_concurrent_calls))
+    }
+
+    fn schema_has_property<T: JsonSchema>(property: &str) -> bool {
+        let schema = schemars::schema_for!(T);
+        let value = serde_json::to_value(schema).expect("schema must serialize to JSON");
+        value
+            .get("properties")
+            .and_then(|properties| properties.get(property))
+            .is_some()
     }
 
     // --- detect_format ---
@@ -594,6 +924,11 @@ mod tests {
         assert_eq!(result.input_bytes, 15);
         assert!(result.line_count.is_none());
         assert!(result.column_count.is_none());
+        assert_eq!(result.detection_confidence, "certain");
+        assert!(!result.detection_ambiguous);
+        assert_eq!(result.detection_candidates, vec!["json".to_owned()]);
+        assert_eq!(result.numeric_coercion_used, None);
+        assert_eq!(result.lossy_coercion_possible, None);
     }
 
     #[tokio::test]
@@ -632,6 +967,29 @@ mod tests {
         assert_eq!(result.format, "csv");
         assert_eq!(result.column_count, Some(3));
         assert!(result.line_count.is_none());
+        assert_eq!(result.detection_confidence, "heuristic");
+        assert_eq!(result.detection_candidates, vec!["csv".to_owned()]);
+        assert_eq!(result.numeric_coercion_used, Some(true));
+        assert_eq!(result.lossy_coercion_possible, Some(false));
+    }
+
+    #[tokio::test]
+    async fn detect_format_csv_flags_lossy_numeric_coercion() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let result = handle_detect_format(
+            DetectParams {
+                input: "zip,count\n00123,1.0".into(),
+            },
+            cfg,
+            noop_sink(),
+            sem,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.format, "csv");
+        assert_eq!(result.numeric_coercion_used, Some(true));
+        assert_eq!(result.lossy_coercion_possible, Some(true));
     }
 
     #[tokio::test]
@@ -685,6 +1043,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.compressed || result.output_bytes <= result.input_bytes);
+        assert!(!result.detection_confidence.is_empty());
     }
 
     #[tokio::test]
@@ -704,6 +1063,7 @@ mod tests {
         .unwrap();
         assert!(!result.compressed);
         assert_eq!(result.output, input);
+        assert_eq!(result.numeric_coercion_used, None);
     }
 
     #[tokio::test]
@@ -735,6 +1095,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.threshold, cfg.max_output_ratio);
+        assert!(!result.detection_confidence.is_empty());
     }
 
     #[tokio::test]
@@ -811,6 +1172,77 @@ mod tests {
         let events = events.lock().expect("not poisoned");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "compression_stats");
+    }
+
+    #[tokio::test]
+    async fn handler_preserves_success_when_logging_channel_closed() {
+        let dir = std::env::temp_dir().join(format!("toon-mcp-server-test-{}", new_event_id()));
+        let config = JsonlSinkConfig {
+            log_dir: dir.clone(),
+            buffer_size: 4,
+            flush_interval: Duration::from_secs(3600),
+        };
+        let (jsonl_sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        drop(task);
+        let sink: Arc<dyn LogSink> = Arc::new(jsonl_sink);
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+
+        let result = handle_detect_format(
+            DetectParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            Arc::clone(&sink),
+            sem,
+        )
+        .await
+        .expect("tool call succeeds despite logging failure");
+
+        assert_eq!(result.format, "json");
+        let diagnostics =
+            handle_toon_diagnostics(DiagnosticsParams {}, cfg, sink, Arc::new(Semaphore::new(1)))
+                .await
+                .expect("diagnostics succeeds");
+        assert_eq!(diagnostics.logging.record_failed_count, 1);
+        assert!(diagnostics.handler.log_record_failed_count >= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_request_durations() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let before = handle_toon_diagnostics(
+            DiagnosticsParams {},
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("diagnostics succeeds");
+
+        handle_detect_format(
+            DetectParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("tool call succeeds");
+
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), sem)
+            .await
+            .expect("diagnostics succeeds");
+        assert!(
+            after.handler.request_succeeded_count > before.handler.request_succeeded_count,
+            "request counter increments"
+        );
+        assert!(
+            after.handler.request_duration_us_total >= before.handler.request_duration_us_total
+        );
     }
 
     // --- memory sink ---
@@ -932,5 +1364,29 @@ mod tests {
     fn new_event_id_is_hex() {
         let id = new_event_id();
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn result_schemas_include_semantics_metadata() {
+        for property in [
+            "detection_confidence",
+            "detection_ambiguous",
+            "detection_candidates",
+            "numeric_coercion_used",
+            "lossy_coercion_possible",
+        ] {
+            assert!(
+                schema_has_property::<DetectResult>(property),
+                "DetectResult schema missing {property}"
+            );
+            assert!(
+                schema_has_property::<CompressResult>(property),
+                "CompressResult schema missing {property}"
+            );
+            assert!(
+                schema_has_property::<StatsResult>(property),
+                "StatsResult schema missing {property}"
+            );
+        }
     }
 }

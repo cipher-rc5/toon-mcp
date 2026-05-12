@@ -1,1 +1,9 @@
-{"group_id":"pipeline","function_id":"pipeline_jsonl_uniform","value_str":null,"throughput":{"Bytes":31310},"full_id":"pipeline/pipeline_jsonl_uniform","directory_name":"pipeline/pipeline_jsonl_uniform","title":"pipeline/pipeline_jsonl_uniform"}
+{
+  "group_id": "pipeline",
+  "function_id": "pipeline_jsonl_uniform",
+  "value_str": null,
+  "throughput": { "Bytes": 31310 },
+  "full_id": "pipeline/pipeline_jsonl_uniform",
+  "directory_name": "pipeline/pipeline_jsonl_uniform",
+  "title": "pipeline/pipeline_jsonl_uniform"
+}

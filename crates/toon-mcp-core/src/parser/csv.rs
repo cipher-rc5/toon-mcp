@@ -5,6 +5,16 @@
 use crate::{error::CoreError, parser::Parser};
 use serde_json::{Map, Number, Value};
 
+/// Metadata describing CSV/TSV numeric coercion for a specific parse request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsvCoercionMetadata {
+    /// Whether numeric-looking fields were eligible for coercion.
+    pub numeric_coercion_used: bool,
+    /// Whether at least one coerced field has syntax that may lose caller
+    /// intent when represented as a JSON number, such as leading zeroes.
+    pub lossy_coercion_possible: bool,
+}
+
 /// Parses CSV or TSV input into a `Value::Array` of uniform `Value::Object` rows.
 ///
 /// The first record is treated as a header row. Each subsequent record becomes
@@ -73,6 +83,63 @@ impl CsvParser {
         self.numeric_coercion = enabled;
         self
     }
+
+    /// Inspect input for numeric-coercion visibility without producing values.
+    ///
+    /// `numeric_coercion_used` is true only when coercion is enabled and at
+    /// least one data field can be represented as a finite JSON number.
+    /// `lossy_coercion_possible` flags number-like fields whose textual form
+    /// carries information JSON numbers do not preserve exactly, including
+    /// leading zeroes, explicit plus signs, exponent notation, and decimal
+    /// spellings of whole numbers.
+    pub fn coercion_metadata(&self, input: &str) -> Result<CsvCoercionMetadata, CoreError> {
+        let mut rdr = csv::ReaderBuilder::new()
+            .delimiter(self.delimiter)
+            .from_reader(input.as_bytes());
+
+        let _headers = rdr.headers()?;
+        let mut numeric_coercion_used = false;
+        let mut lossy_coercion_possible = false;
+
+        if !self.numeric_coercion {
+            return Ok(CsvCoercionMetadata {
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            });
+        }
+
+        for result in rdr.records() {
+            let record = result?;
+            for field in &record {
+                if let Ok(n) = field.parse::<f64>()
+                    && Number::from_f64(n).is_some()
+                {
+                    numeric_coercion_used = true;
+                    lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
+                }
+            }
+        }
+
+        Ok(CsvCoercionMetadata {
+            numeric_coercion_used,
+            lossy_coercion_possible,
+        })
+    }
+}
+
+fn numeric_text_may_be_lossy(field: &str, parsed: f64) -> bool {
+    let trimmed = field.trim();
+    if trimmed.starts_with('+') || trimmed.contains(['e', 'E']) {
+        return true;
+    }
+
+    let unsigned = trimmed.strip_prefix('-').unwrap_or(trimmed);
+    let integer_part = unsigned.split_once('.').map_or(unsigned, |(left, _)| left);
+    if integer_part.len() > 1 && integer_part.starts_with('0') {
+        return true;
+    }
+
+    trimmed.contains('.') && parsed.fract() == 0.0
 }
 
 impl Parser for CsvParser {
@@ -204,6 +271,34 @@ mod tests {
             .unwrap();
         assert!(v[0]["id"].is_string());
         assert!(v[0]["x"].is_string());
+    }
+
+    #[test]
+    fn coercion_metadata_reports_numeric_fields() {
+        let meta = CsvParser::csv()
+            .coercion_metadata("id,name\n1,Alice")
+            .unwrap();
+        assert!(meta.numeric_coercion_used);
+        assert!(!meta.lossy_coercion_possible);
+    }
+
+    #[test]
+    fn coercion_metadata_flags_lossy_spellings() {
+        let meta = CsvParser::csv()
+            .coercion_metadata("zip,count\n00123,1.0")
+            .unwrap();
+        assert!(meta.numeric_coercion_used);
+        assert!(meta.lossy_coercion_possible);
+    }
+
+    #[test]
+    fn disabled_coercion_metadata_reports_no_coercion() {
+        let meta = CsvParser::csv()
+            .with_numeric_coercion(false)
+            .coercion_metadata("id\n1")
+            .unwrap();
+        assert!(!meta.numeric_coercion_used);
+        assert!(!meta.lossy_coercion_possible);
     }
 
     #[test]

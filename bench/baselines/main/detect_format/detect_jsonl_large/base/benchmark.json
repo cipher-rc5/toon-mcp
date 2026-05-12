@@ -1,1 +1,9 @@
-{"group_id":"detect_format","function_id":"detect_jsonl_large","value_str":null,"throughput":{"Bytes":31310},"full_id":"detect_format/detect_jsonl_large","directory_name":"detect_format/detect_jsonl_large","title":"detect_format/detect_jsonl_large"}
+{
+  "group_id": "detect_format",
+  "function_id": "detect_jsonl_large",
+  "value_str": null,
+  "throughput": { "Bytes": 31310 },
+  "full_id": "detect_format/detect_jsonl_large",
+  "directory_name": "detect_format/detect_jsonl_large",
+  "title": "detect_format/detect_jsonl_large"
+}

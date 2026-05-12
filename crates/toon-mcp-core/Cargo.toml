@@ -1,20 +1,20 @@
 [package]
-name        = "toon-mcp-core"
-version.workspace     = true
-edition.workspace     = true
-license.workspace     = true
-repository.workspace  = true
-authors.workspace     = true
+name = "toon-mcp-core"
+version.workspace = true
+authors.workspace = true
+categories = ["encoding", "parsing"]
+edition.workspace = true
+keywords = ["toon", "mcp", "compression", "json", "llm"]
+license.workspace = true
+repository.workspace = true
 description = "Pure detection, parsing, classification, and compression pipeline for toon-mcp"
-keywords    = ["toon", "mcp", "compression", "json", "llm"]
-categories  = ["encoding", "parsing"]
 
 [dependencies]
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 toon-format.workspace = true
-serde_json.workspace  = true
-serde.workspace       = true
-csv.workspace         = true
-thiserror.workspace   = true
 
 [dev-dependencies]
 proptest.workspace = true

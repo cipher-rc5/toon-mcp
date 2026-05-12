@@ -1,1 +1,9 @@
-{"group_id":"pipeline","function_id":"pipeline_json_tabular","value_str":null,"throughput":{"Bytes":73975},"full_id":"pipeline/pipeline_json_tabular","directory_name":"pipeline/pipeline_json_tabular","title":"pipeline/pipeline_json_tabular"}
+{
+  "group_id": "pipeline",
+  "function_id": "pipeline_json_tabular",
+  "value_str": null,
+  "throughput": { "Bytes": 73975 },
+  "full_id": "pipeline/pipeline_json_tabular",
+  "directory_name": "pipeline/pipeline_json_tabular",
+  "title": "pipeline/pipeline_json_tabular"
+}

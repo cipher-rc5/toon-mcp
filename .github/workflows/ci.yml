@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,19 +21,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install toolchain (pinned via rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
 
       # M8: Install cargo-llvm-cov for coverage measurement.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ec1b8a233a7ecec171cd56557f7640e9ae9b24c6  # cargo-llvm-cov
+        uses: taiki-e/install-action@ec1b8a233a7ecec171cd56557f7640e9ae9b24c6 # cargo-llvm-cov
 
       - name: Cache Cargo registry and build artefacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -63,7 +66,7 @@ jobs:
             --fail-under-lines 75
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lcov-report
           path: lcov.info
@@ -81,30 +84,99 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install toolchain (pinned via rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8  # v2
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
         with:
           tool: cargo-audit
 
       - name: cargo audit (deny warnings)
         run: cargo audit --deny warnings
 
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-1.0, AGPL-3.0
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses sources
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly toolchain for cargo-fuzz
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run bounded fuzz smoke targets
+        working-directory: fuzz
+        run: |
+          mkdir -p artifacts
+          for target in detect_and_parse json_parse jsonl_parse csv_parse; do
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time=30 \
+              -rss_limit_mb=512 \
+              -artifact_prefix="artifacts/$target-"
+          done
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   semver-checks:
     name: cargo-semver-checks (library crates)
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Install toolchain (pinned via rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Detect changes to library crates
         id: changes
@@ -127,7 +199,7 @@ jobs:
 
       - name: Install cargo-semver-checks
         if: steps.changes.outputs.run == 'true'
-        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8  # v2
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
         with:
           tool: cargo-semver-checks
 
