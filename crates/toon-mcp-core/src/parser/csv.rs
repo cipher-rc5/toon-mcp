@@ -83,6 +83,16 @@ impl Parser for CsvParser {
 
         let headers: Vec<String> = rdr.headers()?.iter().map(|h| h.to_owned()).collect();
 
+        // Reject duplicate headers up-front: `serde_json::Map` would otherwise
+        // collapse duplicate columns into a single key, silently dropping data.
+        // O(headers) — runs once before the row loop, not per-row.
+        let mut seen = std::collections::HashSet::with_capacity(headers.len());
+        for h in &headers {
+            if !seen.insert(h.as_str()) {
+                return Err(CoreError::DuplicateHeader { header: h.clone() });
+            }
+        }
+
         let mut rows: Vec<Value> = Vec::new();
 
         for result in rdr.records() {
@@ -194,6 +204,41 @@ mod tests {
             .unwrap();
         assert!(v[0]["id"].is_string());
         assert!(v[0]["x"].is_string());
+    }
+
+    #[test]
+    fn duplicate_csv_headers_are_rejected() {
+        // The `id` header appears twice; the parser must reject the input
+        // rather than silently collapse both columns into a single map key.
+        let input = "id,name,id\n1,Alice,2";
+        let err = CsvParser::csv().parse(input).expect_err("must reject");
+        match err {
+            CoreError::DuplicateHeader { header } => assert_eq!(header, "id"),
+            other => panic!("expected DuplicateHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_tsv_headers_are_rejected() {
+        // Same shape as the CSV case but with a tab delimiter; the TSV parser
+        // must also surface the duplicate-header error.
+        let input = "id\tname\tid\n1\tAlice\t2";
+        let err = CsvParser::tsv().parse(input).expect_err("must reject");
+        match err {
+            CoreError::DuplicateHeader { header } => assert_eq!(header, "id"),
+            other => panic!("expected DuplicateHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_sensitive_headers_are_distinct() {
+        // Header names differ only by case; they are distinct keys in
+        // `serde_json::Map` (case-sensitive) and must both survive parsing.
+        let input = "id,ID\n1,2";
+        let v = CsvParser::csv().parse(input).expect("parse");
+        let obj = v[0].as_object().expect("row is object");
+        assert!(obj.contains_key("id"));
+        assert!(obj.contains_key("ID"));
     }
 
     #[test]

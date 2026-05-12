@@ -132,6 +132,40 @@ fn json_just_above_limit_rejects() {
 }
 
 #[test]
+fn jsonl_just_below_limit_proceeds() {
+    let input = build_jsonl_of_exact_size(LIMIT - 1);
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "JSONL input under limit must not trigger InputExceedsLimit"
+    );
+}
+
+#[test]
+fn jsonl_at_limit_proceeds() {
+    let input = build_jsonl_of_exact_size(LIMIT);
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "JSONL input exactly at limit (>=) must NOT trigger InputExceedsLimit (compressor uses strict >)"
+    );
+}
+
+#[test]
 fn jsonl_just_above_limit_rejects() {
     let input = build_jsonl_of_exact_size(LIMIT + 1);
     let config = limit_config(LIMIT);
@@ -145,6 +179,40 @@ fn jsonl_just_above_limit_rejects() {
 }
 
 #[test]
+fn csv_just_below_limit_proceeds() {
+    let input = build_csv_of_exact_size(LIMIT - 1, ',');
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "CSV input under limit must not trigger InputExceedsLimit"
+    );
+}
+
+#[test]
+fn csv_at_limit_proceeds() {
+    let input = build_csv_of_exact_size(LIMIT, ',');
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "CSV input exactly at limit (>=) must NOT trigger InputExceedsLimit (compressor uses strict >)"
+    );
+}
+
+#[test]
 fn csv_just_above_limit_rejects() {
     let input = build_csv_of_exact_size(LIMIT + 1, ',');
     let config = limit_config(LIMIT);
@@ -155,6 +223,40 @@ fn csv_just_above_limit_rejects() {
             ..
         }
     ));
+}
+
+#[test]
+fn tsv_just_below_limit_proceeds() {
+    let input = build_csv_of_exact_size(LIMIT - 1, '\t');
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "TSV input under limit must not trigger InputExceedsLimit"
+    );
+}
+
+#[test]
+fn tsv_at_limit_proceeds() {
+    let input = build_csv_of_exact_size(LIMIT, '\t');
+    let config = limit_config(LIMIT);
+    let decision = Compressor::decide(&input, &config);
+    assert!(
+        !matches!(
+            decision,
+            CompressDecision::PassedThrough {
+                reason: PassThroughReason::InputExceedsLimit { .. },
+                ..
+            }
+        ),
+        "TSV input exactly at limit (>=) must NOT trigger InputExceedsLimit (compressor uses strict >)"
+    );
 }
 
 #[test]

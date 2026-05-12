@@ -123,6 +123,24 @@ LIMIT 20;
 
 Restart after changes.
 
+### Note: pipeline timeout does not cancel in-flight work
+
+`TOON_PIPELINE_TIMEOUT_MS` causes the *handler* to return an error to
+the client when the deadline elapses, but the underlying
+`spawn_blocking` task continues to run to completion on the blocking
+thread pool. Under a sustained stream of expensive inputs, blocking
+threads can remain occupied even as clients see `pipeline_timeout`
+errors — eventually saturating `tokio`'s default blocking pool
+(~512 threads). Symptoms: high RSS without proportional handler
+throughput; long tail of `duration_us` values in the JSONL log even
+for requests that returned timeout errors.
+
+**Mitigation:** lower `TOON_MAX_INPUT_BYTES` to bound the per-call CPU
+budget, and tune `TOON_MAX_CONCURRENT_CALLS` so the semaphore (which
+*does* gate admission) is the real backpressure mechanism. A future
+enhancement could integrate cooperative cancellation into the
+compressor pipeline; this is not implemented today.
+
 ---
 
 ## 3. Log Directory Permission / Disk Issues

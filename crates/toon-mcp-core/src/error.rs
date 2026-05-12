@@ -6,6 +6,7 @@ use thiserror::Error;
 
 /// Errors that can occur in the core detection, parsing, and compression pipeline.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     /// A line in a JSONL input failed to parse as valid JSON.
     #[error("JSONL parse failed at line {line}: {detail}")]
@@ -29,4 +30,14 @@ pub enum CoreError {
     /// The TOON encoder returned an error.
     #[error("TOON encode error: {0}")]
     ToonError(String),
+
+    /// A CSV or TSV input has duplicate header names. Returned by
+    /// `CsvParser::parse` to prevent silent data loss when rows are
+    /// normalised to `serde_json::Map` (which would collapse the duplicates
+    /// into one key).
+    #[error("CSV/TSV parse failed: duplicate header {header:?} appears more than once")]
+    DuplicateHeader {
+        /// The duplicated header name (first occurrence preserved here).
+        header: String,
+    },
 }

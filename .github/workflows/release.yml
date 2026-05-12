@@ -90,9 +90,14 @@ jobs:
           path: toon-mcp-server-${{ matrix.target }}
 
   build-macos:
-    name: Build (aarch64-apple-darwin)
+    name: Build (${{ matrix.target }})
     needs: [verify]
     runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -101,7 +106,7 @@ jobs:
       - name: Install toolchain (pinned via rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Verify toolchain matches rust-toolchain.toml
         run: |
@@ -113,18 +118,18 @@ jobs:
           fi
 
       - name: Build release binary
-        run: cargo build --release --package toon-mcp-server --target aarch64-apple-darwin
+        run: cargo build --release --package toon-mcp-server --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
-          cp target/aarch64-apple-darwin/release/toon-mcp-server \
-             toon-mcp-server-aarch64-apple-darwin
+          cp target/${{ matrix.target }}/release/toon-mcp-server \
+             toon-mcp-server-${{ matrix.target }}
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: toon-mcp-server-aarch64-apple-darwin
-          path: toon-mcp-server-aarch64-apple-darwin
+          name: toon-mcp-server-${{ matrix.target }}
+          path: toon-mcp-server-${{ matrix.target }}
 
   publish-release:
     name: Publish GitHub Release
@@ -156,5 +161,6 @@ jobs:
             --generate-notes \
             artifacts/toon-mcp-server-x86_64-unknown-linux-gnu \
             artifacts/toon-mcp-server-aarch64-unknown-linux-gnu \
+            artifacts/toon-mcp-server-x86_64-apple-darwin \
             artifacts/toon-mcp-server-aarch64-apple-darwin \
             artifacts/checksums.sha256

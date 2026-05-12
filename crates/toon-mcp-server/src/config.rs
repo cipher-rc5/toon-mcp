@@ -8,6 +8,8 @@ use toon_format::Delimiter;
 use toon_mcp_core::DEFAULT_MAX_INPUT_BYTES;
 use toon_mcp_logging::JsonlSinkConfig;
 
+use crate::error::ServerError;
+
 /// Top-level configuration for the toon-mcp-server binary.
 ///
 /// All values are loaded once in `main` from environment variables.
@@ -109,11 +111,16 @@ impl Config {
     /// Load configuration from environment variables, falling back to defaults.
     ///
     /// `dotenvy::dotenv().ok()` should be called before this function.
-    /// Invalid values emit a `tracing::warn!` and fall back to the default.
-    pub fn load() -> Self {
-        let max_output_ratio = env_f64("TOON_COMPRESSION_THRESHOLD", 0.85);
+    ///
+    /// Returns `Err(ServerError::InvalidConfig { .. })` when an env var is set
+    /// to a value that violates a documented constraint (e.g. zero for a
+    /// positive-integer variable, or a compression threshold outside
+    /// `[0.0, 1.0]`). Unparseable values (typos) are logged at `warn` and fall
+    /// back to the default — only deliberately out-of-range values are rejected.
+    pub fn load() -> Result<Self, ServerError> {
+        let max_output_ratio = env_f64_in_range("TOON_COMPRESSION_THRESHOLD", 0.85, 0.0, 1.0)?;
         let min_bytes = env_usize("TOON_MIN_BYTES", 256);
-        let max_input_bytes = env_usize("TOON_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES);
+        let max_input_bytes = env_usize_positive("TOON_MAX_INPUT_BYTES", DEFAULT_MAX_INPUT_BYTES)?;
         let key_folding = env_bool("TOON_KEY_FOLDING", true);
         let delimiter = env_delimiter("TOON_DELIMITER", Delimiter::Comma);
         let tabular_min_rows = env_usize("TOON_TABULAR_MIN_ROWS", 3);
@@ -122,24 +129,16 @@ impl Config {
         let csv_numeric_coercion = env_bool("TOON_CSV_NUMERIC_COERCION", true);
         let logging_enabled = env_bool("TOON_LOG_ENABLED", true);
         let log_level = std::env::var("TOON_LOG_LEVEL").unwrap_or_else(|_| "info".into());
-        let pipeline_timeout_ms = env_u64("TOON_PIPELINE_TIMEOUT_MS", 30_000);
-        let max_concurrent_calls = env_usize("TOON_MAX_CONCURRENT_CALLS", 8);
+        let pipeline_timeout_ms = env_u64_positive("TOON_PIPELINE_TIMEOUT_MS", 30_000)?;
+        let max_concurrent_calls = env_usize_positive("TOON_MAX_CONCURRENT_CALLS", 8)?;
         let client_hint = std::env::var("TOON_CLIENT_HINT")
             .ok()
             .filter(|s| !s.is_empty());
 
-        let flush_interval_secs = env_u64("TOON_LOG_FLUSH_INTERVAL_SECS", 300);
-        let buffer_size = env_usize("TOON_LOG_BUFFER_SIZE", 1000);
+        let flush_interval_secs = env_u64_positive("TOON_LOG_FLUSH_INTERVAL_SECS", 300)?;
+        let buffer_size = env_usize_positive("TOON_LOG_BUFFER_SIZE", 1000)?;
         let log_dir = std::env::var("TOON_LOG_DIR").unwrap_or_else(|_| "data/logs".into());
 
-        // Validate threshold range.
-        if !(0.0..=1.0).contains(&max_output_ratio) {
-            tracing::warn!(
-                value = max_output_ratio,
-                "TOON_COMPRESSION_THRESHOLD is outside [0.0, 1.0]; using {max_output_ratio} but \
-                 compression behaviour may be unexpected"
-            );
-        }
         if min_bytes == 0 {
             tracing::warn!(
                 "TOON_MIN_BYTES=0 disables the minimum-bytes gate; \
@@ -160,7 +159,7 @@ impl Config {
             );
         }
 
-        Self {
+        Ok(Self {
             max_output_ratio,
             min_bytes,
             max_input_bytes,
@@ -180,16 +179,31 @@ impl Config {
             client_hint,
             pipeline_timeout_ms,
             max_concurrent_calls,
-        }
+        })
     }
 }
 
 // --- env helpers ---
 
-fn env_f64(key: &str, default: f64) -> f64 {
+fn env_f64_in_range(
+    key: &'static str,
+    default: f64,
+    min: f64,
+    max: f64,
+) -> Result<f64, ServerError> {
     match std::env::var(key) {
         Ok(val) => match val.parse::<f64>() {
-            Ok(v) => v,
+            Ok(v) => {
+                if (min..=max).contains(&v) {
+                    Ok(v)
+                } else {
+                    Err(ServerError::InvalidConfig {
+                        var: key,
+                        value: val,
+                        reason: "value must be within [0.0, 1.0] inclusive",
+                    })
+                }
+            }
             Err(_) => {
                 tracing::warn!(
                     key,
@@ -197,10 +211,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
                     default,
                     "invalid f64 value for {key}; using default {default}"
                 );
-                default
+                Ok(default)
             }
         },
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
@@ -222,10 +236,38 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
+fn env_usize_positive(key: &'static str, default: usize) -> Result<usize, ServerError> {
+    match std::env::var(key) {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(0) => Err(ServerError::InvalidConfig {
+                var: key,
+                value: val,
+                reason: "value must be >= 1",
+            }),
+            Ok(v) => Ok(v),
+            Err(_) => {
+                tracing::warn!(
+                    key,
+                    raw = %val,
+                    default,
+                    "invalid usize value for {key}; using default {default}"
+                );
+                Ok(default)
+            }
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u64_positive(key: &'static str, default: u64) -> Result<u64, ServerError> {
     match std::env::var(key) {
         Ok(val) => match val.parse::<u64>() {
-            Ok(v) => v,
+            Ok(0) => Err(ServerError::InvalidConfig {
+                var: key,
+                value: val,
+                reason: "value must be >= 1",
+            }),
+            Ok(v) => Ok(v),
             Err(_) => {
                 tracing::warn!(
                     key,
@@ -233,10 +275,10 @@ fn env_u64(key: &str, default: u64) -> u64 {
                     default,
                     "invalid u64 value for {key}; using default {default}"
                 );
-                default
+                Ok(default)
             }
         },
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
@@ -310,7 +352,7 @@ mod tests {
                 ("TOON_MAX_CONCURRENT_CALLS", None::<&str>),
             ],
             || {
-                let config = Config::load();
+                let config = Config::load().expect("defaults must load successfully");
                 assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
                 assert_eq!(config.min_bytes, 256);
                 assert_eq!(config.max_input_bytes, DEFAULT_MAX_INPUT_BYTES);
@@ -330,7 +372,7 @@ mod tests {
     #[test]
     fn threshold_override() {
         with_env("TOON_COMPRESSION_THRESHOLD", "0.7", || {
-            let config = Config::load();
+            let config = Config::load().expect("0.7 is a valid threshold");
             assert!((config.max_output_ratio - 0.7).abs() < f64::EPSILON);
         });
     }
@@ -338,7 +380,7 @@ mod tests {
     #[test]
     fn invalid_f64_falls_back_to_default() {
         with_env("TOON_COMPRESSION_THRESHOLD", "not_a_number", || {
-            let config = Config::load();
+            let config = Config::load().expect("unparseable falls back to default");
             assert!((config.max_output_ratio - 0.85).abs() < f64::EPSILON);
         });
     }
@@ -346,7 +388,7 @@ mod tests {
     #[test]
     fn invalid_usize_falls_back_to_default() {
         with_env("TOON_MIN_BYTES", "abc", || {
-            let config = Config::load();
+            let config = Config::load().expect("unparseable usize falls back to default");
             assert_eq!(config.min_bytes, 256);
         });
     }
@@ -355,7 +397,10 @@ mod tests {
     fn bool_truthy_values() {
         for val in ["true", "1", "yes"] {
             with_env("TOON_LOG_ENABLED", val, || {
-                assert!(Config::load().logging_enabled, "expected true for {val}");
+                assert!(
+                    Config::load().expect("valid bool").logging_enabled,
+                    "expected true for {val}"
+                );
             });
         }
     }
@@ -364,7 +409,10 @@ mod tests {
     fn bool_falsy_values() {
         for val in ["false", "0", "no"] {
             with_env("TOON_LOG_ENABLED", val, || {
-                assert!(!Config::load().logging_enabled, "expected false for {val}");
+                assert!(
+                    !Config::load().expect("valid bool").logging_enabled,
+                    "expected false for {val}"
+                );
             });
         }
     }
@@ -372,42 +420,51 @@ mod tests {
     #[test]
     fn delimiter_pipe() {
         with_env("TOON_DELIMITER", "pipe", || {
-            assert_eq!(Config::load().delimiter, Delimiter::Pipe);
+            assert_eq!(
+                Config::load().expect("valid delim").delimiter,
+                Delimiter::Pipe
+            );
         });
     }
 
     #[test]
     fn delimiter_tab() {
         with_env("TOON_DELIMITER", "tab", || {
-            assert_eq!(Config::load().delimiter, Delimiter::Tab);
+            assert_eq!(
+                Config::load().expect("valid delim").delimiter,
+                Delimiter::Tab
+            );
         });
     }
 
     #[test]
     fn empty_client_hint_becomes_none() {
         with_env("TOON_CLIENT_HINT", "", || {
-            assert!(Config::load().client_hint.is_none());
+            assert!(Config::load().expect("ok").client_hint.is_none());
         });
     }
 
     #[test]
     fn non_empty_client_hint_is_some() {
         with_env("TOON_CLIENT_HINT", "opencode", || {
-            assert_eq!(Config::load().client_hint, Some("opencode".into()));
+            assert_eq!(
+                Config::load().expect("ok").client_hint,
+                Some("opencode".into())
+            );
         });
     }
 
     #[test]
     fn max_input_bytes_override() {
         with_env("TOON_MAX_INPUT_BYTES", "1048576", || {
-            assert_eq!(Config::load().max_input_bytes, 1_048_576);
+            assert_eq!(Config::load().expect("ok").max_input_bytes, 1_048_576);
         });
     }
 
     #[test]
     fn max_concurrent_calls_override() {
         with_env("TOON_MAX_CONCURRENT_CALLS", "16", || {
-            assert_eq!(Config::load().max_concurrent_calls, 16);
+            assert_eq!(Config::load().expect("ok").max_concurrent_calls, 16);
         });
     }
 
@@ -416,14 +473,98 @@ mod tests {
         // With no env var set, csv_numeric_coercion defaults to true to
         // preserve historical behaviour and maximise compression.
         temp_env::with_var("TOON_CSV_NUMERIC_COERCION", None::<&str>, || {
-            assert!(Config::load().csv_numeric_coercion);
+            assert!(Config::load().expect("ok").csv_numeric_coercion);
         });
     }
 
     #[test]
     fn csv_numeric_coercion_override() {
         with_env("TOON_CSV_NUMERIC_COERCION", "false", || {
-            assert!(!Config::load().csv_numeric_coercion);
+            assert!(!Config::load().expect("ok").csv_numeric_coercion);
+        });
+    }
+
+    // --- Validation rejection tests ---
+
+    #[test]
+    fn rejects_zero_buffer_size() {
+        with_env("TOON_LOG_BUFFER_SIZE", "0", || match Config::load() {
+            Err(ServerError::InvalidConfig { var, .. }) => {
+                assert_eq!(var, "TOON_LOG_BUFFER_SIZE");
+            }
+            other => panic!("expected InvalidConfig for buffer_size=0, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn rejects_zero_flush_interval() {
+        with_env("TOON_LOG_FLUSH_INTERVAL_SECS", "0", || {
+            match Config::load() {
+                Err(ServerError::InvalidConfig { var, .. }) => {
+                    assert_eq!(var, "TOON_LOG_FLUSH_INTERVAL_SECS");
+                }
+                other => panic!("expected InvalidConfig for flush_interval=0, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent_calls() {
+        with_env("TOON_MAX_CONCURRENT_CALLS", "0", || match Config::load() {
+            Err(ServerError::InvalidConfig { var, .. }) => {
+                assert_eq!(var, "TOON_MAX_CONCURRENT_CALLS");
+            }
+            other => panic!("expected InvalidConfig for max_concurrent_calls=0, got {other:?}"),
+        });
+    }
+
+    #[test]
+    fn rejects_negative_threshold() {
+        with_env(
+            "TOON_COMPRESSION_THRESHOLD",
+            "-0.1",
+            || match Config::load() {
+                Err(ServerError::InvalidConfig { var, .. }) => {
+                    assert_eq!(var, "TOON_COMPRESSION_THRESHOLD");
+                }
+                other => panic!("expected InvalidConfig for threshold=-0.1, got {other:?}"),
+            },
+        );
+    }
+
+    #[test]
+    fn rejects_threshold_above_one() {
+        with_env("TOON_COMPRESSION_THRESHOLD", "1.5", || {
+            match Config::load() {
+                Err(ServerError::InvalidConfig { var, .. }) => {
+                    assert_eq!(var, "TOON_COMPRESSION_THRESHOLD");
+                }
+                other => panic!("expected InvalidConfig for threshold=1.5, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn accepts_threshold_one_inclusive() {
+        with_env("TOON_COMPRESSION_THRESHOLD", "1.0", || {
+            let config = Config::load().expect("1.0 must be accepted");
+            assert!((config.max_output_ratio - 1.0).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn accepts_threshold_zero_inclusive() {
+        with_env("TOON_COMPRESSION_THRESHOLD", "0.0", || {
+            let config = Config::load().expect("0.0 must be accepted");
+            assert!(config.max_output_ratio.abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn accepts_zero_min_bytes() {
+        with_env("TOON_MIN_BYTES", "0", || {
+            let config = Config::load().expect("min_bytes=0 is documented as allowed");
+            assert_eq!(config.min_bytes, 0);
         });
     }
 }

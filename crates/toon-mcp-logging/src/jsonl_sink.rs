@@ -116,8 +116,8 @@ impl JsonlSink {
         let sink = JsonlSink {
             sender: tx,
             serialization_failed_count: Arc::clone(&serialization_failed_count),
-            record_failed_count,
-            record_dropped_count,
+            record_failed_count: Arc::clone(&record_failed_count),
+            record_dropped_count: Arc::clone(&record_dropped_count),
         };
         let task_future = writer_task(
             rx,
@@ -125,6 +125,8 @@ impl JsonlSink {
             config.flush_interval,
             config.buffer_size,
             serialization_failed_count,
+            record_failed_count,
+            record_dropped_count,
         );
 
         Ok((sink, task_future))
@@ -236,6 +238,8 @@ async fn writer_task(
     flush_interval: Duration,
     buffer_size: usize,
     serialization_failed_count: Arc<AtomicU64>,
+    record_failed_count: Arc<AtomicU64>,
+    record_dropped_count: Arc<AtomicU64>,
 ) {
     let mut pending: Vec<LogEvent> = Vec::with_capacity(buffer_size);
     // Open file handles keyed by YYYY-MM-DD partition string.
@@ -279,6 +283,16 @@ async fn writer_task(
                         )
                         .await;
                         let _ = ack.send(result);
+                        let s = serialization_failed_count.load(Ordering::Relaxed);
+                        let f = record_failed_count.load(Ordering::Relaxed);
+                        let d = record_dropped_count.load(Ordering::Relaxed);
+                        tracing::info!(
+                            component = "jsonl_sink",
+                            record_failed_count = f,
+                            record_dropped_count = d,
+                            serialization_failed_count = s,
+                            "JsonlSink counters"
+                        );
                         info!("JsonlSink writer task: shutdown complete");
                         return;
                     }
@@ -307,6 +321,16 @@ async fn writer_task(
                     ).await {
                         warn!("JsonlSink flush (periodic) failed: {e}");
                     }
+                let s = serialization_failed_count.load(Ordering::Relaxed);
+                let f = record_failed_count.load(Ordering::Relaxed);
+                let d = record_dropped_count.load(Ordering::Relaxed);
+                tracing::info!(
+                    component = "jsonl_sink",
+                    record_failed_count = f,
+                    record_dropped_count = d,
+                    serialization_failed_count = s,
+                    "JsonlSink counters"
+                );
             }
         }
     }
@@ -708,5 +732,33 @@ mod tests {
         sink.flush().await.expect("flush");
         assert_eq!(sink.serialization_failed_count(), 0);
         Box::new(sink).shutdown().await.expect("shutdown");
+    }
+
+    /// Regression test: the periodic counter-summary log path (and the
+    /// shutdown-time counter-summary log) must run without panicking. We
+    /// configure a very short `flush_interval` so the interval branch fires
+    /// at least once during the test's lifetime, then shut down cleanly.
+    #[tokio::test]
+    async fn periodic_summary_log_does_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 100,
+            flush_interval: Duration::from_millis(20),
+        };
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        tokio::spawn(task);
+
+        // Wait long enough for the periodic interval to fire at least once
+        // before any events are recorded — exercises the "all zeros" path.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        sink.record(make_event(1)).await.expect("record succeeds");
+
+        // Wait again so the interval fires after an event has been recorded —
+        // exercises the path where the counters reflect real activity.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
     }
 }

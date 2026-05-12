@@ -26,8 +26,25 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 |---|---|---|---|
 | `TOON_COMPRESSION_THRESHOLD` | `f64` (0.0–1.0) | `0.85` | Maximum fraction of the original byte count that the TOON output may occupy. An input of 10,000 bytes with `threshold=0.85` must produce output ≤ 8,500 bytes to be considered compressed. |
 | `TOON_MIN_BYTES` | `usize` | `256` | Inputs shorter than this byte count are passed through without any processing. Avoids overhead on small strings that will never compress meaningfully. |
+| `TOON_MAX_INPUT_BYTES` | `usize` | `10485760` | Hard upper bound on input size in bytes (default 10 MiB). Inputs larger than this are rejected immediately without parsing, preventing unbounded memory use. |
 | `TOON_KEY_FOLDING` | `bool` | `true` | Enable TOON key-folding mode. When enabled, deeply nested single-key objects are collapsed to dot-notation paths. Disable if your consumer of TOON output does not support key folding. |
 | `TOON_DELIMITER` | `string` | `comma` | The delimiter character used between values in TOON tabular output. Accepted values: `comma`, `tab`, `pipe`. |
+| `TOON_CSV_NUMERIC_COERCION` | `bool` | `true` | When enabled, CSV/TSV cells that parse as numbers become JSON numbers in the normalised intermediate. Set to `false` for inputs containing identifiers, postal codes, or leading-zero values that must round-trip as strings. |
+
+**`TOON_MAX_INPUT_BYTES`** caps the largest payload the server will accept. Tune it down when the host process is memory-constrained or the upstream client is known to never send payloads above a smaller bound — the rejection happens before any allocation, so a tighter cap is the cheapest form of back-pressure. Tune it up only when you have observed legitimate inputs being rejected with `input_too_large`. Watch the runbook (`docs/runbook.md`) for the matching error code and triage steps.
+
+**`TOON_CSV_NUMERIC_COERCION`** controls a behavioural tradeoff, not a performance one. Leave at `true` to maximise compression density for genuinely numeric CSV columns. Flip to `false` when you see downstream consumers complaining about lost leading zeros, mis-typed phone numbers, or identifiers being silently rewritten as integers — those are the diagnostic symptoms. See `docs/runbook.md` for matching incident patterns.
+
+### Concurrency and Timeouts
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `TOON_PIPELINE_TIMEOUT_MS` | `u64` (milliseconds) | `30000` | Per-call pipeline timeout in milliseconds. A call exceeding this duration returns a typed timeout error rather than blocking indefinitely. Also bounds how long a call will wait for a concurrency permit before giving up. |
+| `TOON_MAX_CONCURRENT_CALLS` | `usize` | `8` | Maximum number of concurrent blocking pipeline calls. Controls how many `spawn_blocking` dispatches can be in-flight at once. When the limit is reached, new calls wait up to `TOON_PIPELINE_TIMEOUT_MS` for a permit before returning a busy error. |
+
+**`TOON_PIPELINE_TIMEOUT_MS`** is the per-call upper bound on blocking work plus permit-wait. Tune it down if you would rather surface a fast `timeout` error to the client than have the agent stall while a pathological input is processed — small payloads should always finish in well under a second. Tune it up only when very large inputs (near `TOON_MAX_INPUT_BYTES`) are legitimately producing timeout errors on a slow machine. Symptom to watch for: a sudden spike in `timeout` errors in the JSONL log under load — that is usually permit-wait, not parse time, so consider raising `TOON_MAX_CONCURRENT_CALLS` first. See `docs/runbook.md` for the triage flow.
+
+**`TOON_MAX_CONCURRENT_CALLS`** caps how many CPU-bound pipeline tasks can run simultaneously on the blocking pool. Tune it down on shared/low-core hosts where unbounded concurrency would starve other workloads. Tune it up when the JSONL log shows a sustained pattern of `busy` rejections while host CPU still has headroom — the default `8` is conservative for modern multi-core machines. See `docs/runbook.md` for the relationship between busy errors, timeouts, and CPU saturation.
 
 ### Classification Thresholds
 
@@ -188,18 +205,38 @@ TOON_LOG_FLUSH_INTERVAL_SECS=60
 **Source:** `crates/toon-mcp-server/src/config.rs`
 
 ```rust
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub compression_threshold: f64,
+    /// Maximum output-to-input byte ratio accepted as "compressed".
+    pub max_output_ratio: f64,
+    /// Minimum input byte count for classification to run.
     pub min_bytes: usize,
+    /// Maximum input byte count. Larger inputs are rejected without parsing.
+    pub max_input_bytes: usize,
+    /// Whether TOON key folding is enabled for FoldChain shapes.
     pub key_folding: bool,
+    /// Array delimiter used in TOON output.
     pub delimiter: Delimiter,
+    /// Minimum array length for Tabular classification.
     pub tabular_min_rows: usize,
+    /// Minimum chain depth for FoldChain classification.
     pub fold_min_depth: usize,
+    /// Minimum array length for PrimitiveArray classification.
     pub primitive_array_min: usize,
+    /// Whether CSV/TSV parsing coerces numeric-looking fields into numbers.
+    pub csv_numeric_coercion: bool,
+    /// Whether structured logging is enabled.
     pub logging_enabled: bool,
+    /// JSONL sink configuration (only meaningful when `logging_enabled`).
     pub logging: JsonlSinkConfig,
+    /// tracing filter string (e.g. `"info"`, `"debug"`).
     pub log_level: String,
+    /// Optional client identifier tag written to every log row.
     pub client_hint: Option<String>,
+    /// Per-call pipeline timeout in milliseconds.
+    pub pipeline_timeout_ms: u64,
+    /// Maximum number of concurrent blocking pipeline calls.
+    pub max_concurrent_calls: usize,
 }
 ```
 
@@ -207,7 +244,7 @@ pub struct Config {
 
 ```rust
 let compress_config = CompressConfig {
-    threshold: config.compression_threshold,
+    threshold: config.max_output_ratio,
     min_bytes: config.min_bytes,
     key_folding: config.key_folding,
     delimiter: config.delimiter,
@@ -221,8 +258,38 @@ let compress_config = CompressConfig {
 
 ## Startup Validation
 
-`Config::load()` does not panic on invalid values — it logs a `tracing::warn!` and substitutes the default. This prevents the server from crashing on misconfiguration, at the cost of possibly running with unexpected defaults. Watch stderr during startup to verify all values loaded correctly:
+The accepted range or value-set for each variable is the **contract**:
+
+| Variable | Accepted values |
+|---|---|
+| `TOON_COMPRESSION_THRESHOLD` | finite `f64` in `[0.0, 1.0]` |
+| `TOON_MIN_BYTES` | non-negative `usize` |
+| `TOON_MAX_INPUT_BYTES` | positive `usize` |
+| `TOON_KEY_FOLDING` | one of `true`, `1`, `yes`, `false`, `0`, `no` (case-insensitive) |
+| `TOON_DELIMITER` | one of `comma`, `tab`, `pipe` |
+| `TOON_TABULAR_MIN_ROWS` | non-negative `usize` |
+| `TOON_FOLD_MIN_DEPTH` | non-negative `usize` |
+| `TOON_PRIMITIVE_ARRAY_MIN` | non-negative `usize` |
+| `TOON_CSV_NUMERIC_COERCION` | one of `true`, `1`, `yes`, `false`, `0`, `no` |
+| `TOON_PIPELINE_TIMEOUT_MS` | positive `u64` |
+| `TOON_MAX_CONCURRENT_CALLS` | positive `usize` |
+| `TOON_LOG_ENABLED` | one of `true`, `1`, `yes`, `false`, `0`, `no` |
+| `TOON_LOG_DIR` | string (absolute path required for Claude Desktop) |
+| `TOON_LOG_BUFFER_SIZE` | positive `usize` |
+| `TOON_LOG_FLUSH_INTERVAL_SECS` | positive `u64` |
+| `TOON_LOG_LEVEL` | one of `trace`, `debug`, `info`, `warn`, `error` |
+| `TOON_CLIENT_HINT` | non-empty string, or unset |
+
+Values outside the documented range are rejected at startup with a typed
+error. Watch stderr during startup to verify all values loaded correctly:
 
 ```
-[INFO] toon_mcp_server::config: loaded config compression_threshold=0.85 min_bytes=256 ...
+[INFO] toon_mcp_server::config: loaded config max_output_ratio=0.85 min_bytes=256 ...
 ```
+
+---
+
+## See Also
+
+- `docs/runbook.md` — incident triage for `input_too_large`, `timeout`, and `busy` errors, plus the JSONL log fields used to diagnose them.
+- `README.md` — quick-start environment variable reference.

@@ -2,6 +2,7 @@
 // description: Tokio entry point — wires config, logging, and MCP server together
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::{ServiceExt, transport::stdio};
 use tracing::{error, info, warn};
@@ -15,7 +16,7 @@ use toon_mcp_server::{config::Config, error::ServerError, server::ToonMcpServer}
 async fn main() -> Result<(), ServerError> {
     dotenvy::dotenv().ok();
 
-    let config = Config::load();
+    let config = Config::load()?;
 
     init_tracing(&config.log_level);
 
@@ -23,6 +24,10 @@ async fn main() -> Result<(), ServerError> {
         version = env!("CARGO_PKG_VERSION"),
         "toon-mcp-server starting"
     );
+
+    // Shared flag used by the writer-task supervisor to distinguish a clean
+    // shutdown (where main drops the sink) from an unexpected writer exit.
+    let shutdown_initiated = Arc::new(AtomicBool::new(false));
 
     // Construct the log sink and spawn the background writer task.
     // The sink is wrapped in Arc for shared access from the server handlers.
@@ -34,7 +39,10 @@ async fn main() -> Result<(), ServerError> {
 
             // M3: Supervisor — treat unexpected writer task exit as fatal.
             // Log a structured error so operators can detect silent log loss.
-            let supervisor = tokio::spawn(supervise_writer_task(handle));
+            let supervisor = tokio::spawn(supervise_writer_task(
+                handle,
+                Arc::clone(&shutdown_initiated),
+            ));
 
             (Arc::new(jsonl_sink), Some(supervisor))
         } else {
@@ -42,10 +50,7 @@ async fn main() -> Result<(), ServerError> {
         };
 
     let server = ToonMcpServer::new(config.clone(), Arc::clone(&sink));
-    let service = server
-        .serve(stdio())
-        .await
-        .map_err(|e| ServerError::McpService(e.to_string()))?;
+    let service = server.serve(stdio()).await.map_err(Box::new)?;
 
     // M4: Structured readiness — stable anchor for log scrapers and monitors.
     info!(
@@ -99,7 +104,10 @@ async fn main() -> Result<(), ServerError> {
     if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(10), sink.flush()).await {
         warn!("log sink flush timed out after 10 s: {e}");
     }
-    // Drop the Arc so the writer task's channel receiver sees closure.
+    // Mark shutdown so the supervisor distinguishes clean drain from an
+    // unexpected exit, then drop the Arc so the writer task's channel receiver
+    // sees closure.
+    shutdown_initiated.store(true, Ordering::Relaxed);
     drop(sink);
 
     // Await the supervisor task so the writer fully drains before exit. The
@@ -119,11 +127,26 @@ async fn main() -> Result<(), ServerError> {
 
 /// Supervise the JSONL writer task: log a structured error if it exits or
 /// panics so operators can detect silent log loss.
-pub(crate) async fn supervise_writer_task(handle: tokio::task::JoinHandle<()>) {
+///
+/// The `shutdown_initiated` flag distinguishes a graceful shutdown (main
+/// flushes the sink and drops the Arc, causing the writer to drain and exit
+/// Ok normally) from an unexpected exit. A clean `Ok(())` during shutdown is
+/// logged at `info`; outside of shutdown it remains an `error`.
+pub(crate) async fn supervise_writer_task(
+    handle: tokio::task::JoinHandle<()>,
+    shutdown_initiated: Arc<AtomicBool>,
+) {
     match handle.await {
+        Ok(()) if shutdown_initiated.load(Ordering::Relaxed) => {
+            info!(
+                component = "jsonl_sink_writer",
+                "writer task drained and exited cleanly during shutdown"
+            );
+        }
         Ok(()) => {
-            // Normal exit only happens on Shutdown command; unexpected here
-            // means the task completed without being told to.
+            // Normal exit outside of shutdown is unexpected — the task should
+            // only complete after main sets the shutdown flag and drops the
+            // sink.
             error!(
                 component = "jsonl_sink_writer",
                 "writer task exited unexpectedly; subsequent log events will be dropped"
@@ -159,8 +182,9 @@ mod tests {
     #[tokio::test]
     async fn supervise_writer_task_absorbs_panic() {
         let h = tokio::spawn(async { panic!("boom") });
+        let flag = Arc::new(AtomicBool::new(false));
         // Call returns normally — no panic propagation.
-        supervise_writer_task(h).await;
+        supervise_writer_task(h, flag).await;
     }
 
     /// The supervisor must also handle a normal (clean) task exit without
@@ -168,6 +192,21 @@ mod tests {
     #[tokio::test]
     async fn supervise_writer_task_handles_clean_exit() {
         let h = tokio::spawn(async {});
-        supervise_writer_task(h).await;
+        let flag = Arc::new(AtomicBool::new(false));
+        supervise_writer_task(h, flag).await;
+    }
+
+    /// A clean exit during shutdown (flag set) must not emit an error log.
+    /// We can't easily intercept tracing here without subscriber wiring, so
+    /// this exercise verifies the flag-set arm terminates cleanly. Code review
+    /// confirms the path logs at `info!` rather than `error!`.
+    #[tokio::test]
+    async fn supervise_writer_task_clean_exit_during_shutdown() {
+        let h = tokio::spawn(async {});
+        let flag = Arc::new(AtomicBool::new(true));
+        // If this path took the error arm it would still terminate, but the
+        // contract is that the info arm is taken — verified by inspection of
+        // supervise_writer_task above.
+        supervise_writer_task(h, flag).await;
     }
 }

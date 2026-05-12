@@ -89,7 +89,7 @@ Criterion benchmark suite. Four benchmark binaries:
 | `compression.rs` | Sync core: full compression pipeline | None |
 | `jsonl_sink.rs` | Async logging sink: channel throughput, flush latency | `tokio` `current_thread` |
 
-The three sync core benches depend only on `toon-mcp-core` and MUST NOT start a tokio runtime. The dedicated `jsonl_sink.rs` async bench depends on `toon-mcp-logging` and is the only place a tokio runtime is permitted in this crate — it exists to measure async-specific behaviour (channel throughput, flush latency) that cannot be measured synchronously. The bench crate never depends on `toon-mcp-server`.
+The three sync core benches depend only on `toon-mcp-core` and MUST NOT start a tokio runtime. The dedicated `jsonl_sink.rs` async bench depends on `toon-mcp-logging` and is the only place a tokio runtime is permitted in this crate — it exists to measure async-specific behaviour (channel throughput, flush latency) that cannot be measured synchronously. The bench crate never depends on `toon-mcp-server`. The async-benches exception is documented in [ADR-0001](adr/0001-async-benches.md).
 
 ---
 

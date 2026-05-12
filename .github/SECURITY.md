@@ -2,12 +2,14 @@
 
 ## Supported Versions
 
-Only the latest commit on the `main` branch is actively maintained.
+Only the latest commit on the active development branch is actively
+maintained. The active branch is `master`; CI also runs on `main` for
+historical reasons.
 
-| Version | Supported |
-|---------|-----------|
-| main    | Yes       |
-| older   | No        |
+| Version                          | Supported |
+|----------------------------------|-----------|
+| latest commit on `master`        | Yes       |
+| older commits or tagged releases | No        |
 
 ## Reporting a Vulnerability
 

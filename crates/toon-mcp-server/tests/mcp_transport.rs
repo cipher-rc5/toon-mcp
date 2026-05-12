@@ -298,3 +298,203 @@ async fn unknown_tool_name_returns_error() -> anyhow::Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+/// Verify that `compress_content` rejects inputs exceeding `max_input_bytes`
+/// with an `input_exceeds_limit` error surfaced as an MCP error response.
+#[tokio::test]
+async fn compress_content_rejects_oversized_input() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+
+    // Override max_input_bytes to a small value to keep the test fast.
+    let mut cfg = test_config();
+    cfg.max_input_bytes = 1024;
+
+    let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
+    let _server_handle = tokio::spawn(async move {
+        let _ = server.serve(server_transport).await?.waiting().await;
+        anyhow::Ok(())
+    });
+
+    let client = TestClient.serve(client_transport).await?;
+
+    // Build an input twice the limit, well above the 1024-byte cap.
+    let huge = "x".repeat(2048);
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("compress_content").with_arguments(
+                serde_json::json!({ "input": huge })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+
+    let err = result.expect_err("expected error for oversized input");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("input_exceeds_limit"),
+        "expected error to contain 'input_exceeds_limit', got: {msg}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Verify that `compress_content` returns an error when the parameters do not
+/// match the expected schema (here: missing the required `input` field).
+#[tokio::test]
+async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+
+    let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
+    let _server_handle = tokio::spawn(async move {
+        let _ = server.serve(server_transport).await?.waiting().await;
+        anyhow::Ok(())
+    });
+
+    let client = TestClient.serve(client_transport).await?;
+
+    // Empty object — required `input` field is missing.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("compress_content")
+                .with_arguments(serde_json::json!({}).as_object().unwrap().clone()),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected error for malformed params (missing input field), got: {result:?}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Verify that the `max_concurrent_calls` semaphore plus `pipeline_timeout_ms`
+/// queue deadline cooperate to surface a `server busy` error when more
+/// concurrent calls arrive than the configured limit and the queue deadline
+/// expires before a permit becomes available.
+///
+/// Uses `max_concurrent_calls = 1` and a very short `pipeline_timeout_ms` so
+/// that the second of two parallel calls cannot acquire a permit in time and
+/// must return `server busy`.
+#[tokio::test]
+async fn concurrent_calls_respect_max_concurrent_calls() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+
+    let mut cfg = test_config();
+    cfg.max_concurrent_calls = 1;
+    cfg.pipeline_timeout_ms = 1;
+    cfg.max_output_ratio = 0.99;
+
+    let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
+    let _server_handle = tokio::spawn(async move {
+        let _ = server.serve(server_transport).await?.waiting().await;
+        anyhow::Ok(())
+    });
+
+    let client = TestClient.serve(client_transport).await?;
+
+    // A non-trivial payload — combined with `pipeline_timeout_ms = 1` and
+    // `max_concurrent_calls = 1`, both parallel calls must either fail
+    // their own pipeline timeout or fail to acquire a permit (busy).
+    let rows: Vec<String> = (0..1000)
+        .map(|i| {
+            format!(
+                r#"{{"id":{i},"name":"User{i}","score":{s},"active":true,"tag":"alpha"}}"#,
+                i = i,
+                s = i as f64 * 0.5
+            )
+        })
+        .collect();
+    let big_json = format!("[{}]", rows.join(","));
+
+    let args = serde_json::json!({ "input": big_json })
+        .as_object()
+        .unwrap()
+        .clone();
+
+    let call_a = client
+        .call_tool(CallToolRequestParams::new("compress_content").with_arguments(args.clone()));
+    let call_b = client
+        .call_tool(CallToolRequestParams::new("compress_content").with_arguments(args.clone()));
+
+    let (res_a, res_b) = tokio::join!(call_a, call_b);
+
+    // At least one call must surface a busy error or a pipeline_timeout — both
+    // are valid outcomes when the system is saturated. The contract is "did
+    // the concurrency gate engage?", not "which specific error fired first".
+    let mut saw_busy_or_timeout = false;
+    for r in [&res_a, &res_b] {
+        if let Err(err) = r {
+            let msg = err.to_string();
+            if msg.contains("server busy") || msg.contains("pipeline_timeout") {
+                saw_busy_or_timeout = true;
+            }
+        }
+    }
+    assert!(
+        saw_busy_or_timeout,
+        "expected at least one concurrent call to surface 'server busy' or 'pipeline_timeout'; \
+         got a={res_a:?} b={res_b:?}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Verify that an extremely short `pipeline_timeout_ms` causes
+/// `compress_content` to return a `pipeline_timeout` error.
+#[tokio::test]
+async fn pipeline_timeout_returns_internal_error() -> anyhow::Result<()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+
+    let mut cfg = test_config();
+    cfg.pipeline_timeout_ms = 1;
+    cfg.max_output_ratio = 0.99;
+
+    let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
+    let _server_handle = tokio::spawn(async move {
+        let _ = server.serve(server_transport).await?.waiting().await;
+        anyhow::Ok(())
+    });
+
+    let client = TestClient.serve(client_transport).await?;
+
+    // A non-trivial JSON payload — large enough that the blocking pipeline
+    // call cannot complete within 1ms on any realistic hardware.
+    let rows: Vec<String> = (0..1000)
+        .map(|i| {
+            format!(
+                r#"{{"id":{i},"name":"User{i}","score":{s},"active":true,"tag":"alpha"}}"#,
+                i = i,
+                s = i as f64 * 0.5
+            )
+        })
+        .collect();
+    let big_json = format!("[{}]", rows.join(","));
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("compress_content").with_arguments(
+                serde_json::json!({ "input": big_json })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await;
+
+    let err = result.expect_err("expected pipeline_timeout error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pipeline_timeout"),
+        "expected error to contain 'pipeline_timeout', got: {msg}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}

@@ -1,5 +1,18 @@
 # toon-mcp — Build Plan
 
+> **Status: historical planning artefact.** This document captures the
+> original build plan for toon-mcp and is preserved as a record of intent.
+> It has diverged from the implementation in several places (notably the
+> Parquet sink was replaced with a JSONL sink in `toon-mcp-logging`, and
+> the bench-crate dependency policy now permits async benches that
+> additionally depend on `toon-mcp-logging`). For the authoritative
+> current state, see:
+>
+> - [AGENTS.md](../AGENTS.md) — agent / contributor rules and layer policy
+> - [docs/architecture.md](architecture.md) — crate dependency graph and data flow
+> - [docs/configuration.md](configuration.md) — environment-variable reference
+> - [docs/runbook.md](runbook.md) — production operator runbook
+>
 > Token-Oriented Object Notation compression layer for opencode and Claude
 > Desktop, implemented as a locally hosted MCP server in Rust. Dynamically
 > detects structured payloads across multiple input formats (JSON, JSONL, CSV,
@@ -1028,7 +1041,7 @@ edition = "2024"
 
 ```toml
 [toolchain]
-channel = "1.87.0"
+channel = "1.93.0"
 ```
 
 ### Per-crate Cargo.toml (toon-mcp-core)
@@ -1215,7 +1228,8 @@ Layer call direction (strict — no upward calls permitted):
     toon-mcp-server  ->  toon-mcp-logging
     toon-mcp-core    ->  (no workspace deps beyond toon-format, serde_json, csv)
     toon-mcp-logging ->  (no toon-mcp-core dep)
-    toon-mcp-bench   ->  toon-mcp-core only
+    toon-mcp-bench   ->  toon-mcp-core (sync benches);
+                         additionally toon-mcp-logging for async benches only
 
 - toon-mcp-core MUST remain pure: no I/O, no async, no rmcp dependency.
 - toon-mcp-logging MUST NOT depend on toon-mcp-core.
@@ -1274,7 +1288,7 @@ chore, revert.
 | System prompt injection per turn | Instructions registered once in ServerInfo |
 | parquet crate (Apache Arrow) | DuckDB COPY TO handles Parquet natively |
 | XML, YAML, TOML parsers (v1) | Out of scope; planned for future plugin iteration |
-| toon-mcp-bench importing server crates | Bench depends only on toon-mcp-core |
+| toon-mcp-bench importing toon-mcp-server | Bench depends on toon-mcp-core (sync benches) or toon-mcp-logging (async benches only); never on toon-mcp-server |
 ```
 
 ---
