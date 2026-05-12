@@ -10,9 +10,16 @@ members = [
 [workspace.package]
 version = "0.1.0"
 authors = ["cipher-rc5"]
+categories = ["command-line-utilities", "compression", "encoding"]
+documentation = "https://github.com/cipher-rc5/toon-mcp#readme"
 edition = "2024"
-license = "MIT"
+homepage = "https://github.com/cipher-rc5/toon-mcp"
+keywords = ["mcp", "toon", "compression", "llm", "json"]
+license = "BUSL-1.1"
+readme = "README.md"
 repository = "https://github.com/cipher-rc5/toon-mcp"
+rust-version = "1.93.0"
+description = "MCP server that detects, classifies, and compresses structured data (JSON, JSONL, CSV, TSV) into the TOON format to reduce LLM context token consumption."
 
 [workspace.dependencies]
 # MCP
@@ -31,7 +38,7 @@ csv = "=1.4.0"
 
 # Async
 async-trait = "=0.1.89"
-tokio = { version = "=1.52.2", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Benchmarking
 criterion = { version = "=0.8.2", features = ["html_reports"] }
@@ -50,7 +57,7 @@ thiserror = "=2.0.18"
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # Property-based testing
-proptest = "=1.8.0"
+proptest = "=1.11.0"
 
 [profile.release]
 opt-level = 3

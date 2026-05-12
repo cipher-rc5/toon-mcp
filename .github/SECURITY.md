@@ -15,18 +15,28 @@ branch names exist.
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Report vulnerabilities by emailing the maintainers directly via the contact
-address listed on the [GitHub repository](https://github.com/cipher-rc5/toon-mcp).
+Report vulnerabilities through GitHub's private vulnerability reporting:
+
+1. Open <https://github.com/cipher-rc5/toon-mcp/security/advisories/new>.
+2. Fill in the advisory form with the details below.
+3. Submit. The report is visible only to the maintainers until a coordinated
+   disclosure date is agreed.
+
+If GitHub's private reporting is unavailable to you, open a minimal public
+issue titled "Security contact request" without any vulnerability details,
+and a maintainer will arrange a private channel.
 
 Include the following in your report:
 
 - A description of the vulnerability and its potential impact.
-- Steps to reproduce the issue.
+- Steps to reproduce the issue, ideally with a minimal input that triggers it.
+- The commit SHA or release tag the report is against.
 - Any suggested remediation if known.
 
 You will receive an acknowledgement within 72 hours. We aim to release a fix
 within 14 days of confirming the vulnerability. We will coordinate a public
-disclosure date with you after the fix is available.
+disclosure date with you after the fix is available, and credit you in the
+advisory unless you ask to remain anonymous.
 
 ## Scope
 

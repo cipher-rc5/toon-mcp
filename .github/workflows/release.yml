@@ -72,11 +72,21 @@ jobs:
             exit 1
           fi
 
-      - name: Install cross
-        uses: taiki-e/install-action@24b0de93d6e499a21582ab6ba5abe22282d2ed0e # cross
+      # cargo-zigbuild uses Zig as the cross-linker. This replaces `cross`
+      # (which required Docker) and lets us pin the target glibc to 2.17 so
+      # the binary loads on RHEL/CentOS 7-era and any newer glibc-based distro.
+      - name: Install Zig
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
+        with:
+          tool: zig
 
-      - name: Build release binary
-        run: cross build --release --package toon-mcp-server --target ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release binary (glibc 2.17 baseline)
+        run: cargo zigbuild --release --package toon-mcp-server --target ${{ matrix.target }}.2.17
 
       - name: Rename binary
         run: |

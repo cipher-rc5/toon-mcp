@@ -11,7 +11,7 @@ name = "toon-mcp-fuzz"
 version = "0.0.0"
 authors = ["cipher-rc5"]
 edition = "2024"
-license = "MIT"
+license = "BUSL-1.1"
 publish = false
 
 [package.metadata]

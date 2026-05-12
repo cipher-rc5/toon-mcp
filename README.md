@@ -122,6 +122,40 @@ The `opencode.json` schema is:
 - `enabled` — set to `false` to temporarily disable the server without removing
   the configuration.
 
+### Claude Code (CLI)
+
+Register the server with the Claude Code CLI using `claude mcp add`. Build the release binary first, then run:
+
+```bash
+cargo build --release
+
+# user scope — available across all your projects
+claude mcp add toon \
+  -s user \
+  -e TOON_CLIENT_HINT=claude-code \
+  -e TOON_LOG_DIR=/absolute/path/to/toon-mcp/data/logs \
+  -- /absolute/path/to/toon-mcp/target/release/toon-mcp-server
+
+# verify it's registered
+claude mcp list
+
+# inspect / remove
+claude mcp get toon
+claude mcp remove toon
+```
+
+Scope options:
+
+- `-s user` — available in every project for the current OS user (stored in `~/.claude.json`).
+- `-s project` — writes a `.mcp.json` at the repo root that can be committed and shared with teammates.
+- `-s local` (default) — only for the current project and user, not shared.
+
+Notes:
+
+- Always use absolute paths. Claude Code does not resolve `~`, `./`, or `$VARS` inside the `command` field.
+- Add any additional `TOON_*` overrides with repeated `-e KEY=VALUE` flags. Variables omitted here fall back to the defaults in the [Environment Variables](#environment-variables) table.
+- After registering, run `/mcp` inside a Claude Code session to confirm `toon` is connected and the three tools (`compress_content`, `compression_stats`, `detect_format`) are listed.
+
 ### Claude Desktop
 
 Add an entry to your Claude Desktop MCP config (typically `~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -146,6 +180,19 @@ Add an entry to your Claude Desktop MCP config (typically `~/Library/Application
 ```
 
 **Important:** Claude Desktop does not inherit a shell environment. All paths in `env` values must be absolute.
+
+After editing the config, fully quit and relaunch Claude Desktop. The toon tools appear in the tool picker (🔌 icon) once the server reports `toon-mcp-server ready` on stderr.
+
+### Claude (web — claude.ai)
+
+The web client at <https://claude.ai> connects to MCP servers via **Custom Connectors**, which require an HTTP-based MCP transport (Streamable HTTP / SSE). `toon-mcp-server` only enables `rmcp`'s `transport-io` feature (stdio), so claude.ai cannot launch it directly.
+
+You have two options:
+
+1. **Use Claude Desktop or Claude Code instead** — both speak stdio natively and run the binary as a local subprocess.
+2. **Bridge stdio to HTTP** — run the binary behind a generic stdio→HTTP adapter (e.g. `mcp-remote`, `supergateway`) and register the resulting HTTPS URL as a Custom Connector at Settings → Connectors → Add custom connector. This is unsupported by this project; you accept responsibility for the bridge process, its TLS termination, and any authentication in front of it.
+
+A first-party HTTP transport for `toon-mcp-server` is not on the roadmap today — open an issue if you need one.
 
 ### Production Defaults
 
@@ -357,4 +404,4 @@ CI additionally runs `cargo fmt --check`, workspace clippy/tests/docs, `cargo au
 
 ## License
 
-[MIT](LICENSE)
+[Business Source License 1.1](LICENSE)
