@@ -35,5 +35,5 @@ xxhash-rust.workspace = true
 
 [dev-dependencies]
 anyhow = "=1.0.102"
-rmcp = { version = "=1.6.0", features = ["server", "transport-io", "macros", "schemars", "client"] }
+rmcp = { version = "=1.7.0", features = ["server", "transport-io", "macros", "schemars", "client"] }
 temp-env = "=0.3.6"
