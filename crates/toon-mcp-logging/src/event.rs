@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub struct LogEvent {
     /// 16-character lowercase hexadecimal identifier (xxh3-64 of an
     /// atomic counter mixed with a nanosecond timestamp). Not a UUID;
-    /// uniqueness is guaranteed within a single process run.
+    /// collisions become non-negligible around 2^32 generated IDs within
+    /// a single process run.
     pub event_id: String,
 
     /// Unix timestamp in microseconds when the tool call was received.

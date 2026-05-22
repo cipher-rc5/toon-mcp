@@ -7,16 +7,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [Unreleased] — 0.2.0 (in progress)
 
 ### Changed
 
+- Bumped the pinned Rust toolchain from 1.93.0 to 1.95.0 (`rust-toolchain.toml`, `Cargo.toml` `rust-version`, and all documentation references). Downstream consumers must use Rust 1.95.0 or newer.
 - Renamed `ParquetSink` to `JsonlSink` and `ParquetSinkConfig` to
   `JsonlSinkConfig`. The sink writes JSONL, not Parquet; the previous name
   was misleading. Update any custom code that references these types.
 
 ### Fixed
 
+- Removed stale `AGENTS.md` references from `docs/LLM_RULES.md`, `docs/testing.md`, `docs/adr/0001-async-benches.md`, and `opencode.json`. The authoritative contributor rules now live in `CONTRIBUTING.md`.
 - `detect_format` handler now runs `FormatDetector::detect` on a
   `spawn_blocking` thread, preventing it from stalling the tokio executor
   under large inputs.

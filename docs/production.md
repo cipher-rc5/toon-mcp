@@ -15,7 +15,7 @@ toon-mcp is production-usable as a local stdio MCP server when operators treat i
 
 ## Compatibility
 
-- Rust: exactly the toolchain pinned in `rust-toolchain.toml` (`1.93.0`).
+- Rust: exactly the toolchain pinned in `rust-toolchain.toml` (`1.95.0`).
 - Release artifacts: Linux GNU and macOS for `x86_64` and `aarch64`.
 - MCP: local stdio clients that can launch a subprocess and pass environment variables.
 - Data formats: JSON, JSONL, CSV, TSV. XML, YAML, and TOML are out of scope for v1.
@@ -65,6 +65,7 @@ Current limitations:
 - Events can be lost on process crash, disk error, channel closure, or shutdown timeout.
 - File writes flush process buffers but do not fsync with `sync_data` or `sync_all`.
 - There is no inter-process lock for a shared log directory.
+- The `JsonlSink` keeps one open file handle per UTC day partition for the lifetime of the process; long-running daemons (multi-month uptime) accumulate one handle per day. Restart the process if file-descriptor pressure matters in your environment.
 
 If audit-grade logging is required, add durable queueing, fsync policy, explicit log-loss surfacing, and multi-process coordination before relying on JSONL output.
 

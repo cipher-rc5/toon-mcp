@@ -39,7 +39,7 @@ toon-mcp/
 
 ### Prerequisites
 
-- Rust toolchain pinned to **1.93.0** (managed by `rust-toolchain.toml` — `rustup` picks this up automatically)
+- Rust toolchain pinned to **1.95.0** (managed by `rust-toolchain.toml` — `rustup` picks this up automatically)
 - No Docker, no external services required
 
 ### Build
@@ -56,7 +56,7 @@ The server binary is written to `./target/release/toon-mcp-server`.
 
 ### Environment Variables
 
-Copy the example env file and adjust as needed:
+Copy the example env file (`.env.example`) and adjust as needed:
 
 ```bash
 cp .env.example .env
@@ -102,7 +102,6 @@ The `opencode.json` schema is:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": ["AGENTS.md"],
   "mcp": {
     "toon": {
       "type": "local",
@@ -380,7 +379,7 @@ CI additionally runs `cargo fmt --check`, workspace clippy/tests/docs, `cargo au
 
 ## Compatibility
 
-- Rust toolchain: exactly the version pinned in `rust-toolchain.toml` (`1.93.0`).
+- Rust toolchain: exactly the version pinned in `rust-toolchain.toml` (`1.95.0`).
 - Release binaries: Linux GNU and macOS on `x86_64` and `aarch64`.
 - MCP transport: local stdio clients that can launch a binary and pass environment variables.
 - Branch policy: `master` is the active development branch. CI also runs on `main` while both branch names exist.

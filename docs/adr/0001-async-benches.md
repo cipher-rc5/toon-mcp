@@ -5,7 +5,7 @@
 
 **Status:** accepted
 **Date:** 2026-05-11
-**Supersedes:** prior rule in AGENTS.md (pre-2026-05-11) requiring all
+**Supersedes:** prior rule in CONTRIBUTING.md and docs/architecture.md (pre-2026-05-11) requiring all
 benchmarks to be synchronous and `toon-mcp-bench` to depend only on
 `toon-mcp-core`.
 
@@ -16,7 +16,7 @@ benchmarks to be synchronous and `toon-mcp-bench` to depend only on
 `toon-mcp-logging` `JsonlSink` is async by design — channel-fed writer
 task, periodic flushes, day-rollover behaviour — and these
 characteristics matter to operators. Measuring them requires a Tokio
-runtime, which the original AGENTS.md rule forbade.
+runtime, which the prior workspace policy forbade.
 
 Two options were considered:
 
@@ -50,7 +50,7 @@ constraints:
 
 - Future contributors adding a new async bench should reference this
   ADR in their PR description.
-- The bench-crate dependency graph row in AGENTS.md and
+- The bench-crate dependency graph row in
   `docs/architecture.md` lists `toon-mcp-logging` for async benches only.
 - If a contributor needs `toon-mcp-server` in benches (e.g. to measure
   rmcp dispatch latency), open a new ADR — that decision is not in scope
@@ -58,6 +58,6 @@ constraints:
 
 ## See also
 
-- AGENTS.md "Benchmarking" section
+- `docs/architecture.md` layer-rules section
 - `crates/toon-mcp-bench/benches/jsonl_sink.rs` — the first async bench
   this ADR formalises

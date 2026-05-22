@@ -280,12 +280,19 @@ pub async fn handle_detect_format(
     }
 
     // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
+    // `_permit` is held by the enclosing scope across `.instrument(span).await`
+    // so the semaphore slot releases on every exit path, including panic unwind.
     let _permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
         semaphore.acquire(),
     )
     .await
-    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| {
+        McpError::internal_error(
+            "server busy: too many concurrent calls",
+            Some(serde_json::json!({ "code": "server_busy" })),
+        )
+    })?
     .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
     let event_id = new_event_id();
@@ -431,12 +438,19 @@ pub(crate) async fn handle_compress_content_inner(
         ));
     }
 
+    // `_permit` is held by the enclosing scope across `.instrument(span).await`
+    // so the semaphore slot releases on every exit path, including panic unwind.
     let _permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
         semaphore.acquire(),
     )
     .await
-    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| {
+        McpError::internal_error(
+            "server busy: too many concurrent calls",
+            Some(serde_json::json!({ "code": "server_busy" })),
+        )
+    })?
     .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
     let event_id = new_event_id();
@@ -622,12 +636,19 @@ pub async fn handle_compression_stats(
         ));
     }
 
+    // `_permit` is held by the enclosing scope across `.instrument(span).await`
+    // so the semaphore slot releases on every exit path, including panic unwind.
     let _permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
         semaphore.acquire(),
     )
     .await
-    .map_err(|_| McpError::internal_error("server busy: too many concurrent calls", None))?
+    .map_err(|_| {
+        McpError::internal_error(
+            "server busy: too many concurrent calls",
+            Some(serde_json::json!({ "code": "server_busy" })),
+        )
+    })?
     .map_err(|_| McpError::internal_error("semaphore closed", None))?;
 
     let event_id = new_event_id();

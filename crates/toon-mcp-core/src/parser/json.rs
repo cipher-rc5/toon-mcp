@@ -53,6 +53,27 @@ mod tests {
         let p = JsonParser;
         assert!(p.parse("not json").is_err());
     }
+
+    #[test]
+    fn parse_truncated_object_returns_error() {
+        // JSON object missing the closing brace — must surface a parse error.
+        let p = JsonParser;
+        assert!(p.parse(r#"{"id":1,"name":"Alice"#).is_err());
+    }
+
+    #[test]
+    fn parse_truncated_array_returns_error() {
+        // JSON array missing the closing bracket — must surface a parse error.
+        let p = JsonParser;
+        assert!(p.parse(r#"[1,2,3"#).is_err());
+    }
+
+    #[test]
+    fn parse_truncated_string_returns_error() {
+        // Unterminated string literal — must surface a parse error.
+        let p = JsonParser;
+        assert!(p.parse(r#"{"id":"alice"#).is_err());
+    }
 }
 
 #[cfg(test)]

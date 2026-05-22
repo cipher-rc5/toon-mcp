@@ -1,7 +1,11 @@
 // file: crates/toon-mcp-logging/src/memory_sink.rs
 // description: In-memory LogSink for integration tests
 
-use crate::{error::LogError, event::LogEvent, sink::LogSink};
+use crate::{
+    error::LogError,
+    event::LogEvent,
+    sink::{LogDiagnostics, LogSink},
+};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 
@@ -47,6 +51,18 @@ impl LogSink for MemorySink {
 
     async fn flush(&self) -> Result<(), LogError> {
         Ok(())
+    }
+
+    fn diagnostics(&self) -> LogDiagnostics {
+        LogDiagnostics {
+            queue_queued: Some(
+                self.events
+                    .lock()
+                    .expect("MemorySink mutex is unpoisoned")
+                    .len(),
+            ),
+            ..LogDiagnostics::default()
+        }
     }
 
     async fn shutdown(self: Box<Self>) -> Result<(), LogError> {

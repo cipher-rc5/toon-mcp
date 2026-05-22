@@ -402,7 +402,7 @@ async fn flush_pending(
     pending: &mut Vec<LogEvent>,
     log_dir: &Path,
     file_handles: &mut HashMap<String, std::fs::File>,
-    serialization_failed_count: &AtomicU64,
+    serialization_failed_count: &Arc<AtomicU64>,
     writer_failed_count: &AtomicU64,
     last_error: &Mutex<Option<String>>,
 ) -> Result<(), LogError> {
@@ -411,52 +411,57 @@ async fn flush_pending(
     }
 
     // Group events by UTC day to write to the correct partition.
-    let mut by_day: HashMap<String, Vec<&LogEvent>> = HashMap::new();
+    // Build a lightweight (day, dir, owned events) triple so the heavy
+    // serialization work runs on the blocking pool, not the async executor.
+    let mut by_day: HashMap<String, Vec<LogEvent>> = HashMap::new();
     for event in pending.iter() {
         let day = day_partition_key(event.ts_us);
-        by_day.entry(day).or_default().push(event);
+        by_day.entry(day).or_default().push(event.clone());
     }
 
-    // Serialise all lines on the async task before entering spawn_blocking.
-    let mut day_lines: Vec<(String, PathBuf, String)> = Vec::new();
-    for (day, events) in &by_day {
+    let mut day_events: Vec<(String, PathBuf, Vec<LogEvent>)> = Vec::with_capacity(by_day.len());
+    for (day, events) in by_day {
         let partition_dir = log_dir.join(format!("day={day}"));
-        let lines: String = events
-            .iter()
-            .map(|e| match serde_json::to_string(e) {
-                Ok(s) => s,
-                Err(err) => {
-                    // H1: visible error — never silently drop events.
-                    serialization_failed_count.fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        event_id = %e.event_id,
-                        "JsonlSink: serialization failed, event skipped: {err}"
-                    );
-                    String::new()
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if lines.is_empty() {
-            continue;
-        }
-
-        day_lines.push((day.clone(), partition_dir, lines + "\n"));
+        day_events.push((day, partition_dir, events));
     }
 
-    if day_lines.is_empty() {
+    if day_events.is_empty() {
         pending.clear();
         return Ok(());
     }
 
     // Move file handles into spawn_blocking and get them back after.
     let mut handles_snapshot = std::mem::take(file_handles);
+    let serialization_failed_count = Arc::clone(serialization_failed_count);
 
     let (handles_snapshot, result) = tokio::task::spawn_blocking(
         move || -> (HashMap<String, std::fs::File>, Result<(), LogError>) {
-            for (day, partition_dir, lines) in day_lines {
+            for (day, partition_dir, events) in day_events {
+                // Serialize events on the blocking thread so allocation-heavy
+                // work is kept off the async executor.
+                let lines: String = events
+                    .iter()
+                    .map(|e| match serde_json::to_string(e) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            // H1: visible error — never silently drop events.
+                            serialization_failed_count.fetch_add(1, Ordering::Relaxed);
+                            error!(
+                                event_id = %e.event_id,
+                                "JsonlSink: serialization failed, event skipped: {err}"
+                            );
+                            String::new()
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                if lines.is_empty() {
+                    continue;
+                }
+                let lines = lines + "\n";
+
                 if let Err(e) = std::fs::create_dir_all(&partition_dir) {
                     return (handles_snapshot, Err(LogError::IoError(e)));
                 }

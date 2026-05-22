@@ -27,14 +27,16 @@ directories. `toon-mcp-bench` contributes 0 unit tests (benchmark binaries use
 
 | Layer                      | Location                                        | Style            | Count |
 | -------------------------- | ----------------------------------------------- | ---------------- | ----- |
-| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs`          | `#[test]`        | 17    |
+| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs`          | `#[test]`        | 20+ (incl. proptests) |
 | Format detector            | `crates/toon-mcp-core/src/detector.rs`          | `#[test]`        | 19    |
-| Shape classifier           | `crates/toon-mcp-core/src/classifier.rs`        | `#[test]`        | 12    |
+| Shape classifier           | `crates/toon-mcp-core/src/classifier.rs`        | `#[test]`        | 18+ (incl. proptests) |
 | Compressor pipeline        | `crates/toon-mcp-core/src/compressor.rs`        | `#[test]`        | 8     |
-| JSONL sink                 | `crates/toon-mcp-logging/src/jsonl_sink.rs`     | `#[tokio::test]` | 5     |
-| Tool handlers              | `crates/toon-mcp-server/src/handler.rs`         | `#[tokio::test]` | 15    |
+| JSONL sink                 | `crates/toon-mcp-logging/src/jsonl_sink.rs`     | `#[tokio::test]` | 12    |
+| Tool handlers              | `crates/toon-mcp-server/src/handler.rs`         | `#[tokio::test]` | 20+ (incl. permit-release, schema property tests, diagnostics aggregation) |
 | Config loading             | `crates/toon-mcp-server/src/config.rs`          | `#[test]`        | 10    |
-| MCP transport              | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 5     |
+| MCP transport              | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 10    |
+
+Workspace `cargo test --workspace` reports ~180 unit/integration tests plus 16 doc-tests; the per-row counts above are approximate and may lag the codebase between releases.
 
 Doc-tests in `toon-mcp-core` add a further 14 runnable examples.
 
@@ -66,13 +68,7 @@ runtime (`current_thread`, for deterministic measurement).
 
 ## Known Gaps
 
-### 1. Very large payload stress tests
-
-The byte-gate in `Compressor` (controlled by `TOON_MAX_INPUT_BYTES`) is not
-tested with payloads near the limit. A stress test that exercises the gate
-boundary would improve confidence.
-
-### 2. Malformed / truncated inputs
+### 1. Malformed / truncated inputs
 
 Truncated JSON mid-array or mid-object is not explicitly covered. The
 underlying `serde_json` error path is exercised but not the specific
@@ -89,7 +85,7 @@ instructions.
 
 ## Pre-Commit Gate
 
-Per `AGENTS.md`, the following command **must pass** before every commit:
+Per `CONTRIBUTING.md`, the following command **must pass** before every commit:
 
 ```bash
 cargo fmt && cargo clippy -- -D warnings && cargo test --workspace

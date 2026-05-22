@@ -55,7 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Toolchain pinned via rust-toolchain.toml (1.93.0). Keeping this in
+      # Toolchain pinned via rust-toolchain.toml. Keeping this in
       # sync with CI guarantees release artefacts are built by the same rustc
       # the workspace is verified against.
       - name: Install toolchain (pinned via rust-toolchain.toml)
@@ -126,6 +126,9 @@ jobs:
             echo "Toolchain mismatch: rust-toolchain.toml=$PINNED, active=$ACTIVE" >&2
             exit 1
           fi
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
 
       - name: Build release binary
         run: cargo build --release --package toon-mcp-server --target ${{ matrix.target }}

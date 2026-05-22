@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust **1.93.0** (set via `rust-toolchain.toml`; `rustup` picks this up automatically)
+- Rust **1.95.0** (set via `rust-toolchain.toml`; `rustup` picks this up automatically)
 - A working `cargo` installation
 
 ## Running the test suite
@@ -63,7 +63,7 @@ Pre-1.0 note: the project is currently at `0.1.x`. Until `1.0.0` is tagged, mino
 
 ## Compatibility Policy
 
-- Supported Rust: the exact toolchain pinned in `rust-toolchain.toml` (`1.93.0` at the time of writing).
+- Supported Rust: the exact toolchain pinned in `rust-toolchain.toml` (`1.95.0` at the time of writing).
 - Supported release artifacts: Linux GNU and macOS on `x86_64` and `aarch64`, matching `.github/workflows/release.yml`.
 - Supported MCP clients: stdio MCP clients that can launch a local binary and pass environment variables, including opencode and Claude Desktop.
 - API stability: before `1.0.0`, MCP tool schemas, public Rust APIs, and environment variable semantics may change in a minor release. Document breaking changes in `CHANGELOG.md`.

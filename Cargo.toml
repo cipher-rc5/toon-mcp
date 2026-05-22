@@ -18,7 +18,7 @@ keywords = ["mcp", "toon", "compression", "llm", "json"]
 license = "BUSL-1.1"
 readme = "README.md"
 repository = "https://github.com/cipher-rc5/toon-mcp"
-rust-version = "1.93.0"
+rust-version = "1.95.0"
 description = "MCP server that detects, classifies, and compresses structured data (JSON, JSONL, CSV, TSV) into the TOON format to reduce LLM context token consumption."
 
 [workspace.dependencies]
@@ -26,7 +26,7 @@ description = "MCP server that detects, classifies, and compresses structured da
 rmcp = { version = "=1.7.0", features = ["server", "transport-io", "macros", "schemars"] }
 
 # TOON
-toon-format = { version = "=0.4.5", default-features = false }
+toon-format = { version = "=0.4.6", default-features = false }
 
 # Serialization
 schemars = "=1.2.1"
