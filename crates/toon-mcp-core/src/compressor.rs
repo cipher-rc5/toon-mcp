@@ -69,6 +69,13 @@ impl Default for CompressConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PassThroughReason {
     /// Input byte length exceeded `max_input_bytes`.
+    ///
+    /// Produced by direct calls to [`Compressor::decide`]. The MCP server
+    /// handlers (`detect_format`, `compress_content`, `compression_stats`,
+    /// `toon_diagnostics`) intercept oversized inputs earlier and surface
+    /// them as a structured `invalid_params` MCP error containing
+    /// `input_exceeds_limit`; this variant is therefore observable only
+    /// through the library API, not through the wire protocol.
     InputExceedsLimit {
         /// Actual input byte count.
         actual: usize,

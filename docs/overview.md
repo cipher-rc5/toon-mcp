@@ -6,15 +6,16 @@
 
 ## What It Does
 
-toon-mcp exposes three tools to any MCP-compatible client:
+toon-mcp exposes four tools to any MCP-compatible client:
 
-| Tool                | Purpose                                                                                               |
-| ------------------- | ----------------------------------------------------------------------------------------------------- |
-| `detect_format`     | Identify whether input is JSON, JSONL, CSV, or TSV and return shape metadata                          |
-| `compression_stats` | Preview estimated savings without encoding — useful for deciding whether to compress                  |
-| `compress_content`  | Run the full compression pipeline and return the result (or the original if savings are insufficient) |
+| Tool                | Purpose                                                                                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `detect_format`     | Identify whether input is JSON, JSONL, CSV, or TSV and return shape metadata                                                                             |
+| `compression_stats` | Preview estimated savings without encoding — useful for deciding whether to compress                                                                     |
+| `compress_content`  | Run the full compression pipeline and return the result (or the original if savings are insufficient)                                                    |
+| `toon_diagnostics`  | Return runtime health counters: log-loss, writer failures, queue saturation, pipeline timeouts, request durations, and available concurrency permits     |
 
-All three tools are called over stdio JSON-RPC. The server is a single compiled binary, usable from any client that speaks MCP.
+All four tools are called over stdio JSON-RPC. The server is a single compiled binary, usable from any client that speaks MCP.
 
 ---
 

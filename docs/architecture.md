@@ -75,7 +75,7 @@ The runnable binary. Owns startup, configuration, and MCP protocol registration.
 | `main.rs`    | Tokio entry point: load config, construct sink, spawn background task, serve stdio       |
 | `config.rs`  | Parse `TOON_*` env vars into a typed `Config` struct                                     |
 | `server.rs`  | Register `ToonMcpServer` with `rmcp`, declare tool router, set server info               |
-| `handler.rs` | All three tool implementations: `detect_format`, `compress_content`, `compression_stats` |
+| `handler.rs` | All four tool implementations: `detect_format`, `compress_content`, `compression_stats`, `toon_diagnostics` |
 | `error.rs`   | `ServerError` for startup failures                                                       |
 
 ### `toon-mcp-bench`

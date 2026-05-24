@@ -132,8 +132,42 @@ jobs:
       - name: cargo deny check
         run: cargo deny check advisories bans licenses sources
 
-  fuzz-smoke:
-    name: Fuzz smoke
+  fuzz-smoke-pr:
+    name: Fuzz smoke (PR — 15s/target)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install nightly toolchain for cargo-fuzz
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@c070f87102a1c75b3183910f391c1cb887fe13c8 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run bounded fuzz smoke targets (PR budget)
+        working-directory: fuzz
+        run: |
+          mkdir -p artifacts
+          for target in detect_and_parse json_parse jsonl_parse csv_parse; do
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time=15 \
+              -rss_limit_mb=512 \
+              -artifact_prefix="artifacts/$target-"
+          done
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-pr
+          path: fuzz/artifacts
+
+  fuzz-smoke-extended:
+    name: Fuzz smoke (extended — 30s/target)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
@@ -148,7 +182,7 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Run bounded fuzz smoke targets
+      - name: Run bounded fuzz smoke targets (extended)
         working-directory: fuzz
         run: |
           mkdir -p artifacts
@@ -163,7 +197,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-extended
           path: fuzz/artifacts
 
   semver-checks:

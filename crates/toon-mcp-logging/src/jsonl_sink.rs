@@ -411,12 +411,13 @@ async fn flush_pending(
     }
 
     // Group events by UTC day to write to the correct partition.
-    // Build a lightweight (day, dir, owned events) triple so the heavy
-    // serialization work runs on the blocking pool, not the async executor.
+    // Drain the source vec into owned per-day buckets so the heavy
+    // serialization work runs on the blocking pool, not the async executor,
+    // without cloning every event.
     let mut by_day: HashMap<String, Vec<LogEvent>> = HashMap::new();
-    for event in pending.iter() {
+    for event in pending.drain(..) {
         let day = day_partition_key(event.ts_us);
-        by_day.entry(day).or_default().push(event.clone());
+        by_day.entry(day).or_default().push(event);
     }
 
     let mut day_events: Vec<(String, PathBuf, Vec<LogEvent>)> = Vec::with_capacity(by_day.len());
@@ -426,7 +427,6 @@ async fn flush_pending(
     }
 
     if day_events.is_empty() {
-        pending.clear();
         return Ok(());
     }
 
@@ -507,7 +507,6 @@ async fn flush_pending(
         set_last_error(last_error, err.to_string());
         return Err(err);
     }
-    pending.clear();
     Ok(())
 }
 
