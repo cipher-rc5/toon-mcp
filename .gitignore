@@ -167,3 +167,8 @@ _dev/
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/Cargo.lock
+
+# =============================================================================
+# Internal evaluation harness (not part of the published workspace)
+# =============================================================================
+/evals/
