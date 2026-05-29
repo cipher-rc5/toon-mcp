@@ -35,6 +35,9 @@ data/**
 .env
 .env.*
 !.env.example
+# Eval server config: the template is tracked; the real .env.eval is ignored
+# by the .env.* rule above (and by evals/.gitignore).
+!evals/.env.eval.example
 
 # =============================================================================
 # Editor and IDE
@@ -169,6 +172,9 @@ _dev/
 /fuzz/Cargo.lock
 
 # =============================================================================
-# Internal evaluation harness (not part of the published workspace)
+# Evaluation harness — source is tracked, but generated data stays private.
+# (evals/ is a standalone crate, not a member of the published workspace.)
 # =============================================================================
-/evals/
+/evals/results/
+/evals/target/
+/evals/Cargo.lock

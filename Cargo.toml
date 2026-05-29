@@ -6,6 +6,14 @@ members = [
   "crates/toon-mcp-logging",
   "crates/toon-mcp-server",
 ]
+# Standalone crates with their own toolchain / build requirements (nightly
+# cargo-fuzz instrumentation; the offline eval harness). Excluding them lets
+# ad-hoc `cargo` commands run from those directories without the parent
+# workspace claiming them.
+exclude = [
+  "fuzz",
+  "evals",
+]
 
 [workspace.package]
 version = "0.1.0"

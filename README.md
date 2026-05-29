@@ -81,15 +81,15 @@ The server binary is written to `./target/release/toon-mcp-server`.
 
 Download a binary for your platform from the [GitHub Releases page](https://github.com/cipher-rc5/toon-mcp/releases). Every release ships:
 
-| Asset                                                            | Notes                                                                 |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `toon-mcp-server-x86_64-unknown-linux-gnu`                       | Linux x86_64 (glibc 2.17 baseline)                                    |
-| `toon-mcp-server-aarch64-unknown-linux-gnu`                      | Linux aarch64 (glibc 2.17 baseline)                                   |
-| `toon-mcp-server-x86_64-apple-darwin`                            | macOS Intel                                                           |
-| `toon-mcp-server-aarch64-apple-darwin`                           | macOS Apple Silicon                                                   |
-| `toon-mcp-server-sbom.cdx.json`                                  | CycloneDX 1.4 software bill of materials                              |
-| `checksums.sha256`                                               | SHA256 over every asset                                               |
-| `*.sigstore.json`                                                | One Sigstore keyless signature bundle per asset                       |
+| Asset                                       | Notes                                           |
+| ------------------------------------------- | ----------------------------------------------- |
+| `toon-mcp-server-x86_64-unknown-linux-gnu`  | Linux x86_64 (glibc 2.17 baseline)              |
+| `toon-mcp-server-aarch64-unknown-linux-gnu` | Linux aarch64 (glibc 2.17 baseline)             |
+| `toon-mcp-server-x86_64-apple-darwin`       | macOS Intel                                     |
+| `toon-mcp-server-aarch64-apple-darwin`      | macOS Apple Silicon                             |
+| `toon-mcp-server-sbom.cdx.json`             | CycloneDX 1.4 software bill of materials        |
+| `checksums.sha256`                          | SHA256 over every asset                         |
+| `*.sigstore.json`                           | One Sigstore keyless signature bundle per asset |
 
 See [Releases & verification](#releases--verification) below for the recommended `cosign` flow.
 
@@ -159,11 +159,11 @@ claude mcp get toon
 
 Scope options:
 
-| Scope         | Stored in                  | Sharing                                            |
-| ------------- | -------------------------- | -------------------------------------------------- |
-| `-s user`     | `~/.claude.json`           | Available in every project for the OS user        |
-| `-s project`  | `.mcp.json` at the repo root | Can be committed and shared with teammates       |
-| `-s local`    | Local config (default)      | Only the current project + user                   |
+| Scope        | Stored in                    | Sharing                                    |
+| ------------ | ---------------------------- | ------------------------------------------ |
+| `-s user`    | `~/.claude.json`             | Available in every project for the OS user |
+| `-s project` | `.mcp.json` at the repo root | Can be committed and shared with teammates |
+| `-s local`   | Local config (default)       | Only the current project + user            |
 
 Notes:
 
@@ -246,15 +246,15 @@ Compress a structured payload into TOON format. If the input does not meet the c
 
 `pass_reason` is non-null when `compressed` is `false`:
 
-| `pass_reason`           | Meaning                                                                                                                                                |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `unknown_format`        | Input is not valid JSON, JSONL, CSV, or TSV.                                                                                                           |
-| `below_min_bytes`       | Input is smaller than `TOON_MIN_BYTES`.                                                                                                                |
-| `insufficient_savings`  | Encoding succeeded but savings were below `TOON_COMPRESSION_THRESHOLD`.                                                                                |
-| `shape_not_beneficial`  | Classifier judged the shape unlikely to compress well.                                                                                                 |
-| `parse_failed`          | The format was detected but parsing failed (truncation, invalid escape, etc.).                                                                         |
-| `encode_failed`         | The input parsed successfully but TOON encoding failed; the original input is returned unchanged.                                                      |
-| `input_exceeds_limit`   | Library-only outcome reachable through `Compressor::decide`. The MCP server intercepts oversized inputs earlier and returns an `invalid_params` error. |
+| `pass_reason`          | Meaning                                                                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `unknown_format`       | Input is not valid JSON, JSONL, CSV, or TSV.                                                                                                           |
+| `below_min_bytes`      | Input is smaller than `TOON_MIN_BYTES`.                                                                                                                |
+| `insufficient_savings` | Encoding succeeded but savings were below `TOON_COMPRESSION_THRESHOLD`.                                                                                |
+| `shape_not_beneficial` | Classifier judged the shape unlikely to compress well.                                                                                                 |
+| `parse_failed`         | The format was detected but parsing failed (truncation, invalid escape, etc.).                                                                         |
+| `encode_failed`        | The input parsed successfully but TOON encoding failed; the original input is returned unchanged.                                                      |
+| `input_exceeds_limit`  | Library-only outcome reachable through `Compressor::decide`. The MCP server intercepts oversized inputs earlier and returns an `invalid_params` error. |
 
 `detection_confidence` is `"certain"` for inputs validated by a full `serde_json` parse or for `unknown`, and `"heuristic"` for JSONL / CSV / TSV (which are probed without parsing the entire document). `detection_candidates` lists every format that matched, in detection-precedence order. `numeric_coercion_used` and `lossy_coercion_possible` are populated only for CSV / TSV inputs; see [Numeric coercion](#numeric-coercion-csv--tsv).
 
@@ -378,49 +378,49 @@ All configuration is via `TOON_*` environment variables, read once at startup. F
 
 ### Compression behaviour
 
-| Variable                     | Default     | Purpose                                                                                                                                      |
-| ---------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TOON_COMPRESSION_THRESHOLD` | `0.85`      | Maximum output-to-input byte ratio accepted as compressed. `0.85` means output must be ≤ 85 % of input (≥ 15 % savings).                     |
-| `TOON_MIN_BYTES`             | `256`       | Inputs below this byte count are passed through immediately.                                                                                 |
-| `TOON_MAX_INPUT_BYTES`       | `10485760`  | Hard upper bound (10 MiB by default). Larger inputs are rejected before parsing.                                                             |
-| `TOON_KEY_FOLDING`           | `true`      | Enable TOON key folding for deeply nested objects.                                                                                           |
-| `TOON_DELIMITER`             | `comma`     | TOON array delimiter: `comma`, `tab`, or `pipe`.                                                                                             |
-| `TOON_CSV_NUMERIC_COERCION`  | `true`      | Coerce numeric-looking CSV/TSV cells into JSON numbers. Set `false` for identifiers / leading-zero values.                                   |
+| Variable                     | Default    | Purpose                                                                                                                  |
+| ---------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `TOON_COMPRESSION_THRESHOLD` | `0.85`     | Maximum output-to-input byte ratio accepted as compressed. `0.85` means output must be ≤ 85 % of input (≥ 15 % savings). |
+| `TOON_MIN_BYTES`             | `256`      | Inputs below this byte count are passed through immediately.                                                             |
+| `TOON_MAX_INPUT_BYTES`       | `10485760` | Hard upper bound (10 MiB by default). Larger inputs are rejected before parsing.                                         |
+| `TOON_KEY_FOLDING`           | `true`     | Enable TOON key folding for deeply nested objects.                                                                       |
+| `TOON_DELIMITER`             | `comma`    | TOON array delimiter: `comma`, `tab`, or `pipe`.                                                                         |
+| `TOON_CSV_NUMERIC_COERCION`  | `true`     | Coerce numeric-looking CSV/TSV cells into JSON numbers. Set `false` for identifiers / leading-zero values.               |
 
 ### Classification thresholds
 
-| Variable                  | Default | Purpose                                                              |
-| ------------------------- | ------- | -------------------------------------------------------------------- |
-| `TOON_TABULAR_MIN_ROWS`   | `3`     | Minimum row count for an array to be classified as tabular.          |
-| `TOON_FOLD_MIN_DEPTH`     | `3`     | Minimum single-key chain depth to trigger fold-chain classification. |
-| `TOON_PRIMITIVE_ARRAY_MIN`| `5`     | Minimum element count for a primitive-array classification.          |
+| Variable                   | Default | Purpose                                                              |
+| -------------------------- | ------- | -------------------------------------------------------------------- |
+| `TOON_TABULAR_MIN_ROWS`    | `3`     | Minimum row count for an array to be classified as tabular.          |
+| `TOON_FOLD_MIN_DEPTH`      | `3`     | Minimum single-key chain depth to trigger fold-chain classification. |
+| `TOON_PRIMITIVE_ARRAY_MIN` | `5`     | Minimum element count for a primitive-array classification.          |
 
 ### Concurrency, timeouts, and admission control
 
-| Variable                    | Default | Purpose                                                                                                                                                                                   |
-| --------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TOON_PIPELINE_TIMEOUT_MS`  | `30000` | Per-call pipeline timeout in ms. Bounds permit wait + handler-visible blocking pipeline result. Timed-out blocking work may continue until the worker finishes.                           |
-| `TOON_MAX_CONCURRENT_CALLS` | `8`     | Maximum concurrent blocking pipeline calls. Additional calls wait up to `TOON_PIPELINE_TIMEOUT_MS` for a permit, then return `server busy`.                                              |
+| Variable                    | Default | Purpose                                                                                                                                                         |
+| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TOON_PIPELINE_TIMEOUT_MS`  | `30000` | Per-call pipeline timeout in ms. Bounds permit wait + handler-visible blocking pipeline result. Timed-out blocking work may continue until the worker finishes. |
+| `TOON_MAX_CONCURRENT_CALLS` | `8`     | Maximum concurrent blocking pipeline calls. Additional calls wait up to `TOON_PIPELINE_TIMEOUT_MS` for a permit, then return `server busy`.                     |
 
 ### Logging
 
-| Variable                       | Default     | Purpose                                                                                                                                                                                              |
-| ------------------------------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TOON_LOG_ENABLED`             | `true`      | Enable structured event logging.                                                                                                                                                                     |
-| `TOON_LOG_DIR`                 | `data/logs` | Directory for JSONL log partitions. **Use an absolute path** when launched under Claude Desktop or a process supervisor with an unpredictable working directory.                                     |
-| `TOON_LOG_BUFFER_SIZE`         | `1000`      | Events buffered before a forced flush. Doubles as the writer-task channel capacity for backpressure accounting.                                                                                       |
-| `TOON_LOG_FLUSH_INTERVAL_SECS` | `300`       | Periodic flush interval.                                                                                                                                                                             |
-| `TOON_LOG_LEVEL`               | `info`      | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`).                                                                                                                                       |
-| `TOON_CLIENT_HINT`             | _(none)_    | Arbitrary label attached to every log event — useful for splitting metrics by calling client.                                                                                                        |
-| `TOON_CONFIG_STRICT`           | `false`     | If `true`, unparseable env values cause startup to fail. The default is to log a warning and fall back to the documented default.                                                                    |
+| Variable                       | Default     | Purpose                                                                                                                                                          |
+| ------------------------------ | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TOON_LOG_ENABLED`             | `true`      | Enable structured event logging.                                                                                                                                 |
+| `TOON_LOG_DIR`                 | `data/logs` | Directory for JSONL log partitions. **Use an absolute path** when launched under Claude Desktop or a process supervisor with an unpredictable working directory. |
+| `TOON_LOG_BUFFER_SIZE`         | `1000`      | Events buffered before a forced flush. Doubles as the writer-task channel capacity for backpressure accounting.                                                  |
+| `TOON_LOG_FLUSH_INTERVAL_SECS` | `300`       | Periodic flush interval.                                                                                                                                         |
+| `TOON_LOG_LEVEL`               | `info`      | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`).                                                                                                   |
+| `TOON_CLIENT_HINT`             | _(none)_    | Arbitrary label attached to every log event — useful for splitting metrics by calling client.                                                                    |
+| `TOON_CONFIG_STRICT`           | `false`     | If `true`, unparseable env values cause startup to fail. The default is to log a warning and fall back to the documented default.                                |
 
 ### Recommended starting points by host
 
-| Host                                   | Suggested overrides                                                              |
-| -------------------------------------- | -------------------------------------------------------------------------------- |
-| 1–2 vCPU laptop / VM                   | `TOON_MAX_INPUT_BYTES=1048576`, `TOON_MAX_CONCURRENT_CALLS=2`, `TOON_PIPELINE_TIMEOUT_MS=10000` |
-| Normal developer workstation           | All defaults                                                                     |
-| Dedicated multi-core host              | Raise `TOON_MAX_CONCURRENT_CALLS` only after observing sustained `server busy` errors with CPU/RSS headroom |
+| Host                         | Suggested overrides                                                                                         |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 1–2 vCPU laptop / VM         | `TOON_MAX_INPUT_BYTES=1048576`, `TOON_MAX_CONCURRENT_CALLS=2`, `TOON_PIPELINE_TIMEOUT_MS=10000`             |
+| Normal developer workstation | All defaults                                                                                                |
+| Dedicated multi-core host    | Raise `TOON_MAX_CONCURRENT_CALLS` only after observing sustained `server busy` errors with CPU/RSS headroom |
 
 See [docs/production.md](docs/production.md), [docs/deployment.md](docs/deployment.md), and [docs/runbook.md](docs/runbook.md) for deployment, sizing, retention, and troubleshooting guidance.
 
@@ -541,6 +541,22 @@ CI runs this same triple plus:
 - `cargo-llvm-cov` line coverage gate (currently **75 %**)
 - `cargo-semver-checks` against library crates when their sources change
 - `cargo-fuzz` smoke (15 s per target) on every PR; 30 s per target on schedule / dispatch
+- build + lint of the standalone `evals/` harness (`just eval-build`, plus its own `fmt` / `clippy`)
+
+### Task runner
+
+Common commands are wrapped in a [`justfile`](justfile); run `just` to list recipes (`just build`, `just test`, `just lint`, and the `just eval-*` family below). They wrap the `cargo` commands above and are optional.
+
+### Evaluation harness
+
+`evals/` is an offline harness that measures compression **quality** (distinct from the latency benchmarks in `toon-mcp-bench`): token savings under a real model tokenizer, encode→decode round-trip fidelity, classifier accuracy, and JSON-vs-TOON comprehension parity. It is a standalone crate — its own cargo workspace, **not** a root-workspace member — so `--workspace` commands never build it.
+
+```bash
+just eval-build          # build only (also gated in CI)
+just eval-all            # generate → score → comprehension → report
+```
+
+The generate and comprehension stages need a local OpenAI-compatible `llama-server` (start one with `just serve`, configured via `evals/.env.eval`); the scoring and report stages do not. Generated corpora and reports are written to `evals/results/` and are gitignored — only the harness source is tracked. See [`evals/README.md`](evals/README.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow, branch model, and semver policy.
 
@@ -571,20 +587,20 @@ cosign verify-blob \
 
 ## Documentation
 
-| Document                                       | Contents                                                                                |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------- |
-| [docs/overview.md](docs/overview.md)           | What the server does and why it exists                                                  |
-| [docs/architecture.md](docs/architecture.md)   | Crate dependency graph, data flow, layer rules, design rationale                        |
-| [docs/algorithms.md](docs/algorithms.md)       | Format detection, shape classification, and TOON encoding algorithms                    |
-| [docs/configuration.md](docs/configuration.md) | Full configuration reference with tuning guidance                                       |
-| [docs/logging.md](docs/logging.md)             | `LogSink` trait, `LogEvent` schema, on-disk layout, and example queries                 |
-| [docs/runbook.md](docs/runbook.md)             | Operator runbook: diagnostics and remediation for production incidents                  |
-| [docs/production.md](docs/production.md)       | Production readiness, sizing, durability, known non-goals                               |
-| [docs/deployment.md](docs/deployment.md)       | Release-binary deployment examples (systemd, launchd, Claude Desktop) + verification    |
-| [docs/testing.md](docs/testing.md)             | Existing test suite, gaps, and how to add new tests                                     |
-| [docs/adr/](docs/adr/)                         | Architecture Decision Records                                                           |
-| [CHANGELOG.md](CHANGELOG.md)                   | Release history and the in-progress `[Unreleased]` section                              |
-| [SECURITY.md](.github/SECURITY.md)             | Vulnerability reporting policy and supported versions                                   |
+| Document                                       | Contents                                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [docs/overview.md](docs/overview.md)           | What the server does and why it exists                                               |
+| [docs/architecture.md](docs/architecture.md)   | Crate dependency graph, data flow, layer rules, design rationale                     |
+| [docs/algorithms.md](docs/algorithms.md)       | Format detection, shape classification, and TOON encoding algorithms                 |
+| [docs/configuration.md](docs/configuration.md) | Full configuration reference with tuning guidance                                    |
+| [docs/logging.md](docs/logging.md)             | `LogSink` trait, `LogEvent` schema, on-disk layout, and example queries              |
+| [docs/runbook.md](docs/runbook.md)             | Operator runbook: diagnostics and remediation for production incidents               |
+| [docs/production.md](docs/production.md)       | Production readiness, sizing, durability, known non-goals                            |
+| [docs/deployment.md](docs/deployment.md)       | Release-binary deployment examples (systemd, launchd, Claude Desktop) + verification |
+| [docs/testing.md](docs/testing.md)             | Existing test suite, gaps, and how to add new tests                                  |
+| [docs/adr/](docs/adr/)                         | Architecture Decision Records                                                        |
+| [CHANGELOG.md](CHANGELOG.md)                   | Release history and the in-progress `[Unreleased]` section                           |
+| [SECURITY.md](.github/SECURITY.md)             | Vulnerability reporting policy and supported versions                                |
 
 ---
 

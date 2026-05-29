@@ -1,0 +1,27 @@
+# Standalone, decoupled from the parent workspace (empty [workspace] table makes
+# this its own workspace root). Intentionally NOT a member of the root
+# Cargo.toml; the source is tracked, but generated data under results/ is
+# gitignored. See README.md.
+[workspace]
+
+[package]
+name = "toon-evals"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Internal evaluation harness for toon-mcp compression quality (token savings, fidelity, comprehension parity, classification)."
+
+[[bin]]
+name = "toon-evals"
+path = "src/main.rs"
+
+[dependencies]
+toon-mcp-core = { path = "../crates/toon-mcp-core" }
+toon-format = { version = "=0.5.0", default-features = false }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+ureq = { version = "=3.3.0", features = ["json"] }
+anyhow = "=1.0.102"
+
+[profile.release]
+opt-level = 2

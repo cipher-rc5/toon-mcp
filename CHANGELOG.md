@@ -54,6 +54,17 @@ Each release header records the date (UTC) the tag was published.
 - `CHANGELOG.md`, `SECURITY.md`, and GitHub issue templates.
 - Line-coverage gate measured by `cargo-llvm-cov`. The floor was raised
   from 70 % to 75 % once non-trivial coverage was confirmed in CI.
+- `evals/` — an offline compression-**quality** harness (token savings under
+  a real model tokenizer, encode→decode round-trip fidelity, classifier
+  accuracy, and JSON-vs-TOON comprehension parity). It is a standalone cargo
+  workspace, intentionally not a member of the root workspace; generated data
+  under `evals/results/` is gitignored.
+- `justfile` task runner wrapping common workflows (`just build` / `test` /
+  `lint`) and the evaluation harness (`just eval-build`, `eval-generate`,
+  `eval-pipeline`, `eval-comprehend`, `eval-report`, `eval-all`).
+- CI job `evals` that builds and lints the standalone harness (`just
+  eval-build` plus `fmt` / `clippy`) on every push and PR; it does not run the
+  harness, which requires a local model server.
 
 ### Changed
 

@@ -37,12 +37,21 @@ Apply formatting in place with:
 cargo fmt
 ```
 
+## Task runner
+
+Common workflows are wrapped in a [`justfile`](justfile). Run `just` to list every recipe. Highlights:
+
+- `just build` / `just test` / `just lint` — release build, the full test suite, and the canonical `fmt` + `clippy` gate for the published workspace.
+- `just eval-*` — drive the evaluation harness (see [Evaluation harness](#evaluation-harness)).
+
+The recipes are thin wrappers around the `cargo` commands documented here; using them is optional.
+
 ## Branch and PR model
 
 - Work against `master`. Branch off `master` for every change.
 - Branch names: `feat/<short-description>`, `fix/<short-description>`, `chore/<short-description>`.
 - Open a pull request against `master`. CI also runs on `main` while both branch names exist, but `master` is the active development branch.
-- All CI checks (fmt, clippy, test, doc, audit, semver where applicable, coverage >= 75%) must pass before merge.
+- All CI checks (fmt, clippy, test, doc, audit, cargo-deny, semver where applicable, coverage >= 75%, fuzz smoke, and the standalone evals-harness build) must pass before merge.
 - Squash-merge is preferred to keep the history linear.
 - Update `CHANGELOG.md` under `[Unreleased]` as part of the PR.
 
@@ -81,8 +90,10 @@ Dependabot opens weekly PRs for patch-level updates; review and merge them promp
 ## Fuzz Testing
 
 The `fuzz/` directory contains a `cargo-fuzz` harness for the parser surface
-(JSON, JSONL, CSV/TSV, and the format-detection entry point). Fuzzing requires
-the nightly Rust toolchain and is not part of CI.
+(JSON, JSONL, CSV/TSV, and the format-detection entry point). It requires the
+nightly Rust toolchain. CI runs a **bounded fuzz smoke** (15 s per target on
+PRs, 30 s on schedule / dispatch); the commands below are for longer local
+runs.
 
 ```bash
 # One-time setup
@@ -106,3 +117,27 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<id>
 
 Please report any reproducible crash as a security advisory (see SECURITY.md)
 before opening a public issue.
+
+## Evaluation harness
+
+`evals/` contains an offline harness that measures compression _quality_ (as
+opposed to the latency that `toon-mcp-bench` measures): token savings under a
+real model tokenizer, encode→decode round-trip fidelity, classifier accuracy,
+and JSON-vs-TOON comprehension parity.
+
+It is a **standalone crate with its own cargo workspace** and is deliberately
+**not** a member of the root workspace, so `cargo … --workspace` commands never
+touch it. Build it on its own:
+
+```bash
+just eval-build
+# or: cd evals && cargo build --release
+```
+
+The data-generating and comprehension stages drive a local, OpenAI-compatible
+`llama-server`; the deterministic stages (pipeline scoring, report) do not.
+Generated corpora and reports land under `evals/results/` and are **gitignored**
+— only the harness source is tracked. CI builds and lints the harness on every
+push / PR (`just eval-build` plus `fmt` and `clippy`) but does not run it, since
+no model is available in CI. See [`evals/README.md`](evals/README.md) for the
+full workflow and the `llama-server` invocation.

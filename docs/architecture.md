@@ -70,13 +70,13 @@ Async event recording. Decoupled from the core pipeline via the `LogSink` trait 
 
 The runnable binary. Owns startup, configuration, and MCP protocol registration.
 
-| Module       | Role                                                                                     |
-| ------------ | ---------------------------------------------------------------------------------------- |
-| `main.rs`    | Tokio entry point: load config, construct sink, spawn background task, serve stdio       |
-| `config.rs`  | Parse `TOON_*` env vars into a typed `Config` struct                                     |
-| `server.rs`  | Register `ToonMcpServer` with `rmcp`, declare tool router, set server info               |
+| Module       | Role                                                                                                        |
+| ------------ | ----------------------------------------------------------------------------------------------------------- |
+| `main.rs`    | Tokio entry point: load config, construct sink, spawn background task, serve stdio                          |
+| `config.rs`  | Parse `TOON_*` env vars into a typed `Config` struct                                                        |
+| `server.rs`  | Register `ToonMcpServer` with `rmcp`, declare tool router, set server info                                  |
 | `handler.rs` | All four tool implementations: `detect_format`, `compress_content`, `compression_stats`, `toon_diagnostics` |
-| `error.rs`   | `ServerError` for startup failures                                                       |
+| `error.rs`   | `ServerError` for startup failures                                                                          |
 
 ### `toon-mcp-bench`
 
@@ -90,6 +90,12 @@ Criterion benchmark suite. Four benchmark binaries:
 | `jsonl_sink.rs`     | Async logging sink: channel throughput, flush latency | `tokio` `current_thread` |
 
 The three sync core benches depend only on `toon-mcp-core` and MUST NOT start a tokio runtime. The dedicated `jsonl_sink.rs` async bench depends on `toon-mcp-logging` and is the only place a tokio runtime is permitted in this crate — it exists to measure async-specific behaviour (channel throughput, flush latency) that cannot be measured synchronously. The bench crate never depends on `toon-mcp-server`. The async-benches exception is documented in [ADR-0001](adr/0001-async-benches.md).
+
+### `evals/` (standalone, not a workspace member)
+
+`evals/` is an offline harness that measures compression **quality** — token savings (via a local model's tokenizer), encode→decode round-trip fidelity, classifier accuracy, and JSON-vs-TOON comprehension parity. Unlike `toon-mcp-bench` (latency), it answers "is the compression worth it and lossless?".
+
+It is its **own cargo workspace** and is deliberately excluded from the root workspace, so the crate-boundary rules above do not constrain it and `cargo … --workspace` never compiles it. It depends on `toon-mcp-core` (by path) and `toon-format`, and shells out to a local OpenAI-compatible `llama-server` for the data-generation and comprehension stages. Generated data under `evals/results/` is gitignored; only the source is tracked. CI builds and lints it (`just eval-build`) but does not run it. See [testing.md](testing.md#evaluation-harness).
 
 ---
 

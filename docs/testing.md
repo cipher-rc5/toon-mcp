@@ -25,16 +25,16 @@ All tests are inline `#[cfg(test)]` modules — there are no separate `tests/`
 directories. `toon-mcp-bench` contributes 0 unit tests (benchmark binaries use
 `harness = false` and only run via `cargo bench`, not `cargo test`).
 
-| Layer                      | Location                                        | Style            | Count |
-| -------------------------- | ----------------------------------------------- | ---------------- | ----- |
-| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs`          | `#[test]`        | 20+ (incl. proptests) |
-| Format detector            | `crates/toon-mcp-core/src/detector.rs`          | `#[test]`        | 19    |
-| Shape classifier           | `crates/toon-mcp-core/src/classifier.rs`        | `#[test]`        | 18+ (incl. proptests) |
-| Compressor pipeline        | `crates/toon-mcp-core/src/compressor.rs`        | `#[test]`        | 8     |
-| JSONL sink                 | `crates/toon-mcp-logging/src/jsonl_sink.rs`     | `#[tokio::test]` | 12    |
+| Layer                      | Location                                        | Style            | Count                                                                      |
+| -------------------------- | ----------------------------------------------- | ---------------- | -------------------------------------------------------------------------- |
+| Parsers (JSON, JSONL, CSV) | `crates/toon-mcp-core/src/parser/*.rs`          | `#[test]`        | 20+ (incl. proptests)                                                      |
+| Format detector            | `crates/toon-mcp-core/src/detector.rs`          | `#[test]`        | 19                                                                         |
+| Shape classifier           | `crates/toon-mcp-core/src/classifier.rs`        | `#[test]`        | 18+ (incl. proptests)                                                      |
+| Compressor pipeline        | `crates/toon-mcp-core/src/compressor.rs`        | `#[test]`        | 8                                                                          |
+| JSONL sink                 | `crates/toon-mcp-logging/src/jsonl_sink.rs`     | `#[tokio::test]` | 12                                                                         |
 | Tool handlers              | `crates/toon-mcp-server/src/handler.rs`         | `#[tokio::test]` | 20+ (incl. permit-release, schema property tests, diagnostics aggregation) |
-| Config loading             | `crates/toon-mcp-server/src/config.rs`          | `#[test]`        | 10    |
-| MCP transport              | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 10    |
+| Config loading             | `crates/toon-mcp-server/src/config.rs`          | `#[test]`        | 10                                                                         |
+| MCP transport              | `crates/toon-mcp-server/tests/mcp_transport.rs` | `#[tokio::test]` | 10                                                                         |
 
 Workspace `cargo test --workspace` reports ~180 unit/integration tests plus 16 doc-tests; the per-row counts above are approximate and may lag the codebase between releases.
 
@@ -66,6 +66,36 @@ runtime (`current_thread`, for deterministic measurement).
 
 ---
 
+## Evaluation harness
+
+Where `toon-mcp-bench` measures _latency_, the `evals/` harness measures
+compression **quality** end-to-end:
+
+| Axis                    | What it checks                                                            |
+| ----------------------- | ------------------------------------------------------------------------- |
+| Token savings           | Original vs TOON token counts under a real model tokenizer (`/tokenize`)  |
+| Round-trip fidelity     | `parse → encode → decode` reproduces the parsed value (path-expansion on) |
+| Classification accuracy | Classifier shape vs the shape the generator intended                      |
+| Comprehension parity    | Model answer accuracy on the same questions over JSON vs TOON             |
+
+`evals/` is a **standalone crate with its own cargo workspace** — it is _not_ a
+member of the root workspace and is never built by `cargo … --workspace`. Build
+and lint it on its own:
+
+```bash
+just eval-build
+# or: cd evals && cargo build --release
+```
+
+The data-generation and comprehension stages drive a local, OpenAI-compatible
+`llama-server`; the pipeline-scoring and report stages are deterministic and run
+without one. CI builds and lints the harness (`just eval-build`, plus its own
+`fmt` / `clippy`) on every push / PR but does **not** run it, since no model is
+available in CI. Generated corpora and reports under `evals/results/` are
+gitignored. See [`evals/README.md`](../evals/README.md) for the full workflow.
+
+---
+
 ## Known Gaps
 
 ### 1. Malformed / truncated inputs
@@ -76,8 +106,10 @@ truncation case.
 
 A `cargo-fuzz` harness exists in `fuzz/` that targets the four
 untrusted-input entry points (`FormatDetector::detect_and_parse`,
-`JsonParser::parse`, `JsonlParser::parse`, and `CsvParser::parse`). Fuzzing
-is not part of CI and requires the nightly toolchain plus `cargo-fuzz`. See
+`JsonParser::parse`, `JsonlParser::parse`, and `CsvParser::parse`). It
+requires the nightly toolchain plus `cargo-fuzz`. CI runs a **bounded fuzz
+smoke** (15 s per target on PRs, 30 s on schedule / dispatch); longer
+campaigns are run manually. See
 [CONTRIBUTING.md](../CONTRIBUTING.md#fuzz-testing) for setup and run
 instructions.
 

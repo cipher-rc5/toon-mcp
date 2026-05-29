@@ -8,12 +8,12 @@
 
 toon-mcp exposes four tools to any MCP-compatible client:
 
-| Tool                | Purpose                                                                                                                                                  |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `detect_format`     | Identify whether input is JSON, JSONL, CSV, or TSV and return shape metadata                                                                             |
-| `compression_stats` | Preview estimated savings without encoding — useful for deciding whether to compress                                                                     |
-| `compress_content`  | Run the full compression pipeline and return the result (or the original if savings are insufficient)                                                    |
-| `toon_diagnostics`  | Return runtime health counters: log-loss, writer failures, queue saturation, pipeline timeouts, request durations, and available concurrency permits     |
+| Tool                | Purpose                                                                                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `detect_format`     | Identify whether input is JSON, JSONL, CSV, or TSV and return shape metadata                                                                         |
+| `compression_stats` | Preview estimated savings without encoding — useful for deciding whether to compress                                                                 |
+| `compress_content`  | Run the full compression pipeline and return the result (or the original if savings are insufficient)                                                |
+| `toon_diagnostics`  | Return runtime health counters: log-loss, writer failures, queue saturation, pipeline timeouts, request durations, and available concurrency permits |
 
 All four tools are called over stdio JSON-RPC. The server is a single compiled binary, usable from any client that speaks MCP.
 
@@ -57,6 +57,11 @@ toon-mcp-server  (binary, MCP wiring, tool handlers)
 toon-mcp-bench   (Criterion benchmarks; sync benches depend on toon-mcp-core,
                   async benches additionally on toon-mcp-logging)
 ```
+
+A fifth crate, `evals/`, is an offline compression-quality harness. It is a
+**standalone cargo workspace and is intentionally not a member of the root
+workspace**, so it never affects `cargo … --workspace` builds, the published
+crates, or the dependency graph above. See [testing.md](testing.md#evaluation-harness).
 
 Key architectural decisions:
 
