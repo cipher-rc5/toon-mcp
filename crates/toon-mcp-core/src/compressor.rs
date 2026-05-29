@@ -17,6 +17,12 @@ use toon_format::types::KeyFoldingMode;
 use toon_format::{Delimiter, EncodeOptions};
 
 /// Configuration for the compressor.
+///
+/// This struct is `#[non_exhaustive]`: construct it from
+/// [`CompressConfig::default()`] and mutate the fields you need. Adding a
+/// field in a future release is therefore not a source-breaking change for
+/// downstream callers.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CompressConfig {
     /// Maximum output-to-input byte ratio accepted as "compressed".
@@ -102,6 +108,16 @@ pub enum PassThroughReason {
         /// Human-readable description of the failure.
         detail: String,
     },
+    /// The input parsed successfully but TOON encoding failed.
+    ///
+    /// Distinct from [`PassThroughReason::ParseFailed`] so callers can tell a
+    /// malformed input apart from a value that parsed but could not be encoded.
+    EncodeFailed {
+        /// The detected input format.
+        format: InputFormat,
+        /// Human-readable description of the encode failure.
+        detail: String,
+    },
 }
 
 impl PassThroughReason {
@@ -127,6 +143,7 @@ impl PassThroughReason {
             PassThroughReason::InsufficientSavings { .. } => "insufficient_savings",
             PassThroughReason::ShapeNotBeneficial => "shape_not_beneficial",
             PassThroughReason::ParseFailed { .. } => "parse_failed",
+            PassThroughReason::EncodeFailed { .. } => "encode_failed",
         }
     }
 }
@@ -207,7 +224,8 @@ impl Compressor {
     ///
     /// // Oversized input is rejected before any allocation.
     /// let huge = "x".repeat(1000);
-    /// let tiny_limit = CompressConfig { max_input_bytes: 10, ..CompressConfig::default() };
+    /// let mut tiny_limit = CompressConfig::default();
+    /// tiny_limit.max_input_bytes = 10;
     /// assert!(matches!(
     ///     Compressor::decide(&huge, &tiny_limit),
     ///     CompressDecision::PassedThrough { reason: PassThroughReason::InputExceedsLimit { .. }, .. }
@@ -310,7 +328,7 @@ impl Compressor {
             Ok(s) => s,
             Err(e) => {
                 return CompressDecision::PassedThrough {
-                    reason: PassThroughReason::ParseFailed {
+                    reason: PassThroughReason::EncodeFailed {
                         format: fmt,
                         detail: e.to_string(),
                     },

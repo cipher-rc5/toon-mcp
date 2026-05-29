@@ -17,10 +17,9 @@ fn load_fixture(name: &str) -> String {
 /// Default benchmark config with a permissive max_output_ratio so all
 /// compressible inputs go through the full encode path.
 fn bench_config() -> CompressConfig {
-    CompressConfig {
-        max_output_ratio: 0.99,
-        ..CompressConfig::default()
-    }
+    let mut cfg = CompressConfig::default();
+    cfg.max_output_ratio = 0.99;
+    cfg
 }
 
 fn bench_pipeline(c: &mut Criterion) {

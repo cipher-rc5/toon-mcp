@@ -25,9 +25,7 @@ pub mod error;
 /// Format-specific parser implementations.
 pub mod parser;
 
-pub use classifier::{
-    Classifier, ClassifyConfig, FOLD_MIN_DEPTH, PRIMITIVE_ARRAY_MIN, ShapeClass, TABULAR_MIN_ROWS,
-};
+pub use classifier::{Classifier, ClassifyConfig, ShapeClass};
 pub use compressor::{
     CompressConfig, CompressDecision, Compressor, DEFAULT_MAX_INPUT_BYTES, PassThroughReason,
 };

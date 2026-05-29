@@ -253,6 +253,7 @@ Compress a structured payload into TOON format. If the input does not meet the c
 | `insufficient_savings`  | Encoding succeeded but savings were below `TOON_COMPRESSION_THRESHOLD`.                                                                                |
 | `shape_not_beneficial`  | Classifier judged the shape unlikely to compress well.                                                                                                 |
 | `parse_failed`          | The format was detected but parsing failed (truncation, invalid escape, etc.).                                                                         |
+| `encode_failed`         | The input parsed successfully but TOON encoding failed; the original input is returned unchanged.                                                      |
 | `input_exceeds_limit`   | Library-only outcome reachable through `Compressor::decide`. The MCP server intercepts oversized inputs earlier and returns an `invalid_params` error. |
 
 `detection_confidence` is `"certain"` for inputs validated by a full `serde_json` parse or for `unknown`, and `"heuristic"` for JSONL / CSV / TSV (which are probed without parsing the entire document). `detection_candidates` lists every format that matched, in detection-precedence order. `numeric_coercion_used` and `lossy_coercion_possible` are populated only for CSV / TSV inputs; see [Numeric coercion](#numeric-coercion-csv--tsv).

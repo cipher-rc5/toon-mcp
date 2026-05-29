@@ -7,7 +7,10 @@ use crate::{detector::InputFormat, error::CoreError, parser::Parser};
 /// element per non-empty line.
 ///
 /// Each line is parsed independently. If any line fails to parse, a
-/// `CoreError::ParseFailed` is returned with the zero-based line index.
+/// `CoreError::ParseFailed` is returned with the 1-based *physical* line
+/// number of the offending line (counting blank/whitespace-only lines, which
+/// are otherwise skipped). This matches the line numbers a user sees in an
+/// editor when debugging the input.
 ///
 /// The resulting `Value::Array` preserves the stream-of-uniform-objects signal
 /// that the classifier uses for Tabular shape detection.
@@ -40,7 +43,8 @@ impl Parser for JsonlParser {
             let v: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| CoreError::ParseFailed {
                     format: InputFormat::Jsonl,
-                    line: idx,
+                    // 1-based physical line number (see module doc comment).
+                    line: idx + 1,
                     detail: e.to_string(),
                 })?;
             values.push(v);
@@ -89,7 +93,26 @@ not json
         match err {
             CoreError::ParseFailed { format, line, .. } => {
                 assert_eq!(format, InputFormat::Jsonl);
-                assert_eq!(line, 1);
+                // `not json` is the 2nd physical line (1-based).
+                assert_eq!(line, 2);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn malformed_line_after_blank_lines_reports_physical_line() {
+        // Two leading blank lines (skipped at parse time) precede the bad line.
+        // The reported `line` must be the 1-based *physical* line number (4),
+        // matching what a user sees in an editor — not the count of parsed
+        // records (which would be 1).
+        let input = "\n\n{\"id\":1}\nnot json";
+        let p = JsonlParser;
+        let err = p.parse(input).unwrap_err();
+        match err {
+            CoreError::ParseFailed { format, line, .. } => {
+                assert_eq!(format, InputFormat::Jsonl);
+                assert_eq!(line, 4);
             }
             other => panic!("unexpected error: {other}"),
         }

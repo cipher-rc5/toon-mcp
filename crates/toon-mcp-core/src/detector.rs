@@ -140,6 +140,11 @@ impl FormatDetector {
     /// ```
     pub fn jsonl_line_count(fmt: InputFormat, input: &str) -> Option<usize> {
         if fmt == InputFormat::Jsonl {
+            // Single efficient pass over the input. This re-scans lines the
+            // detector already iterated during `detect_with_metadata`; that
+            // caller-side double-scan is a known, accepted tradeoff because
+            // eliminating it would require threading a count through the public
+            // detection API, which we intentionally keep stable.
             Some(input.lines().filter(|l| !l.trim().is_empty()).count())
         } else {
             None

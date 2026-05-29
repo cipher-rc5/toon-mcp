@@ -65,22 +65,69 @@ async fn main() -> Result<(), ServerError> {
     #[cfg(unix)]
     let shutdown_signal = async {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("SIGTERM handler registration is valid");
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("SIGINT handler registration is valid");
+        // Register each handler gracefully: if registration fails, log a
+        // structured error and treat that signal source as never-firing so the
+        // server still runs and shuts down on stdin close instead of panicking.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    signal = "SIGTERM",
+                    "failed to register signal handler; shutdown via this signal disabled"
+                );
+                None
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    signal = "SIGINT",
+                    "failed to register signal handler; shutdown via this signal disabled"
+                );
+                None
+            }
+        };
+        // A `None` stream parks forever via `pending`, so only successfully
+        // registered handlers can resolve the `select!`.
+        let sigterm_fut = async {
+            match sigterm.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let sigint_fut = async {
+            match sigint.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
-            _ = sigterm.recv() => { info!("received SIGTERM"); }
-            _ = sigint.recv()  => { info!("received SIGINT");  }
+            _ = sigterm_fut => { info!("received SIGTERM"); }
+            _ = sigint_fut  => { info!("received SIGINT");  }
         }
     };
 
     #[cfg(not(unix))]
     let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("ctrl_c handler registration is valid");
-        info!("received Ctrl-C");
+        // If ctrl_c handler registration fails, log a structured error and park
+        // forever so shutdown still works via stdin close instead of panicking.
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("received Ctrl-C"),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "failed to register Ctrl-C handler; shutdown via Ctrl-C disabled"
+                );
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     tokio::select! {
@@ -164,7 +211,14 @@ pub(crate) async fn supervise_writer_task(
 
 /// Initialise the tracing subscriber with the given filter string.
 fn init_tracing(log_level: &str) {
-    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    // A malformed filter directive must not silently degrade to "info" — emit a
+    // visible warning so operators notice the misconfiguration. This runs before
+    // the tracing subscriber is installed, so `tracing::warn!` would be a no-op;
+    // write to stderr directly (the project logs to stderr only, never stdout).
+    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| {
+        eprintln!("warning: invalid log-filter directive {log_level:?}; falling back to \"info\"");
+        EnvFilter::new("info")
+    });
 
     fmt()
         .with_env_filter(filter)

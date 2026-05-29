@@ -1,9 +1,37 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "azure": {
+      "npm": "@ai-sdk/openai",
+      "name": "Azure OpenAI",
+      "options": {
+        "apiKey": "{env:AZURE_COGNITIVE_SERVICES_API_KEY}",
+        "baseURL": "https://c0217-mow3o9wg-eastus2.cognitiveservices.azure.com/openai/v1",
+        "headers": {
+          "api-key": "{env:AZURE_COGNITIVE_SERVICES_API_KEY}"
+        },
+        "defaultQuery": {
+          "api-version": "preview"
+        }
+      },
+      "models": {
+        "gpt-5.5": {
+          "name": "Azure GPT-5.5",
+          "limit": {
+            "context": 400000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "model": "azure/gpt-5.5",
   "mcp": {
     "toon": {
       "type": "local",
-      "command": ["./target/release/toon-mcp-server"],
+      "command": [
+        "./target/release/toon-mcp-server"
+      ],
       "enabled": true,
       "environment": {
         "TOON_COMPRESSION_THRESHOLD": "0.85",

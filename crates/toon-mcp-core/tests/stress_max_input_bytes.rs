@@ -69,14 +69,14 @@ fn build_csv_of_exact_size(target_bytes: usize, delim: char) -> String {
 }
 
 fn limit_config(limit: usize) -> CompressConfig {
-    CompressConfig {
-        max_input_bytes: limit,
-        // Keep min_bytes well below the test sizes so the lower gate doesn't fire.
-        min_bytes: 16,
-        // Permissive savings threshold so well-formed inputs compress.
-        max_output_ratio: 0.99,
-        ..CompressConfig::default()
-    }
+    // `CompressConfig` is `#[non_exhaustive]`; build from default and mutate.
+    let mut cfg = CompressConfig::default();
+    cfg.max_input_bytes = limit;
+    // Keep min_bytes well below the test sizes so the lower gate doesn't fire.
+    cfg.min_bytes = 16;
+    // Permissive savings threshold so well-formed inputs compress.
+    cfg.max_output_ratio = 0.99;
+    cfg
 }
 
 const LIMIT: usize = 1024;

@@ -70,6 +70,21 @@ fn first_text(result: &rmcp::model::CallToolResult) -> &str {
         .expect("expected text content in tool result")
 }
 
+/// Join a spawned server task after the client has cancelled, surfacing any
+/// server-side panic instead of silently absorbing it.
+///
+/// Once the client cancels, the in-memory duplex closes and the server's
+/// `waiting()` future resolves, so the task completes promptly. We bound the
+/// join with a short timeout so a wedged server task fails the test instead of
+/// hanging it. A `JoinError` (panic) or a non-`Ok` server result fails the test.
+async fn join_server(handle: tokio::task::JoinHandle<anyhow::Result<()>>) {
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("server task did not finish within 5 s after client cancel");
+    let result = joined.expect("server task panicked");
+    result.expect("server task returned an error");
+}
+
 // ---------------------------------------------------------------------------
 // Transport integration tests
 // ---------------------------------------------------------------------------
@@ -81,7 +96,7 @@ async fn detect_format_tool_routes_and_responds() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -113,6 +128,7 @@ async fn detect_format_tool_routes_and_responds() -> anyhow::Result<()> {
     assert!(parsed["input_bytes"].is_number(), "expected input_bytes");
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -127,7 +143,7 @@ async fn compress_content_tool_routes_and_compresses() -> anyhow::Result<()> {
     cfg.max_output_ratio = 0.99;
 
     let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -177,6 +193,7 @@ async fn compress_content_tool_routes_and_compresses() -> anyhow::Result<()> {
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -188,7 +205,7 @@ async fn compress_content_passes_through_prose() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -223,6 +240,7 @@ async fn compress_content_passes_through_prose() -> anyhow::Result<()> {
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -233,7 +251,7 @@ async fn compression_stats_tool_routes_and_returns_stats() -> anyhow::Result<()>
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -272,6 +290,7 @@ async fn compression_stats_tool_routes_and_returns_stats() -> anyhow::Result<()>
     assert!(parsed["threshold"].is_number(), "expected threshold");
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -281,7 +300,7 @@ async fn toon_diagnostics_tool_routes_and_returns_health() -> anyhow::Result<()>
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -314,6 +333,7 @@ async fn toon_diagnostics_tool_routes_and_returns_health() -> anyhow::Result<()>
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -324,7 +344,7 @@ async fn unknown_tool_name_returns_error() -> anyhow::Result<()> {
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -339,6 +359,7 @@ async fn unknown_tool_name_returns_error() -> anyhow::Result<()> {
     assert!(result.is_err(), "expected error for unknown tool name");
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -353,7 +374,7 @@ async fn compress_content_rejects_oversized_input() -> anyhow::Result<()> {
     cfg.max_input_bytes = 1024;
 
     let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -382,6 +403,7 @@ async fn compress_content_rejects_oversized_input() -> anyhow::Result<()> {
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -392,7 +414,7 @@ async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()>
     let (server_transport, client_transport) = tokio::io::duplex(65_536);
 
     let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -413,6 +435,7 @@ async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()>
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -434,7 +457,7 @@ async fn concurrent_calls_respect_max_concurrent_calls() -> anyhow::Result<()> {
     cfg.max_output_ratio = 0.99;
 
     let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -486,6 +509,7 @@ async fn concurrent_calls_respect_max_concurrent_calls() -> anyhow::Result<()> {
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }
 
@@ -500,7 +524,7 @@ async fn pipeline_timeout_returns_internal_error() -> anyhow::Result<()> {
     cfg.max_output_ratio = 0.99;
 
     let server = ToonMcpServer::new(cfg, Arc::new(NoopSink));
-    let _server_handle = tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         let _ = server.serve(server_transport).await?.waiting().await;
         anyhow::Ok(())
     });
@@ -539,5 +563,6 @@ async fn pipeline_timeout_returns_internal_error() -> anyhow::Result<()> {
     );
 
     client.cancel().await?;
+    join_server(server_handle).await;
     Ok(())
 }

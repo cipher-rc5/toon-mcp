@@ -26,6 +26,10 @@ license-files = [
 ]
 
 [bans]
+# Kept at "warn" rather than "deny": the only duplicate versions in the graph
+# (getrandom 0.3/0.4, memchr, serde_core) are pulled in transitively by
+# dev/bench tooling (proptest, criterion, tempfile, rusty-fork) and do not
+# affect the shipped binary. Promote to "deny" once `cargo tree -d` is clean.
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"

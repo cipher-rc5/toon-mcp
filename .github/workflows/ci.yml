@@ -28,6 +28,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Verify toolchain matches rust-toolchain.toml
+        run: |
+          PINNED=$(awk -F\" '/channel/ { print $2 }' rust-toolchain.toml)
+          ACTIVE=$(rustc -V | awk '{ print $2 }')
+          if [ "$PINNED" != "$ACTIVE" ]; then
+            echo "Toolchain mismatch: rust-toolchain.toml=$PINNED, active=$ACTIVE" >&2
+            exit 1
+          fi
+
       # M8: Install cargo-llvm-cov for coverage measurement.
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@ec1b8a233a7ecec171cd56557f7640e9ae9b24c6 # cargo-llvm-cov

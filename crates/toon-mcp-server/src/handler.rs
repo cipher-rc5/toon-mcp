@@ -26,6 +26,11 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
     schemars::json_schema!({ "type": "integer" })
 }
 
+// Process-lifetime diagnostic counters. All use `Relaxed` ordering because
+// they are independent monotonic tallies with no cross-counter invariants.
+// Overflow wraps silently and is not a correctness concern: at one event per
+// nanosecond a u64 still takes ~585 years to wrap, and these feed gauges, not
+// control flow.
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HANDLER_LOG_RECORD_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
 static HANDLER_LOG_RECORD_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -156,17 +161,19 @@ where
 
 impl From<&Config> for CompressConfig {
     fn from(c: &Config) -> Self {
-        Self {
-            max_output_ratio: c.max_output_ratio,
-            min_bytes: c.min_bytes,
-            max_input_bytes: c.max_input_bytes,
-            key_folding: c.key_folding,
-            delimiter: c.delimiter,
-            tabular_min_rows: c.tabular_min_rows,
-            fold_min_depth: c.fold_min_depth,
-            primitive_array_min: c.primitive_array_min,
-            csv_numeric_coercion: c.csv_numeric_coercion,
-        }
+        // `CompressConfig` is `#[non_exhaustive]`, so start from the default and
+        // overwrite each field rather than using a struct literal.
+        let mut cfg = CompressConfig::default();
+        cfg.max_output_ratio = c.max_output_ratio;
+        cfg.min_bytes = c.min_bytes;
+        cfg.max_input_bytes = c.max_input_bytes;
+        cfg.key_folding = c.key_folding;
+        cfg.delimiter = c.delimiter;
+        cfg.tabular_min_rows = c.tabular_min_rows;
+        cfg.fold_min_depth = c.fold_min_depth;
+        cfg.primitive_array_min = c.primitive_array_min;
+        cfg.csv_numeric_coercion = c.csv_numeric_coercion;
+        cfg
     }
 }
 
@@ -214,7 +221,11 @@ fn csv_coercion_visibility(
             Some(metadata.lossy_coercion_possible),
         ),
         Err(err) => {
-            tracing::debug!(%err, "could not compute CSV coercion metadata");
+            warn!(
+                %err,
+                format = fmt.as_str(),
+                "could not compute CSV coercion metadata; reporting coercion visibility as false"
+            );
             (Some(false), Some(false))
         }
     }

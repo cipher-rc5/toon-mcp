@@ -160,13 +160,17 @@ impl Parser for CsvParser {
             }
         }
 
+        // Cache header `&str`s once so the per-row loop zips borrowed slices
+        // rather than re-iterating `Vec<String>` elements each row.
+        let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+
         let mut rows: Vec<Value> = Vec::new();
 
         for result in rdr.records() {
             let record = result?;
             let mut map = Map::with_capacity(headers.len());
 
-            for (key, field) in headers.iter().zip(record.iter()) {
+            for (&key, field) in header_refs.iter().zip(record.iter()) {
                 let val = if self.numeric_coercion {
                     if let Ok(n) = field.parse::<f64>() {
                         // Postcondition: f64 parsed successfully implies Number::from_f64 succeeds
@@ -180,8 +184,10 @@ impl Parser for CsvParser {
                 } else {
                     Value::String(field.to_owned())
                 };
-                // key.clone(): Map<String, Value> requires owned keys; headers is borrowed during iteration so we cannot move keys out.
-                map.insert(key.clone(), val);
+                // `to_owned()` allocates the single owned key that
+                // `serde_json::Map<String, Value>` requires; this allocation is
+                // unavoidable, but we no longer clone an already-owned String.
+                map.insert(key.to_owned(), val);
             }
 
             rows.push(Value::Object(map));

@@ -3,14 +3,13 @@
 
 use serde_json::Value;
 
-/// Minimum number of rows for an array to qualify as Tabular.
-pub const TABULAR_MIN_ROWS: usize = 3;
-
-/// Minimum chain depth for FoldChain classification.
-pub const FOLD_MIN_DEPTH: usize = 3;
-
-/// Minimum array length for PrimitiveArray classification.
-pub const PRIMITIVE_ARRAY_MIN: usize = 5;
+// Default classification thresholds. These are the single internal source of
+// truth, surfaced publicly only through `ClassifyConfig::default()` and
+// `CompressConfig::default()` so the defaults can change without breaking the
+// public API surface.
+pub(crate) const TABULAR_MIN_ROWS: usize = 3;
+pub(crate) const FOLD_MIN_DEPTH: usize = 3;
+pub(crate) const PRIMITIVE_ARRAY_MIN: usize = 5;
 
 /// Hard upper bound on `is_fold_chain` recursion depth.
 ///

@@ -242,7 +242,14 @@ impl LogSink for JsonlSink {
             record_failed_count: self.record_failed_count.load(Ordering::Relaxed),
             serialization_failed_count: self.serialization_failed_count.load(Ordering::Relaxed),
             writer_failed_count: self.writer_failed_count.load(Ordering::Relaxed),
-            last_error: self.last_error.lock().ok().and_then(|guard| guard.clone()),
+            // A poisoned mutex still carries the last recorded error: recover
+            // the inner value via `PoisonError::into_inner()` so an unhealthy
+            // sink stays observable instead of silently reporting `None`.
+            last_error: self
+                .last_error
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_else(|p| p.into_inner().clone()),
             queue_capacity: Some(capacity),
             queue_queued: Some(capacity.saturating_sub(available)),
             queue_available: Some(available),
@@ -272,6 +279,14 @@ impl LogSink for JsonlSink {
         rx.await.map_err(|e| LogError::ShutdownAck(e.to_string()))?
     }
 }
+
+/// Maximum number of day-partition file handles kept open at once.
+///
+/// The handle map is keyed by `YYYY-MM-DD`, so on a long-running process it
+/// would otherwise grow one entry per calendar day, leaking file descriptors.
+/// We cap it and evict the oldest day(s); reopening a partition on a later
+/// write is cheap relative to holding unbounded handles.
+const MAX_OPEN_DAY_PARTITIONS: usize = 8;
 
 /// Background writer task that owns the open file handles.
 ///
@@ -467,6 +482,20 @@ async fn flush_pending(
                 }
 
                 let file_path = partition_dir.join("events.jsonl");
+                // Bound the handle map: before opening a brand-new day
+                // partition, evict the oldest day(s) once we are at the cap.
+                // Keys are lexicographically sortable `YYYY-MM-DD`, so the
+                // minimum key is the oldest. Dropping a `File` flushes/closes
+                // it. Skip eviction when the day is already cached.
+                if !handles_snapshot.contains_key(&day) {
+                    while handles_snapshot.len() >= MAX_OPEN_DAY_PARTITIONS {
+                        if let Some(oldest) = handles_snapshot.keys().min().cloned() {
+                            handles_snapshot.remove(&oldest);
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 // L3: re-use open handle; open once per partition per process run.
                 let entry = handles_snapshot.entry(day);
                 let file = match entry {
@@ -518,10 +547,19 @@ fn set_last_error(last_error: &Mutex<Option<String>>, message: String) {
 
 /// Returns a `YYYY-MM-DD` string from a microsecond Unix timestamp.
 fn day_partition_key(ts_us: i64) -> String {
-    jiff::Timestamp::from_microsecond(ts_us)
-        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
-        .strftime("%Y-%m-%d")
-        .to_string()
+    let ts = match jiff::Timestamp::from_microsecond(ts_us) {
+        Ok(ts) => ts,
+        Err(err) => {
+            // An out-of-range timestamp would silently bucket into the epoch
+            // partition; surface it so the upstream data error is observable.
+            warn!(
+                ts_us,
+                "JsonlSink: timestamp out of range, bucketing into UNIX_EPOCH partition: {err}"
+            );
+            jiff::Timestamp::UNIX_EPOCH
+        }
+    };
+    ts.strftime("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]
@@ -654,6 +692,69 @@ mod tests {
     fn day_partition_key_correct() {
         // 2023-11-14 00:00:00 UTC in microseconds
         assert_eq!(day_partition_key(1_699_920_000_000_000), "2023-11-14");
+    }
+
+    #[test]
+    fn day_partition_key_out_of_range_falls_back_to_epoch() {
+        // `i64::MAX` microseconds is far outside jiff's representable range,
+        // so the key falls back to the UNIX_EPOCH partition (and warns).
+        assert_eq!(day_partition_key(i64::MAX), "1970-01-01");
+    }
+
+    /// Eviction: writing across more than `MAX_OPEN_DAY_PARTITIONS` distinct
+    /// days must keep the writer task's handle map bounded while still
+    /// persisting every day's events correctly (evicted handles are reopened
+    /// on the next write to that day).
+    #[tokio::test]
+    async fn handle_map_eviction_keeps_all_partitions_correct() {
+        let dir = tempfile::tempdir().expect("tempdir created successfully");
+        let config = JsonlSinkConfig {
+            log_dir: dir.path().to_path_buf(),
+            buffer_size: 1000,
+            flush_interval: Duration::from_secs(3600),
+        };
+
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        tokio::spawn(task);
+
+        // One microsecond-per-day step so each event lands in a distinct
+        // `day=YYYY-MM-DD` partition. Use more days than the cap to force
+        // eviction of the oldest handles.
+        let micros_per_day: i64 = 86_400 * 1_000_000;
+        let days = MAX_OPEN_DAY_PARTITIONS + 4;
+        let base_us: i64 = 1_700_006_400_000_000; // 2023-11-15 00:00:00 UTC
+
+        for d in 0..days {
+            let mut e = make_event(d as u64);
+            e.ts_us = base_us + (d as i64) * micros_per_day;
+            sink.record(e).await.expect("record succeeds");
+        }
+        sink.flush().await.expect("flush succeeds");
+
+        // Re-write to the oldest day, whose handle was evicted, to prove the
+        // partition is reopened and appended to rather than lost.
+        let mut reopen = make_event(999);
+        reopen.ts_us = base_us;
+        sink.record(reopen).await.expect("re-record succeeds");
+        sink.flush().await.expect("flush succeeds");
+
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
+
+        // Every distinct day must have a partition file with the expected
+        // number of lines (the first day gets two: original + reopened write).
+        for d in 0..days {
+            let day_us = base_us + (d as i64) * micros_per_day;
+            let key = day_partition_key(day_us);
+            let path = dir.path().join(format!("day={key}")).join("events.jsonl");
+            assert!(path.exists(), "partition for {key} exists");
+            let content = std::fs::read_to_string(&path).expect("file readable");
+            let expected = if d == 0 { 2 } else { 1 };
+            assert_eq!(
+                content.lines().count(),
+                expected,
+                "partition {key} holds {expected} event(s)"
+            );
+        }
     }
 
     /// Day rollover: events whose `ts_us` straddle a UTC date boundary must
