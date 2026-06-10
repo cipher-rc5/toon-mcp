@@ -184,23 +184,20 @@ impl Classifier {
     }
 
     fn is_tabular(arr: &[Value]) -> bool {
-        // All elements must be objects.
-        let all_objects = arr.iter().all(|v| v.is_object());
-        if !all_objects {
-            return false;
-        }
-
-        // Determine the key set from the first element.
-        let first_keys: Vec<&str> = match arr.first() {
-            Some(Value::Object(m)) => m.keys().map(String::as_str).collect(),
+        // Use the first element's key set as the reference. Borrowing the map
+        // directly avoids collecting the keys into an intermediate `Vec`.
+        let first = match arr.first() {
+            Some(Value::Object(m)) => m,
             _ => return false,
         };
 
-        // All elements must share identical key sets and contain only primitives.
+        // Every element must be an object sharing the reference key set and
+        // holding only primitive values. This single pass also enforces the
+        // "all objects" requirement, so no separate pre-scan is needed.
         arr.iter().all(|v| match v {
             Value::Object(map) => {
-                let keys_match = map.len() == first_keys.len()
-                    && first_keys.iter().all(|k| map.contains_key(*k));
+                let keys_match =
+                    map.len() == first.len() && first.keys().all(|k| map.contains_key(k));
                 let all_primitive = map.values().all(is_primitive);
                 keys_match && all_primitive
             }

@@ -53,6 +53,23 @@ pub struct DetectionMetadata {
     pub candidates: Vec<InputFormat>,
 }
 
+impl DetectionMetadata {
+    /// Metadata for an input whose format was not (or could not be) detected:
+    /// `Unknown`, `Certain`, not ambiguous, no candidates.
+    ///
+    /// Used when the compression pipeline rejects an input before detection
+    /// runs (e.g. it exceeds the byte-length limit) but a caller still expects
+    /// a `DetectionMetadata` value.
+    pub fn unknown() -> Self {
+        Self {
+            format: InputFormat::Unknown,
+            confidence: DetectionConfidence::Certain,
+            ambiguous: false,
+            candidates: Vec::new(),
+        }
+    }
+}
+
 impl InputFormat {
     /// Return a stable lowercase string identifier for logging and display.
     ///

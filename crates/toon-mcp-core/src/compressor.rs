@@ -4,8 +4,13 @@
 
 use crate::{
     classifier::{Classifier, ClassifyConfig, ShapeClass},
-    detector::{FormatDetector, InputFormat},
-    parser::{Parser, csv::CsvParser, json::JsonParser, jsonl::JsonlParser},
+    detector::{DetectionMetadata, FormatDetector, InputFormat},
+    parser::{
+        Parser,
+        csv::{CsvCoercionMetadata, CsvParser},
+        json::JsonParser,
+        jsonl::JsonlParser,
+    },
 };
 
 /// Maximum number of bytes accepted as input. Inputs larger than this are
@@ -189,6 +194,24 @@ pub enum CompressDecision {
     },
 }
 
+/// The full result of running the compression pipeline.
+///
+/// Bundles the [`CompressDecision`] with the detection metadata and CSV/TSV
+/// coercion visibility computed during the *same* pass. Callers that need all
+/// three (such as the MCP handlers) should use
+/// [`Compressor::decide_with_metadata`] instead of re-detecting and
+/// re-parsing the input separately.
+#[derive(Debug, Clone)]
+pub struct CompressionResult {
+    /// The compression decision.
+    pub decision: CompressDecision,
+    /// Detection metadata gathered in the single detection pass.
+    pub detection: DetectionMetadata,
+    /// CSV/TSV numeric-coercion visibility. `None` for non-delimited formats
+    /// or when the input was rejected before parsing (e.g. below `min_bytes`).
+    pub coercion: Option<CsvCoercionMetadata>,
+}
+
 /// Stateless compression decision engine.
 ///
 /// The pipeline is:
@@ -232,70 +255,112 @@ impl Compressor {
     /// ));
     /// ```
     pub fn decide(input: &str, config: &CompressConfig) -> CompressDecision {
+        Self::decide_with_metadata(input, config).decision
+    }
+
+    /// Run the full pipeline and return the decision together with the
+    /// detection metadata and CSV/TSV coercion visibility, all computed in a
+    /// single detection + parse pass.
+    ///
+    /// Prefer this over calling [`Compressor::decide`],
+    /// [`FormatDetector::detect_with_metadata`], and
+    /// [`CsvParser::coercion_metadata`] separately — those would each re-walk
+    /// the input, parsing CSV/TSV bodies up to three times for one request.
+    pub fn decide_with_metadata(input: &str, config: &CompressConfig) -> CompressionResult {
         let original_bytes = input.len();
 
         // Step 1: upper-bound gate — reject oversized inputs before any allocation.
+        // Detection is skipped, so report empty metadata (Unknown / no candidates).
         if original_bytes > config.max_input_bytes {
-            return CompressDecision::PassedThrough {
-                reason: PassThroughReason::InputExceedsLimit {
-                    actual: original_bytes,
-                    limit: config.max_input_bytes,
+            return CompressionResult {
+                decision: CompressDecision::PassedThrough {
+                    reason: PassThroughReason::InputExceedsLimit {
+                        actual: original_bytes,
+                        limit: config.max_input_bytes,
+                    },
+                    input_format: None,
                 },
-                input_format: None,
+                detection: DetectionMetadata::unknown(),
+                coercion: None,
             };
         }
 
         // Step 2: lower-bound gate — skip tiny inputs that cannot compress meaningfully.
+        // Detection still runs so callers receive accurate format metadata even
+        // when the byte gate short-circuits the compression decision.
+        let detection = FormatDetector::detect_with_metadata(input);
         if original_bytes < config.min_bytes {
-            return CompressDecision::PassedThrough {
-                reason: PassThroughReason::BelowMinBytes,
-                input_format: None,
+            return CompressionResult {
+                decision: CompressDecision::PassedThrough {
+                    reason: PassThroughReason::BelowMinBytes,
+                    input_format: None,
+                },
+                detection,
+                coercion: None,
             };
         }
 
-        // Step 3: detect and parse.
-        // Detection runs once up-front so the appropriate parser can be
-        // dispatched with the runtime configuration (e.g. CSV numeric
-        // coercion). Non-`ParseFailed` errors still report the detected
-        // format instead of collapsing to `Unknown`.
-        let detected_fmt = FormatDetector::detect(input);
+        // Step 3: parse using the format already detected above. CSV/TSV parse
+        // via `parse_with_coercion_metadata` so numeric-coercion visibility is
+        // gathered in the same pass rather than a second full re-parse.
+        let detected_fmt = detection.format;
+        let mut coercion: Option<CsvCoercionMetadata> = None;
         let parse_result = match detected_fmt {
             InputFormat::Json => JsonParser.parse(input),
             InputFormat::Jsonl => JsonlParser.parse(input),
             InputFormat::Csv => CsvParser::csv()
                 .with_numeric_coercion(config.csv_numeric_coercion)
-                .parse(input),
+                .parse_with_coercion_metadata(input)
+                .map(|(v, meta)| {
+                    coercion = Some(meta);
+                    v
+                }),
             InputFormat::Tsv => CsvParser::tsv()
                 .with_numeric_coercion(config.csv_numeric_coercion)
-                .parse(input),
+                .parse_with_coercion_metadata(input)
+                .map(|(v, meta)| {
+                    coercion = Some(meta);
+                    v
+                }),
             InputFormat::Unknown => {
-                return CompressDecision::PassedThrough {
-                    reason: PassThroughReason::UnknownFormat,
-                    input_format: Some(InputFormat::Unknown),
+                return CompressionResult {
+                    decision: CompressDecision::PassedThrough {
+                        reason: PassThroughReason::UnknownFormat,
+                        input_format: Some(InputFormat::Unknown),
+                    },
+                    detection,
+                    coercion: None,
                 };
             }
         };
         let (fmt, value) = match parse_result {
             Ok(v) => (detected_fmt, v),
             Err(crate::error::CoreError::ParseFailed { format, detail, .. }) => {
-                if format == InputFormat::Unknown {
-                    return CompressDecision::PassedThrough {
-                        reason: PassThroughReason::UnknownFormat,
-                        input_format: Some(InputFormat::Unknown),
-                    };
-                }
-                return CompressDecision::PassedThrough {
-                    reason: PassThroughReason::ParseFailed { format, detail },
-                    input_format: Some(format),
+                let reason = if format == InputFormat::Unknown {
+                    PassThroughReason::UnknownFormat
+                } else {
+                    PassThroughReason::ParseFailed { format, detail }
+                };
+                return CompressionResult {
+                    decision: CompressDecision::PassedThrough {
+                        reason,
+                        input_format: Some(format),
+                    },
+                    detection,
+                    coercion,
                 };
             }
             Err(e) => {
-                return CompressDecision::PassedThrough {
-                    reason: PassThroughReason::ParseFailed {
-                        format: detected_fmt,
-                        detail: e.to_string(),
+                return CompressionResult {
+                    decision: CompressDecision::PassedThrough {
+                        reason: PassThroughReason::ParseFailed {
+                            format: detected_fmt,
+                            detail: e.to_string(),
+                        },
+                        input_format: Some(detected_fmt),
                     },
-                    input_format: Some(detected_fmt),
+                    detection,
+                    coercion,
                 };
             }
         };
@@ -308,9 +373,13 @@ impl Compressor {
         };
         let shape = Classifier::classify_with(&value, &classify_config);
         if shape == ShapeClass::PassThrough {
-            return CompressDecision::PassedThrough {
-                reason: PassThroughReason::ShapeNotBeneficial,
-                input_format: Some(fmt),
+            return CompressionResult {
+                decision: CompressDecision::PassedThrough {
+                    reason: PassThroughReason::ShapeNotBeneficial,
+                    input_format: Some(fmt),
+                },
+                detection,
+                coercion,
             };
         }
 
@@ -327,12 +396,16 @@ impl Compressor {
         let toon = match toon_format::encode(&value, &opts) {
             Ok(s) => s,
             Err(e) => {
-                return CompressDecision::PassedThrough {
-                    reason: PassThroughReason::EncodeFailed {
-                        format: fmt,
-                        detail: e.to_string(),
+                return CompressionResult {
+                    decision: CompressDecision::PassedThrough {
+                        reason: PassThroughReason::EncodeFailed {
+                            format: fmt,
+                            detail: e.to_string(),
+                        },
+                        input_format: Some(fmt),
                     },
-                    input_format: Some(fmt),
+                    detection,
+                    coercion,
                 };
             }
         };
@@ -344,22 +417,30 @@ impl Compressor {
         // output_ratio = toon_bytes / original_bytes; pass if output_ratio <= max_output_ratio.
         let output_ratio = toon_bytes as f64 / original_bytes as f64;
         if output_ratio > config.max_output_ratio {
-            return CompressDecision::PassedThrough {
-                reason: PassThroughReason::InsufficientSavings {
-                    output_ratio,
-                    max_output_ratio: config.max_output_ratio,
+            return CompressionResult {
+                decision: CompressDecision::PassedThrough {
+                    reason: PassThroughReason::InsufficientSavings {
+                        output_ratio,
+                        max_output_ratio: config.max_output_ratio,
+                    },
+                    input_format: Some(fmt),
                 },
-                input_format: Some(fmt),
+                detection,
+                coercion,
             };
         }
 
-        CompressDecision::Compressed {
-            toon,
-            original_bytes,
-            toon_bytes,
-            savings_pct: 1.0 - output_ratio,
-            input_format: fmt,
-            shape_class: shape,
+        CompressionResult {
+            decision: CompressDecision::Compressed {
+                toon,
+                original_bytes,
+                toon_bytes,
+                savings_pct: 1.0 - output_ratio,
+                input_format: fmt,
+                shape_class: shape,
+            },
+            detection,
+            coercion,
         }
     }
 }

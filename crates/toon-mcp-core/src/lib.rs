@@ -27,7 +27,8 @@ pub mod parser;
 
 pub use classifier::{Classifier, ClassifyConfig, ShapeClass};
 pub use compressor::{
-    CompressConfig, CompressDecision, Compressor, DEFAULT_MAX_INPUT_BYTES, PassThroughReason,
+    CompressConfig, CompressDecision, CompressionResult, Compressor, DEFAULT_MAX_INPUT_BYTES,
+    PassThroughReason,
 };
 pub use detector::{DetectionConfidence, DetectionMetadata, FormatDetector, InputFormat};
 pub use error::CoreError;

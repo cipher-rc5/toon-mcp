@@ -14,7 +14,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use toon_mcp_core::{
     CompressConfig, CompressDecision, Compressor, DetectionMetadata, FormatDetector, InputFormat,
-    parser::csv::CsvParser,
+    parser::csv::{CsvCoercionMetadata, CsvParser},
 };
 use toon_mcp_logging::{LogEvent, LogSink};
 
@@ -203,31 +203,50 @@ fn detection_candidates_as_strings(metadata: &DetectionMetadata) -> Vec<String> 
         .collect()
 }
 
-fn csv_coercion_visibility(
+/// Compute CSV/TSV coercion metadata for the detect-only path, which does not
+/// run the compression pipeline. Returns `None` for non-delimited formats so
+/// the caller reports no coercion visibility. Unlike the compression pipeline,
+/// this inspects the input without materialising parsed values.
+fn detect_coercion_metadata(
     fmt: InputFormat,
     input: &str,
     numeric_coercion: bool,
-) -> (Option<bool>, Option<bool>) {
+) -> Option<CsvCoercionMetadata> {
     let parser = match fmt {
         InputFormat::Csv => CsvParser::csv(),
         InputFormat::Tsv => CsvParser::tsv(),
-        _ => return (None, None),
+        _ => return None,
     }
     .with_numeric_coercion(numeric_coercion);
 
     match parser.coercion_metadata(input) {
-        Ok(metadata) => (
-            Some(metadata.numeric_coercion_used),
-            Some(metadata.lossy_coercion_possible),
-        ),
+        Ok(metadata) => Some(metadata),
         Err(err) => {
             warn!(
                 %err,
                 format = fmt.as_str(),
                 "could not compute CSV coercion metadata; reporting coercion visibility as false"
             );
-            (Some(false), Some(false))
+            Some(CsvCoercionMetadata {
+                numeric_coercion_used: false,
+                lossy_coercion_possible: false,
+            })
         }
+    }
+}
+
+/// Map the CSV/TSV coercion metadata produced by the compression pipeline
+/// into the optional booleans the handlers attach to their responses.
+///
+/// `None` (non-delimited formats, or inputs rejected before parsing) yields
+/// `(None, None)`; a delimited parse yields `Some(..)` for each flag.
+fn coercion_visibility(coercion: Option<CsvCoercionMetadata>) -> (Option<bool>, Option<bool>) {
+    match coercion {
+        Some(meta) => (
+            Some(meta.numeric_coercion_used),
+            Some(meta.lossy_coercion_possible),
+        ),
+        None => (None, None),
     }
 }
 
@@ -327,7 +346,7 @@ pub async fn handle_detect_format(
                 let line_count = FormatDetector::jsonl_line_count(fmt, &input);
                 let column_count = FormatDetector::column_count(fmt, &input);
                 let (numeric_coercion_used, lossy_coercion_possible) =
-                    csv_coercion_visibility(fmt, &input, csv_numeric_coercion);
+                    coercion_visibility(detect_coercion_metadata(fmt, &input, csv_numeric_coercion));
                 (
                     metadata,
                     line_count,
@@ -473,19 +492,17 @@ pub(crate) async fn handle_compress_content_inner(
         let start = Instant::now();
 
         // L1: Return (input, decision) so input is available for pass-through output.
+        // `decide_with_metadata` runs detection and parsing once, surfacing the
+        // detection metadata and CSV/TSV coercion visibility from the same pass.
         let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
             run_pipeline("compression", pipeline_timeout_ms, move || {
-                let detection_metadata = FormatDetector::detect_with_metadata(&input);
-                let (numeric_coercion_used, lossy_coercion_possible) = csv_coercion_visibility(
-                    detection_metadata.format,
-                    &input,
-                    compress_config.csv_numeric_coercion,
-                );
-                let decision = Compressor::decide(&input, &compress_config);
+                let result = Compressor::decide_with_metadata(&input, &compress_config);
+                let (numeric_coercion_used, lossy_coercion_possible) =
+                    coercion_visibility(result.coercion);
                 (
                     input,
-                    decision,
-                    detection_metadata,
+                    result.decision,
+                    result.detection,
                     numeric_coercion_used,
                     lossy_coercion_possible,
                 )
@@ -672,16 +689,12 @@ pub async fn handle_compression_stats(
 
         let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
             run_pipeline("compression", pipeline_timeout_ms, move || {
-                let detection_metadata = FormatDetector::detect_with_metadata(&input);
-                let (numeric_coercion_used, lossy_coercion_possible) = csv_coercion_visibility(
-                    detection_metadata.format,
-                    &input,
-                    compress_config.csv_numeric_coercion,
-                );
-                let decision = Compressor::decide(&input, &compress_config);
+                let result = Compressor::decide_with_metadata(&input, &compress_config);
+                let (numeric_coercion_used, lossy_coercion_possible) =
+                    coercion_visibility(result.coercion);
                 (
-                    decision,
-                    detection_metadata,
+                    result.decision,
+                    result.detection,
                     numeric_coercion_used,
                     lossy_coercion_possible,
                 )

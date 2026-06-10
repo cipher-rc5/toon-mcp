@@ -142,13 +142,27 @@ fn numeric_text_may_be_lossy(field: &str, parsed: f64) -> bool {
     trimmed.contains('.') && parsed.fract() == 0.0
 }
 
-impl Parser for CsvParser {
-    fn parse(&self, input: &str) -> Result<Value, CoreError> {
+impl CsvParser {
+    /// Parse `input` while simultaneously collecting numeric-coercion metadata.
+    ///
+    /// Equivalent to calling [`Parser::parse`] and [`Self::coercion_metadata`]
+    /// back-to-back, but walks the input only once. The compression pipeline
+    /// needs both the parsed value and the coercion visibility flags, so the
+    /// single pass avoids re-reading and re-parsing the entire CSV body.
+    pub fn parse_with_coercion_metadata(
+        &self,
+        input: &str,
+    ) -> Result<(Value, CsvCoercionMetadata), CoreError> {
         let mut rdr = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
             .from_reader(input.as_bytes());
 
-        let headers: Vec<String> = rdr.headers()?.iter().map(|h| h.to_owned()).collect();
+        // Headers must be owned `String`s: the `StringRecord` returned by
+        // `rdr.headers()` borrows `rdr`, but the row loop below needs its own
+        // mutable borrow of `rdr` via `records()`. Owning the header names
+        // decouples them from the reader. The per-row loop then zips
+        // `&str` slices, avoiding a second `Vec<&str>` collection.
+        let headers: Vec<String> = rdr.headers()?.iter().map(str::to_owned).collect();
 
         // Reject duplicate headers up-front: `serde_json::Map` would otherwise
         // collapse duplicate columns into a single key, silently dropping data.
@@ -160,24 +174,24 @@ impl Parser for CsvParser {
             }
         }
 
-        // Cache header `&str`s once so the per-row loop zips borrowed slices
-        // rather than re-iterating `Vec<String>` elements each row.
-        let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-
         let mut rows: Vec<Value> = Vec::new();
+        let mut numeric_coercion_used = false;
+        let mut lossy_coercion_possible = false;
 
         for result in rdr.records() {
             let record = result?;
             let mut map = Map::with_capacity(headers.len());
 
-            for (&key, field) in header_refs.iter().zip(record.iter()) {
+            for (key, field) in headers.iter().zip(record.iter()) {
                 let val = if self.numeric_coercion {
-                    if let Ok(n) = field.parse::<f64>() {
-                        // Postcondition: f64 parsed successfully implies Number::from_f64 succeeds
-                        // for all finite values. Infinite/NaN fields fall through to string.
-                        Number::from_f64(n)
-                            .map(Value::Number)
-                            .unwrap_or_else(|| Value::String(field.to_owned()))
+                    if let Ok(n) = field.parse::<f64>()
+                        && let Some(num) = Number::from_f64(n)
+                    {
+                        // Finite f64: coerce to a JSON number. Infinite/NaN
+                        // fields fail `from_f64` and fall through to string.
+                        numeric_coercion_used = true;
+                        lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
+                        Value::Number(num)
                     } else {
                         Value::String(field.to_owned())
                     }
@@ -185,15 +199,26 @@ impl Parser for CsvParser {
                     Value::String(field.to_owned())
                 };
                 // `to_owned()` allocates the single owned key that
-                // `serde_json::Map<String, Value>` requires; this allocation is
-                // unavoidable, but we no longer clone an already-owned String.
+                // `serde_json::Map<String, Value>` requires.
                 map.insert(key.to_owned(), val);
             }
 
             rows.push(Value::Object(map));
         }
 
-        Ok(Value::Array(rows))
+        Ok((
+            Value::Array(rows),
+            CsvCoercionMetadata {
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            },
+        ))
+    }
+}
+
+impl Parser for CsvParser {
+    fn parse(&self, input: &str) -> Result<Value, CoreError> {
+        self.parse_with_coercion_metadata(input).map(|(v, _)| v)
     }
 }
 
