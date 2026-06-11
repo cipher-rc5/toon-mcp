@@ -255,6 +255,12 @@ jobs:
   semver-checks:
     name: cargo-semver-checks (library crates)
     runs-on: ubuntu-24.04
+    # Non-blocking: `cargo semver-checks check-release` baselines against the
+    # crates.io-published version, but toon-mcp-core / toon-mcp-logging are
+    # unpublished internal workspace crates ("not found in registry"). The job
+    # still runs and surfaces API-break info, but cannot gate CI until these
+    # crates are published (or migrated to a git-rev baseline).
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
