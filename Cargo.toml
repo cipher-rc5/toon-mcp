@@ -58,7 +58,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 # Utilities
 anyhow = "=1.0.103"
 dotenvy = "=0.15.7"
-jiff = "=0.2.31"
+jiff = "=0.2.32"
 temp-env = "=0.3.6"
 tempfile = "=3.27.0"
 thiserror = "=2.0.18"
