@@ -46,7 +46,7 @@ csv = "=1.4.0"
 
 # Async
 async-trait = "=0.1.89"
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Benchmarking
 criterion = { version = "=0.8.2", features = ["html_reports"] }
