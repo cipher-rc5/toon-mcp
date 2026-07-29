@@ -61,7 +61,7 @@ dotenvy = "=0.15.7"
 jiff = "=0.2.32"
 temp-env = "=0.3.6"
 tempfile = "=3.27.0"
-thiserror = "=2.0.18"
+thiserror = "=2.0.19"
 xxhash-rust = { version = "=0.8.16", features = ["xxh3"] }
 
 # Property-based testing
