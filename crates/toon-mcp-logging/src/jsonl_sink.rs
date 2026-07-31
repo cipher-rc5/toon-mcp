@@ -82,8 +82,11 @@ impl Default for JsonlSinkConfig {
 }
 
 /// Commands sent from `JsonlSink` to the background writer task.
+///
+/// The event is boxed to keep the enum small: `LogEvent` is over 200 bytes,
+/// while the other variants are a single channel handle.
 enum SinkCmd {
-    Record(LogEvent),
+    Record(Box<LogEvent>),
     Flush(oneshot::Sender<Result<(), LogError>>),
     Shutdown(oneshot::Sender<Result<(), LogError>>),
 }
@@ -224,7 +227,7 @@ impl LogSink for JsonlSink {
         // saturation we drop the event and return `Ok(())` rather than
         // blocking the handler. A closed channel, however, is a real error
         // operators must see (the writer task is dead).
-        match self.sender.try_send(SinkCmd::Record(event)) {
+        match self.sender.try_send(SinkCmd::Record(Box::new(event))) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.record_dropped_count.fetch_add(1, Ordering::Relaxed);
@@ -317,7 +320,7 @@ async fn writer_task(
             cmd = rx.recv() => {
                 match cmd {
                     Some(SinkCmd::Record(event)) => {
-                        pending.push(event);
+                        pending.push(*event);
                         if pending.len() >= buffer_size
                             && let Err(e) = flush_pending(
                                 &mut pending,
@@ -586,6 +589,7 @@ mod tests {
             savings_pct: 0.56,
             threshold_used: 0.85,
             duration_us: n * 10,
+            outcome: "ok".into(),
             pass_reason: None,
             client_hint: Some("test".into()),
         }

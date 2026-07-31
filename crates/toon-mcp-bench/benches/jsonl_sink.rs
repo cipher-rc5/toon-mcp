@@ -29,6 +29,7 @@ fn make_event(n: u64) -> LogEvent {
         savings_pct: 0.56,
         threshold_used: 0.85,
         duration_us: n * 10,
+        outcome: "ok".into(),
         pass_reason: None,
         client_hint: Some("bench".into()),
     }

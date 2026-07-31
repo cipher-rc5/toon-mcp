@@ -87,8 +87,21 @@ Every tool invocation produces one `LogEvent` with the following fields:
 | `savings_pct`    | `f64`             | Fraction of bytes saved (0.0 when not compressed)                                |
 | `threshold_used` | `f64`             | The `TOON_COMPRESSION_THRESHOLD` value active at call time                       |
 | `duration_us`    | `u64`             | Wall-clock time in microseconds for the detect + classify + encode pipeline      |
+| `outcome`        | `String`          | `"ok"`, `"rejected"`, `"timeout"`, `"busy"`, or `"failed"` (see below)           |
 | `pass_reason`    | `Option<String>`  | If `compressed=false`, the reason (see below)                                    |
 | `client_hint`    | `Option<String>`  | Value of `TOON_CLIENT_HINT` at startup, or `null`                                |
+
+### `outcome` values
+
+Added after the initial schema; rows written by earlier releases lack the field and deserialise as `"ok"`.
+
+| Value        | Meaning                                                                    |
+| ------------ | -------------------------------------------------------------------------- |
+| `"ok"`       | The tool returned a successful response                                     |
+| `"rejected"` | The input was rejected before processing (e.g. above `TOON_MAX_INPUT_BYTES`) |
+| `"timeout"`  | The pipeline exceeded `TOON_PIPELINE_TIMEOUT_MS`                            |
+| `"busy"`     | No concurrency permit became available within the queue deadline            |
+| `"failed"`   | An internal failure (e.g. the blocking task crashed)                        |
 
 ### `pass_reason` values
 
@@ -208,6 +221,20 @@ FROM read_json('data/logs/**/*.jsonl')
 GROUP BY tool_name
 ORDER BY total_calls DESC;
 ```
+
+### Failure breakdown by outcome
+
+```sql
+SELECT
+    tool_name,
+    coalesce(outcome, 'ok') AS outcome,
+    count(*) AS n
+FROM read_json('data/logs/**/*.jsonl')
+GROUP BY tool_name, coalesce(outcome, 'ok')
+ORDER BY tool_name, n DESC;
+```
+
+`coalesce` keeps the query correct across rows written before the `outcome` field existed.
 
 ### Pass-through breakdown
 

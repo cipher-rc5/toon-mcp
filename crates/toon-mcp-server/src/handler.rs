@@ -373,6 +373,7 @@ pub async fn handle_detect_format(
             savings_pct: 0.0,
             threshold_used: config.max_output_ratio,
             duration_us,
+            outcome: "ok".into(),
             pass_reason: None,
             client_hint: config.client_hint.clone(),
         };
@@ -569,6 +570,7 @@ pub(crate) async fn handle_compress_content_inner(
             savings_pct: outcome.savings_pct,
             threshold_used: config.max_output_ratio,
             duration_us,
+            outcome: "ok".into(),
             pass_reason: outcome.pass_reason_str.clone(),
             client_hint: config.client_hint.clone(),
         };
@@ -756,6 +758,7 @@ pub async fn handle_compression_stats(
             savings_pct: outcome.savings_pct,
             threshold_used: config.max_output_ratio,
             duration_us,
+            outcome: "ok".into(),
             pass_reason: outcome.pass_reason_str.clone(),
             client_hint: config.client_hint.clone(),
         };
