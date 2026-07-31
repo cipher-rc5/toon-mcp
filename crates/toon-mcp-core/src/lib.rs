@@ -22,6 +22,9 @@ pub mod detector;
 /// Error types for the core pipeline.
 pub mod error;
 
+/// Structural value equivalence for round-trip fidelity checks.
+pub mod fidelity;
+
 /// Format-specific parser implementations.
 pub mod parser;
 
@@ -32,4 +35,5 @@ pub use compressor::{
 };
 pub use detector::{DetectionConfidence, DetectionMetadata, FormatDetector, InputFormat};
 pub use error::CoreError;
+pub use fidelity::values_equiv;
 pub use parser::Parser;

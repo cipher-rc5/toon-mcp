@@ -7,6 +7,10 @@ use toon_format::types::{KeyFoldingMode, PathExpansionMode};
 use toon_format::{DecodeOptions, Delimiter, EncodeOptions};
 use toon_mcp_core::parser::{Parser, csv::CsvParser, json::JsonParser, jsonl::JsonlParser};
 
+// Shared with the production round-trip tests so the eval harness and the
+// pipeline measure fidelity with one definition.
+pub use toon_mcp_core::fidelity::values_equiv;
+
 /// Parse a payload to the normalised `Value` the pipeline would classify,
 /// using the same parser the compressor dispatches for that format.
 pub fn parse_to_value(format: &str, payload: &str, numeric_coercion: bool) -> Result<Value> {
@@ -42,24 +46,3 @@ pub fn decode_pipeline(toon: &str) -> Result<Value> {
     toon_format::decode(toon, &opts).map_err(|e| anyhow!("decode failed: {e}"))
 }
 
-/// Structural equality that tolerates integer/float representation drift
-/// (e.g. `30` vs `30.0`) introduced by the encode→decode cycle, while still
-/// catching real corruption (wrong value, missing key, reordered array).
-pub fn values_equiv(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(fx), Some(fy)) => (fx - fy).abs() <= 1e-9 * fx.abs().max(fy.abs()).max(1.0),
-            _ => x == y,
-        },
-        (Value::Array(xs), Value::Array(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| values_equiv(x, y))
-        }
-        (Value::Object(xs), Value::Object(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .all(|(k, x)| ys.get(k).is_some_and(|y| values_equiv(x, y)))
-        }
-        _ => a == b,
-    }
-}
