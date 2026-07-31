@@ -287,8 +287,10 @@ impl Compressor {
 
         // Step 2: lower-bound gate — skip tiny inputs that cannot compress meaningfully.
         // Detection still runs so callers receive accurate format metadata even
-        // when the byte gate short-circuits the compression decision.
-        let detection = FormatDetector::detect_with_metadata(input);
+        // when the byte gate short-circuits the compression decision. When the
+        // input is JSON, detection hands back the value parsed during the
+        // probe, so step 3 does not re-run serde_json over the full payload.
+        let (detection, json_value) = FormatDetector::detect_with_metadata_and_value(input);
         if original_bytes < config.min_bytes {
             return CompressionResult {
                 decision: CompressDecision::PassedThrough {
@@ -306,7 +308,13 @@ impl Compressor {
         let detected_fmt = detection.format;
         let mut coercion: Option<CsvCoercionMetadata> = None;
         let parse_result = match detected_fmt {
-            InputFormat::Json => JsonParser.parse(input),
+            // The detection probe already parsed JSON inputs; reuse that
+            // value instead of re-parsing. The fallback covers the defensive
+            // case where detection selected Json without a value.
+            InputFormat::Json => match json_value {
+                Some(v) => Ok(v),
+                None => JsonParser.parse(input),
+            },
             InputFormat::Jsonl => JsonlParser.parse(input),
             InputFormat::Csv => CsvParser::csv()
                 .with_numeric_coercion(config.csv_numeric_coercion)

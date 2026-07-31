@@ -51,6 +51,10 @@ pub struct DetectionMetadata {
     pub ambiguous: bool,
     /// All formats that matched, in detection precedence order.
     pub candidates: Vec<InputFormat>,
+    /// Number of non-empty lines, populated when `format` is
+    /// [`InputFormat::Jsonl`]. Counted during the detection probe so callers
+    /// do not need a second scan over the input.
+    pub line_count: Option<usize>,
 }
 
 impl DetectionMetadata {
@@ -66,6 +70,7 @@ impl DetectionMetadata {
             confidence: DetectionConfidence::Certain,
             ambiguous: false,
             candidates: Vec::new(),
+            line_count: None,
         }
     }
 }
@@ -142,32 +147,6 @@ impl FormatDetector {
             .map(|h| h.len())
     }
 
-    /// Count non-empty lines in JSONL input, or return `None` for other formats.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use toon_mcp_core::{FormatDetector, InputFormat};
-    ///
-    /// assert_eq!(
-    ///     FormatDetector::jsonl_line_count(InputFormat::Jsonl, "{\"a\":1}\n\n{\"b\":2}"),
-    ///     Some(2)
-    /// );
-    /// assert_eq!(FormatDetector::jsonl_line_count(InputFormat::Json, r#"{"a":1}"#), None);
-    /// ```
-    pub fn jsonl_line_count(fmt: InputFormat, input: &str) -> Option<usize> {
-        if fmt == InputFormat::Jsonl {
-            // Single efficient pass over the input. This re-scans lines the
-            // detector already iterated during `detect_with_metadata`; that
-            // caller-side double-scan is a known, accepted tradeoff because
-            // eliminating it would require threading a count through the public
-            // detection API, which we intentionally keep stable.
-            Some(input.lines().filter(|l| !l.trim().is_empty()).count())
-        } else {
-            None
-        }
-    }
-
     /// Detect the format of `input` without parsing the full document.
     ///
     /// Detection operates solely on the string slice; no I/O is performed.
@@ -188,21 +167,50 @@ impl FormatDetector {
 
     /// Detect the format of `input` and include confidence/ambiguity metadata.
     pub fn detect_with_metadata(input: &str) -> DetectionMetadata {
+        Self::detect_inner(input, false).0
+    }
+
+    /// Detect the format of `input` and, when the JSON probe validated the
+    /// document, hand back the parsed `serde_json::Value` from that same
+    /// pass.
+    ///
+    /// Callers that go on to parse a detected-JSON input (the compression
+    /// pipeline) should use this instead of [`Self::detect_with_metadata`]
+    /// followed by a fresh `serde_json::from_str`: it collapses the probe's
+    /// validation walk and the parse into one traversal of the payload.
+    pub fn detect_with_metadata_and_value(
+        input: &str,
+    ) -> (DetectionMetadata, Option<serde_json::Value>) {
+        Self::detect_inner(input, true)
+    }
+
+    fn detect_inner(
+        input: &str,
+        want_value: bool,
+    ) -> (DetectionMetadata, Option<serde_json::Value>) {
         let mut candidates = Vec::new();
+        let mut json_value = None;
 
         // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
-        // Use `IgnoredAny` so serde_json validates structure without
-        // allocating a `Value` tree; we re-parse with a real Value if and
-        // when the caller invokes `detect_and_parse`.
+        // Metadata-only callers validate with `IgnoredAny` (no `Value` tree
+        // allocation); pipeline callers ask for the value so the validation
+        // pass doubles as the parse.
         let first_nonws = input.bytes().find(|b| !b.is_ascii_whitespace());
-        if matches!(first_nonws, Some(b'{') | Some(b'['))
-            && serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok()
-        {
-            candidates.push(InputFormat::Json);
+        if matches!(first_nonws, Some(b'{') | Some(b'[')) {
+            if want_value {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
+                    json_value = Some(v);
+                    candidates.push(InputFormat::Json);
+                }
+            } else if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
+                candidates.push(InputFormat::Json);
+            }
         }
 
-        // 2. JSONL probe — try first two non-empty lines.
-        if Self::probe_jsonl(input) {
+        // 2. JSONL probe — validate the first two non-empty lines, counting
+        // the rest so the line count needs no second scan.
+        let jsonl_line_count = Self::probe_jsonl(input);
+        if jsonl_line_count.is_some() {
             candidates.push(InputFormat::Jsonl);
         }
 
@@ -223,12 +231,16 @@ impl FormatDetector {
                 DetectionConfidence::Heuristic
             }
         };
-        DetectionMetadata {
+        let metadata = DetectionMetadata {
+            line_count: (format == InputFormat::Jsonl)
+                .then_some(jsonl_line_count)
+                .flatten(),
             format,
             confidence,
             ambiguous: candidates.len() > 1,
             candidates,
-        }
+        };
+        (metadata, json_value)
     }
 
     /// Detect the format and immediately parse to a normalised `serde_json::Value`.
@@ -268,18 +280,23 @@ impl FormatDetector {
 
     // --- private helpers ---
 
-    fn probe_jsonl(input: &str) -> bool {
+    /// Probe for JSONL: the first two non-empty lines must each be valid
+    /// JSON. Returns the total non-empty line count on success so callers
+    /// get the count from the same scan; `None` when the input is not JSONL.
+    fn probe_jsonl(input: &str) -> Option<usize> {
         let mut checked = 0usize;
+        let mut count = 0usize;
         for line in input.lines().filter(|l| !l.trim().is_empty()) {
-            if serde_json::from_str::<serde_json::Value>(line).is_err() {
-                return false;
+            if checked < 2 {
+                // `IgnoredAny` validates without allocating a `Value` tree.
+                if serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+                    return None;
+                }
+                checked += 1;
             }
-            checked += 1;
-            if checked == 2 {
-                return true;
-            }
+            count += 1;
         }
-        false
+        (checked == 2).then_some(count)
     }
 
     fn probe_delimited(input: &str, delimiter: u8) -> bool {

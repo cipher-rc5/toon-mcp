@@ -546,7 +546,8 @@ pub async fn handle_detect_format(
             move || {
                 let metadata = FormatDetector::detect_with_metadata(&input);
                 let fmt = metadata.format;
-                let line_count = FormatDetector::jsonl_line_count(fmt, &input);
+                // Counted during the detection probe; no second scan needed.
+                let line_count = metadata.line_count;
                 let column_count = FormatDetector::column_count(fmt, &input);
                 let (numeric_coercion_used, lossy_coercion_possible) = coercion_visibility(
                     detect_coercion_metadata(fmt, &input, csv_numeric_coercion),
