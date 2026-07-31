@@ -12,6 +12,61 @@ Each release header records the date (UTC) the tag was published.
 
 ## [Unreleased] — 0.2.0 (in progress)
 
+### Fixed (audit remediation)
+
+- CSV/TSV numeric coercion is now two-stage: integer-looking cells coerce
+  to exact `i64` JSON numbers instead of drifting through `f64`; integer
+  literals whose magnitude exceeds 2^53 are preserved verbatim as strings,
+  and `lossy_coercion_possible` flags integer literals longer than 15
+  digits.
+- Tracing is installed before configuration loads; `Config::load` returns
+  collected `ConfigWarning`s that `main` replays through `tracing::warn!`,
+  so misconfiguration warnings are no longer silently dropped.
+- `TOON_MAX_INPUT_BYTES` is rejected above 1 GiB and
+  `TOON_MAX_CONCURRENT_CALLS` above 1024.
+- Shutdown issues the acknowledged sink `shutdown()` so the writer task
+  emits its counter-summary line at exit; `JsonlSink` is now `Clone`.
+- A pipeline timeout no longer releases the concurrency permit early: the
+  abandoned blocking task holds its permit until it completes, and is
+  counted in the new `blocking_tasks_abandoned` diagnostic.
+- A failed log flush no longer discards events for unaffected day
+  partitions; unwritten events are re-queued (bounded by the buffer size)
+  and retried on the next flush. Explicit flushes and shutdown call
+  `sync_data` before acknowledging, making the durability claim true
+  across power loss.
+- `JsonParser` rejects objects with duplicate keys
+  (`CoreError::DuplicateKey`) instead of silently keeping the last value,
+  and all parsers plus the format detector strip a leading UTF-8 BOM.
+- Documentation: the README no longer claims the pipeline is "lossy-free";
+  CSV/TSV coercion is documented as a lossy transform with its reporting
+  flags, and the false "unsigned artifacts / no SBOM" non-goals were
+  removed from docs/production.md (release.yml has signed and attested
+  releases with a CycloneDX SBOM).
+
+### Added (audit remediation)
+
+- Shared round-trip fidelity harness: `toon_mcp_core::values_equiv` (moved
+  from the eval harness) plus proptest coverage over tabular, fold-chain,
+  and primitive-array shapes; the comparison is direction-aware and rejects
+  integer-to-float drift.
+- `LogEvent.outcome` field (`ok` / `rejected` / `timeout` / `busy` /
+  `failed`); failure paths in every data tool now emit log events.
+- Failure counters (`request_failed_count`, `input_rejected_count`,
+  `server_busy_count`) and a fixed-bucket request-duration histogram in
+  `toon_diagnostics`; handler counters moved into a per-server `Metrics`
+  struct. `toon_diagnostics` gained a tracing span and its own log event.
+- `LogSink::record` returns `RecordOutcome { accepted, dropped }` so drops
+  are attributed synchronously instead of via diagnostics deltas.
+- JSON detection hands its parsed value to the compressor (about 10%
+  faster on the tabular-JSON pipeline benchmark) and JSONL detection
+  carries the line count, removing a second scan.
+- CI: round-trip fidelity gate over a committed fixture corpus, a
+  windows-latest `cargo check` job, a committed seed fuzz corpus with
+  caching, a 300 s scheduled fuzz budget with `cargo fuzz cmin`
+  corpus commit-back, workspace lint policy in Cargo.toml
+  (`unsafe_code = forbid`), tracked lockfiles for the evals and fuzz
+  crates, and a coverage floor of 85 (measured 90.9%).
+
 ### Added
 
 - Fourth MCP tool `toon_diagnostics` that returns runtime health counters:
