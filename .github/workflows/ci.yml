@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [master]
   pull_request:
-    branches: [main, master]
+    branches: [master]
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -61,8 +61,8 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      # Coverage gate. Floor raised from 70 -> 75 once non-trivial coverage
-      # was confirmed; bump again when coverage matures.
+      # Coverage gate. Floor raised 70 -> 75 -> 85; measured line coverage
+      # was 90.9% when the floor moved to 85, leaving ~6 points of headroom.
       - name: cargo llvm-cov (coverage gate)
         run: |
           cargo llvm-cov --workspace \
@@ -72,7 +72,7 @@ jobs:
             --ignore-filename-regex "crates/toon-mcp-bench"
           cargo llvm-cov report \
             --ignore-filename-regex "crates/toon-mcp-bench" \
-            --fail-under-lines 75
+            --fail-under-lines 85
 
       - name: Upload coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

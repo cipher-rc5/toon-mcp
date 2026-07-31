@@ -1,6 +1,8 @@
 // file: crates/toon-mcp-core/tests/stress_max_input_bytes.rs
 // description: Boundary stress tests asserting Compressor::decide behaviour at max_input_bytes ±1
 
+//! Boundary stress tests for the `max_input_bytes` gate.
+
 use toon_mcp_core::{CompressConfig, CompressDecision, Compressor, PassThroughReason};
 
 /// Build a tabular JSON array string of approximately `target_bytes` bytes.

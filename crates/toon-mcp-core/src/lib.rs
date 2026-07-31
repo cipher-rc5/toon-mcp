@@ -2,6 +2,7 @@
 // description: Public API surface for toon-mcp-core
 
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 //! Pure detection, parsing, classification, and compression pipeline for
 //! structured data formats (JSON, JSONL, CSV, TSV).

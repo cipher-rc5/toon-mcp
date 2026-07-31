@@ -45,4 +45,3 @@ pub fn decode_pipeline(toon: &str) -> Result<Value> {
     };
     toon_format::decode(toon, &opts).map_err(|e| anyhow!("decode failed: {e}"))
 }
-

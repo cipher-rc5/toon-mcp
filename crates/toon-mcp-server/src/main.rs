@@ -1,6 +1,10 @@
 // file: crates/toon-mcp-server/src/main.rs
 // description: Tokio entry point — wires config, logging, and MCP server together
 
+//! Binary entry point for `toon-mcp-server`: loads configuration, installs
+//! tracing, starts the JSONL log sink, and serves the MCP tools over stdio
+//! until stdin closes or a shutdown signal arrives.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

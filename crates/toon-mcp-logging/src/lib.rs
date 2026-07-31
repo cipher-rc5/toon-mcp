@@ -2,6 +2,7 @@
 // description: Public API surface for toon-mcp-logging
 
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 //! Async `LogSink` trait and implementations for structured event logging.
 //!

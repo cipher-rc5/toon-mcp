@@ -67,6 +67,15 @@ xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 # Property-based testing
 proptest = "=1.11.0"
 
+# Lint policy shared by every workspace member (each crate opts in with
+# `[lints] workspace = true`). Encodes what CI enforces via `-D warnings`.
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+
 [profile.release]
 opt-level = 3
 lto = true

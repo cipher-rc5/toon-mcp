@@ -164,13 +164,20 @@ _dev/
 .claude/
 
 # =============================================================================
+# Criterion baseline noise
+# =============================================================================
+# HTML reports and raw samples are regenerable and large; only
+# estimates.json / benchmark.json / tukey.json are tracked.
+bench/baselines/**/report/
+bench/baselines/**/sample.json
+
+# =============================================================================
 # cargo-fuzz
 # =============================================================================
 /fuzz/target/
 # /fuzz/corpus/ is tracked: it carries the seed corpus and the minimised
 # corpus committed back by the scheduled fuzz job, so coverage accumulates.
 /fuzz/artifacts/
-/fuzz/Cargo.lock
 
 # =============================================================================
 # Evaluation harness — source is tracked, but generated data stays private.
@@ -178,4 +185,3 @@ _dev/
 # =============================================================================
 /evals/results/
 /evals/target/
-/evals/Cargo.lock

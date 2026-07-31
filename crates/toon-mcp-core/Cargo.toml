@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 description = "Pure detection, parsing, classification, and compression pipeline for toon-mcp"
 
+[lints]
+workspace = true
+
 [dependencies]
 csv.workspace = true
 serde.workspace = true

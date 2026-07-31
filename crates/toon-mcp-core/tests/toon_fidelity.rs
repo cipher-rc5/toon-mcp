@@ -1,6 +1,8 @@
 // file: crates/toon-mcp-core/tests/toon_fidelity.rs
 // description: Round-trip fidelity harness — encode/decode with pipeline options must preserve values
 
+//! Round-trip fidelity harness: pipeline encode/decode must preserve values.
+
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 use toon_format::types::{KeyFoldingMode, PathExpansionMode};

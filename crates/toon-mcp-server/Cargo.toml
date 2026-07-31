@@ -17,6 +17,9 @@ path = "src/main.rs"
 name = "toon_mcp_server"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 dotenvy.workspace = true
 jiff.workspace = true

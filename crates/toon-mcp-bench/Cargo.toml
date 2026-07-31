@@ -24,6 +24,9 @@ harness = false
 name = "jsonl_sink"
 harness = false
 
+[lints]
+workspace = true
+
 [dependencies]
 toon-mcp-core = { path = "../toon-mcp-core" }
 

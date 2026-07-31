@@ -2,6 +2,8 @@
 // description: Throughput and back-pressure benchmarks for JsonlSink (record + flush)
 // reference: https://docs.rs/criterion/latest/criterion/
 
+//! Criterion benchmarks for the JSONL log sink write path.
+
 use std::hint::black_box;
 use std::time::Duration;
 
