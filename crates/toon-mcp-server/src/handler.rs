@@ -143,25 +143,16 @@ impl Metrics {
 async fn record_log_event(metrics: &Metrics, log_sink: &Arc<dyn LogSink>, event: LogEvent) {
     let event_id = event.event_id.clone();
     let tool_name = event.tool_name.clone();
-    let before = log_sink.diagnostics();
 
     match log_sink.record(event).await {
-        Ok(()) => {
-            let after = log_sink.diagnostics();
-            let dropped = after
-                .record_dropped_count
-                .saturating_sub(before.record_dropped_count);
-            if dropped > 0 {
+        Ok(outcome) => {
+            if outcome.dropped {
                 metrics
                     .log_record_dropped_count
-                    .fetch_add(dropped, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     component = "handler_logging",
-                    tool_name,
-                    event_id,
-                    dropped,
-                    total_dropped = after.record_dropped_count,
-                    "log event dropped by logging sink"
+                    tool_name, event_id, "log event dropped by logging sink"
                 );
             }
         }

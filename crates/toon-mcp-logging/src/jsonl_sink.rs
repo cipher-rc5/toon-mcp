@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use crate::{
     error::LogError,
     event::LogEvent,
-    sink::{LogDiagnostics, LogSink},
+    sink::{LogDiagnostics, LogSink, RecordOutcome},
 };
 use async_trait::async_trait;
 
@@ -222,17 +222,17 @@ impl JsonlSink {
 
 #[async_trait]
 impl LogSink for JsonlSink {
-    async fn record(&self, event: LogEvent) -> Result<(), LogError> {
+    async fn record(&self, event: LogEvent) -> Result<RecordOutcome, LogError> {
         // `record` is fire-and-forget at the handler boundary: under
-        // saturation we drop the event and return `Ok(())` rather than
-        // blocking the handler. A closed channel, however, is a real error
-        // operators must see (the writer task is dead).
+        // saturation we drop the event and report it in the outcome rather
+        // than blocking the handler. A closed channel, however, is a real
+        // error operators must see (the writer task is dead).
         match self.sender.try_send(SinkCmd::Record(Box::new(event))) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(RecordOutcome::ACCEPTED),
             Err(TrySendError::Full(_)) => {
                 self.record_dropped_count.fetch_add(1, Ordering::Relaxed);
                 set_last_error(&self.last_error, "writer task channel is full".into());
-                Ok(())
+                Ok(RecordOutcome::DROPPED)
             }
             Err(TrySendError::Closed(_)) => {
                 self.record_failed_count.fetch_add(1, Ordering::Relaxed);

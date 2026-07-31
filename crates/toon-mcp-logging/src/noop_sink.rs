@@ -4,7 +4,7 @@
 use crate::{
     error::LogError,
     event::LogEvent,
-    sink::{LogDiagnostics, LogSink},
+    sink::{LogDiagnostics, LogSink, RecordOutcome},
 };
 use async_trait::async_trait;
 
@@ -18,8 +18,10 @@ pub struct NoopSink;
 /// by leaving every queue gauge as `None`.
 #[async_trait]
 impl LogSink for NoopSink {
-    async fn record(&self, _event: LogEvent) -> Result<(), LogError> {
-        Ok(())
+    async fn record(&self, _event: LogEvent) -> Result<RecordOutcome, LogError> {
+        // Discarding is this sink's contract, not backpressure: report the
+        // event as accepted so callers do not count drops.
+        Ok(RecordOutcome::ACCEPTED)
     }
 
     async fn flush(&self) -> Result<(), LogError> {

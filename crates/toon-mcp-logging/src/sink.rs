@@ -29,6 +29,33 @@ pub struct LogDiagnostics {
     pub queue_available: Option<usize>,
 }
 
+/// What happened to a single event handed to [`LogSink::record`].
+///
+/// Returned so callers can attribute drops to the exact request that caused
+/// them, instead of inferring drops from diagnostics-counter deltas (which
+/// misattributes under concurrency and costs two snapshots per request).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordOutcome {
+    /// The sink took ownership of the event and will attempt to persist it.
+    pub accepted: bool,
+    /// The event was discarded due to backpressure (bounded queue full).
+    pub dropped: bool,
+}
+
+impl RecordOutcome {
+    /// The event was accepted for persistence.
+    pub const ACCEPTED: Self = Self {
+        accepted: true,
+        dropped: false,
+    };
+
+    /// The event was discarded due to backpressure.
+    pub const DROPPED: Self = Self {
+        accepted: false,
+        dropped: true,
+    };
+}
+
 /// Abstraction over a structured event logger.
 ///
 /// Implementations include:
@@ -59,7 +86,11 @@ pub struct LogDiagnostics {
 #[async_trait]
 pub trait LogSink: Send + Sync + 'static {
     /// Record a single tool invocation event.
-    async fn record(&self, event: LogEvent) -> Result<(), LogError>;
+    ///
+    /// Returns a [`RecordOutcome`] telling the caller whether the event was
+    /// accepted or dropped under backpressure. `Err` is reserved for real
+    /// failures (e.g. the writer task is gone).
+    async fn record(&self, event: LogEvent) -> Result<RecordOutcome, LogError>;
 
     /// Flush any buffered events to durable storage and wait for acknowledgement.
     ///

@@ -4,7 +4,7 @@
 use crate::{
     error::LogError,
     event::LogEvent,
-    sink::{LogDiagnostics, LogSink},
+    sink::{LogDiagnostics, LogSink, RecordOutcome},
 };
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -39,14 +39,14 @@ impl Default for MemorySink {
 
 #[async_trait]
 impl LogSink for MemorySink {
-    async fn record(&self, event: LogEvent) -> Result<(), LogError> {
+    async fn record(&self, event: LogEvent) -> Result<RecordOutcome, LogError> {
         self.events
             .lock()
             // Postcondition: only this task holds the lock; poisoning cannot
             // occur because we never panic while holding it.
             .expect("MemorySink mutex is unpoisoned")
             .push(event);
-        Ok(())
+        Ok(RecordOutcome::ACCEPTED)
     }
 
     async fn flush(&self) -> Result<(), LogError> {
