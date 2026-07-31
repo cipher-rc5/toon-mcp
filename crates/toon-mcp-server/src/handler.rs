@@ -43,6 +43,14 @@ static REQUEST_SUCCEEDED_COUNT: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_MAX: AtomicU64 = AtomicU64::new(0);
 
+/// Histogram bucket upper bounds in microseconds: 1 ms, 10 ms, 100 ms, 1 s,
+/// 10 s. Durations above the last bound land in the +Inf bucket (index 5).
+const DURATION_BUCKET_BOUNDS_US: [u64; 5] = [1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+
+/// Per-band counts for successful request durations; index i covers
+/// durations in (bound[i-1], bound[i]], index 5 is the +Inf band.
+static REQUEST_DURATION_BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 /// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
 /// Avoids OS RNG. The output is a 64-bit xxh3 hash; under the birthday paradox,
 /// collisions become non-negligible around 2^32 (~4.3 billion) generated IDs.
@@ -62,6 +70,11 @@ fn new_event_id() -> String {
 fn record_success_duration(duration_us: u64) {
     REQUEST_SUCCEEDED_COUNT.fetch_add(1, Ordering::Relaxed);
     REQUEST_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
+    let bucket = DURATION_BUCKET_BOUNDS_US
+        .iter()
+        .position(|&bound| duration_us <= bound)
+        .unwrap_or(DURATION_BUCKET_BOUNDS_US.len());
+    REQUEST_DURATION_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
     let mut current = REQUEST_DURATION_US_MAX.load(Ordering::Relaxed);
     while duration_us > current {
         match REQUEST_DURATION_US_MAX.compare_exchange_weak(
@@ -984,6 +997,34 @@ pub struct LoggingDiagnosticsResult {
     pub queue_available: Option<usize>,
 }
 
+/// Cumulative fixed-bucket histogram of successful request durations.
+///
+/// Buckets are cumulative in the Prometheus `le` style: `le_10ms` counts
+/// every request completing in at most 10 ms, including those counted by
+/// `le_1ms`. `gt_10s` is the overflow band. The total number of observed
+/// requests is `le_10s + gt_10s`, which equals `request_succeeded_count`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DurationHistogramResult {
+    /// Requests completing in at most 1 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_1ms: u64,
+    /// Requests completing in at most 10 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_10ms: u64,
+    /// Requests completing in at most 100 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_100ms: u64,
+    /// Requests completing in at most 1 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_1s: u64,
+    /// Requests completing in at most 10 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_10s: u64,
+    /// Requests taking longer than 10 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub gt_10s: u64,
+}
+
 /// Handler-level diagnostics returned by `toon_diagnostics`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct HandlerDiagnosticsResult {
@@ -1021,6 +1062,9 @@ pub struct HandlerDiagnosticsResult {
     pub request_duration_us_max: u64,
     /// Average successful request duration in microseconds.
     pub request_duration_us_avg: f64,
+    /// Cumulative duration histogram for successful requests. The three
+    /// total/max/avg gauges above are retained for backward compatibility.
+    pub request_duration_us_histogram: DurationHistogramResult,
 }
 
 /// Output from `toon_diagnostics`.
@@ -1038,6 +1082,22 @@ pub struct DiagnosticsResult {
     /// Configured maximum concurrent calls.
     #[schemars(schema_with = "schema_as_integer")]
     pub max_concurrent_calls: usize,
+}
+
+/// Snapshot the per-band bucket counters as a cumulative `le`-style histogram.
+fn duration_histogram() -> DurationHistogramResult {
+    let bands: Vec<u64> = REQUEST_DURATION_BUCKETS
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
+    DurationHistogramResult {
+        le_1ms: bands[0],
+        le_10ms: bands[0] + bands[1],
+        le_100ms: bands[0] + bands[1] + bands[2],
+        le_1s: bands[..4].iter().sum(),
+        le_10s: bands[..5].iter().sum(),
+        gt_10s: bands[5],
+    }
 }
 
 /// Handle the `toon_diagnostics` MCP tool.
@@ -1080,6 +1140,7 @@ pub async fn handle_toon_diagnostics(
             request_duration_us_total: duration_total,
             request_duration_us_max: REQUEST_DURATION_US_MAX.load(Ordering::Relaxed),
             request_duration_us_avg: duration_avg,
+            request_duration_us_histogram: duration_histogram(),
         },
         semaphore_available_permits: semaphore.available_permits(),
         max_concurrent_calls: config.max_concurrent_calls,
@@ -1568,6 +1629,49 @@ mod tests {
         assert!(
             after.handler.request_duration_us_total >= before.handler.request_duration_us_total
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_histogram_counts_successful_requests() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let total = |h: &DurationHistogramResult| h.le_10s + h.gt_10s;
+
+        let before = handle_toon_diagnostics(
+            DiagnosticsParams {},
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("diagnostics succeeds");
+
+        handle_detect_format(
+            DetectParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("tool call succeeds");
+
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), sem)
+            .await
+            .expect("diagnostics succeeds");
+        let h = &after.handler.request_duration_us_histogram;
+        assert!(
+            total(h) > total(&before.handler.request_duration_us_histogram),
+            "histogram total observes the new request"
+        );
+        // Cumulative monotonicity across buckets.
+        assert!(h.le_1ms <= h.le_10ms);
+        assert!(h.le_10ms <= h.le_100ms);
+        assert!(h.le_100ms <= h.le_1s);
+        assert!(h.le_1s <= h.le_10s);
+        // The histogram and the succeeded counter observe the same stream.
+        assert_eq!(total(h), after.handler.request_succeeded_count);
     }
 
     // --- memory sink ---
