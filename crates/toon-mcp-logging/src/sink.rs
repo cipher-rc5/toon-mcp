@@ -64,7 +64,9 @@ pub trait LogSink: Send + Sync + 'static {
     /// Flush any buffered events to durable storage and wait for acknowledgement.
     ///
     /// Unlike a fire-and-forget send, the caller can rely on events being
-    /// durable after this returns `Ok(())`.
+    /// durable after this returns `Ok(())`. Disk-backed implementations call
+    /// `sync_data` on the written files before acknowledging, so acknowledged
+    /// events survive power loss, not merely process exit.
     async fn flush(&self) -> Result<(), LogError>;
 
     /// Return a point-in-time diagnostics snapshot for this sink.

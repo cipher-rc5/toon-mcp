@@ -268,8 +268,9 @@ impl LogSink for JsonlSink {
     /// Flush all buffered events to disk and wait for acknowledgement.
     ///
     /// This method blocks until the writer task confirms the flush is
-    /// complete — unlike a fire-and-forget send, the caller can rely on
-    /// events being durable after this returns `Ok(())`.
+    /// complete, including a `sync_data` on each written partition file —
+    /// unlike a fire-and-forget send, the caller can rely on events being
+    /// durable on disk (across power loss) after this returns `Ok(())`.
     async fn flush(&self) -> Result<(), LogError> {
         let (tx, rx) = oneshot::channel();
         self.sender
@@ -326,9 +327,9 @@ async fn writer_task(
                                 &mut pending,
                                 &log_dir,
                                 &mut file_handles,
-                                &diagnostics.serialization_failed_count,
-                                &diagnostics.writer_failed_count,
-                                &diagnostics.last_error,
+                                buffer_size,
+                                false,
+                                &diagnostics,
                             ).await {
                                 warn!("JsonlSink flush (buffer full) failed: {e}");
                             }
@@ -338,9 +339,9 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            buffer_size,
+                            true,
+                            &diagnostics,
                         )
                         .await;
                         let _ = ack.send(result);
@@ -350,9 +351,9 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            buffer_size,
+                            true,
+                            &diagnostics,
                         )
                         .await;
                         let _ = ack.send(result);
@@ -376,9 +377,9 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            buffer_size,
+                            false,
+                            &diagnostics,
                         ).await {
                             warn!("JsonlSink flush (channel closed) failed: {e}");
                         }
@@ -394,9 +395,9 @@ async fn writer_task(
                         &mut pending,
                         &log_dir,
                         &mut file_handles,
-                        &diagnostics.serialization_failed_count,
-                        &diagnostics.writer_failed_count,
-                        &diagnostics.last_error,
+                        buffer_size,
+                        false,
+                        &diagnostics,
                     ).await {
                         warn!("JsonlSink flush (periodic) failed: {e}");
                     }
@@ -422,13 +423,23 @@ async fn writer_task(
 /// File handles are cached in `file_handles` and re-used across calls to avoid
 /// repeated `open(2)` / `close(2)` syscalls. A handle is opened the first time
 /// a partition key is seen; it is closed only when the writer task exits.
+///
+/// Partitions are written independently: a failure on one partition does not
+/// discard events destined for the others. Events whose partition failed are
+/// pushed back onto `pending` (bounded by `buffer_size`) so a later flush can
+/// retry them; overflow beyond the buffer is dropped and counted in
+/// `record_dropped_count`.
+///
+/// When `sync` is true (explicit flush and shutdown), `sync_data` is called
+/// on each written file before returning, so events are durable on disk when
+/// the acknowledgement is sent.
 async fn flush_pending(
     pending: &mut Vec<LogEvent>,
     log_dir: &Path,
     file_handles: &mut HashMap<String, std::fs::File>,
-    serialization_failed_count: &Arc<AtomicU64>,
-    writer_failed_count: &AtomicU64,
-    last_error: &Mutex<Option<String>>,
+    buffer_size: usize,
+    sync: bool,
+    diagnostics: &WriterDiagnostics,
 ) -> Result<(), LogError> {
     if pending.is_empty() {
         return Ok(());
@@ -450,100 +461,142 @@ async fn flush_pending(
         day_events.push((day, partition_dir, events));
     }
 
-    if day_events.is_empty() {
-        return Ok(());
-    }
-
     // Move file handles into spawn_blocking and get them back after.
     let mut handles_snapshot = std::mem::take(file_handles);
-    let serialization_failed_count = Arc::clone(serialization_failed_count);
+    let serialization_failed_count = Arc::clone(&diagnostics.serialization_failed_count);
 
-    let (handles_snapshot, result) = tokio::task::spawn_blocking(
-        move || -> (HashMap<String, std::fs::File>, Result<(), LogError>) {
+    type FlushOutcome = (HashMap<String, std::fs::File>, Vec<LogEvent>, Vec<LogError>);
+    let (handles_snapshot, requeue, errors): FlushOutcome =
+        tokio::task::spawn_blocking(move || {
+            let mut requeue: Vec<LogEvent> = Vec::new();
+            let mut errors: Vec<LogError> = Vec::new();
             for (day, partition_dir, events) in day_events {
-                // Serialize events on the blocking thread so allocation-heavy
-                // work is kept off the async executor.
-                let lines: String = events
-                    .iter()
-                    .map(|e| match serde_json::to_string(e) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            // H1: visible error — never silently drop events.
-                            serialization_failed_count.fetch_add(1, Ordering::Relaxed);
-                            error!(
-                                event_id = %e.event_id,
-                                "JsonlSink: serialization failed, event skipped: {err}"
-                            );
-                            String::new()
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if lines.is_empty() {
-                    continue;
-                }
-                let lines = lines + "\n";
-
-                if let Err(e) = std::fs::create_dir_all(&partition_dir) {
-                    return (handles_snapshot, Err(LogError::IoError(e)));
-                }
-
-                let file_path = partition_dir.join("events.jsonl");
-                // Bound the handle map: before opening a brand-new day
-                // partition, evict the oldest day(s) once we are at the cap.
-                // Keys are lexicographically sortable `YYYY-MM-DD`, so the
-                // minimum key is the oldest. Dropping a `File` flushes/closes
-                // it. Skip eviction when the day is already cached.
-                if !handles_snapshot.contains_key(&day) {
-                    while handles_snapshot.len() >= MAX_OPEN_DAY_PARTITIONS {
-                        if let Some(oldest) = handles_snapshot.keys().min().cloned() {
-                            handles_snapshot.remove(&oldest);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                // L3: re-use open handle; open once per partition per process run.
-                let entry = handles_snapshot.entry(day);
-                let file = match entry {
-                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&file_path)
-                        {
-                            Ok(f) => v.insert(f),
-                            Err(e) => return (handles_snapshot, Err(LogError::IoError(e))),
-                        }
-                    }
-                };
-
-                if let Err(e) = file.write_all(lines.as_bytes()) {
-                    return (handles_snapshot, Err(LogError::IoError(e)));
+                if let Err(e) = write_partition(
+                    &mut handles_snapshot,
+                    &day,
+                    &partition_dir,
+                    &events,
+                    sync,
+                    &serialization_failed_count,
+                ) {
+                    // Independent partitions: keep the failed partition's
+                    // events for retry and carry on with the others.
+                    errors.push(e);
+                    requeue.extend(events);
                 }
             }
-            (handles_snapshot, Ok(()))
-        },
-    )
-    .await
-    .map_err(|e| {
-        error!("JsonlSink spawn_blocking task failed: {e}");
-        let message = format!("spawn_blocking failed: {e}");
-        writer_failed_count.fetch_add(1, Ordering::Relaxed);
-        set_last_error(last_error, message.clone());
-        LogError::IoError(std::io::Error::other(message))
-    })?;
+            (handles_snapshot, requeue, errors)
+        })
+        .await
+        .map_err(|e| {
+            error!("JsonlSink spawn_blocking task failed: {e}");
+            let message = format!("spawn_blocking failed: {e}");
+            diagnostics
+                .writer_failed_count
+                .fetch_add(1, Ordering::Relaxed);
+            set_last_error(&diagnostics.last_error, message.clone());
+            LogError::IoError(std::io::Error::other(message))
+        })?;
 
     // Restore the file handles regardless of outcome.
     *file_handles = handles_snapshot;
 
-    if let Err(err) = result {
-        writer_failed_count.fetch_add(1, Ordering::Relaxed);
-        set_last_error(last_error, err.to_string());
-        return Err(err);
+    // Re-queue unwritten events so a later flush retries them, bounded by
+    // the configured buffer size.
+    if !requeue.is_empty() {
+        let keep = requeue.len().min(buffer_size.saturating_sub(pending.len()));
+        let dropped = requeue.len() - keep;
+        if dropped > 0 {
+            diagnostics
+                .record_dropped_count
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            warn!(
+                dropped,
+                "JsonlSink: dropping unwritten events beyond buffer capacity after failed flush"
+            );
+        }
+        pending.extend(requeue.into_iter().take(keep));
+    }
+
+    if let Some(first) = errors.into_iter().next() {
+        diagnostics
+            .writer_failed_count
+            .fetch_add(1, Ordering::Relaxed);
+        set_last_error(&diagnostics.last_error, first.to_string());
+        return Err(first);
+    }
+    Ok(())
+}
+
+/// Serialize and append one partition's events, opening or re-using the
+/// cached file handle. Runs on the blocking pool.
+fn write_partition(
+    handles: &mut HashMap<String, std::fs::File>,
+    day: &str,
+    partition_dir: &Path,
+    events: &[LogEvent],
+    sync: bool,
+    serialization_failed_count: &AtomicU64,
+) -> Result<(), LogError> {
+    // Serialize events on the blocking thread so allocation-heavy work is
+    // kept off the async executor.
+    let lines: String = events
+        .iter()
+        .map(|e| match serde_json::to_string(e) {
+            Ok(s) => s,
+            Err(err) => {
+                // H1: visible error — never silently drop events.
+                serialization_failed_count.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    event_id = %e.event_id,
+                    "JsonlSink: serialization failed, event skipped: {err}"
+                );
+                String::new()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let lines = lines + "\n";
+
+    std::fs::create_dir_all(partition_dir).map_err(LogError::IoError)?;
+
+    let file_path = partition_dir.join("events.jsonl");
+    // Bound the handle map: before opening a brand-new day partition, evict
+    // the oldest day(s) once we are at the cap. Keys are lexicographically
+    // sortable `YYYY-MM-DD`, so the minimum key is the oldest. Dropping a
+    // `File` flushes/closes it. Skip eviction when the day is already cached.
+    if !handles.contains_key(day) {
+        while handles.len() >= MAX_OPEN_DAY_PARTITIONS {
+            if let Some(oldest) = handles.keys().min().cloned() {
+                handles.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+    // L3: re-use open handle; open once per partition per process run.
+    let file = match handles.entry(day.to_owned()) {
+        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => v.insert(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+                .map_err(LogError::IoError)?,
+        ),
+    };
+
+    file.write_all(lines.as_bytes())
+        .map_err(LogError::IoError)?;
+    if sync {
+        // Explicit flush/shutdown: make the write durable before the
+        // acknowledgement is sent back to the caller.
+        file.sync_data().map_err(LogError::IoError)?;
     }
     Ok(())
 }
@@ -919,6 +972,86 @@ mod tests {
         sink.flush().await.expect("flush");
         assert_eq!(sink.serialization_failed_count(), 0);
         Box::new(sink).shutdown().await.expect("shutdown");
+    }
+
+    /// A failed flush must not discard events: they are re-queued onto
+    /// `pending` and written by the next successful flush. Failure is
+    /// injected by replacing the log directory with a regular file so
+    /// partition creation fails (works even when tests run as root, unlike
+    /// permission bits).
+    #[tokio::test]
+    async fn events_survive_failed_flush_and_are_requeued() {
+        let parent = tempfile::tempdir().expect("tempdir created successfully");
+        let log_dir = parent.path().join("logs");
+        let config = JsonlSinkConfig {
+            log_dir: log_dir.clone(),
+            buffer_size: 100,
+            flush_interval: Duration::from_secs(3600),
+        };
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        tokio::spawn(task);
+
+        sink.record(make_event(1)).await.expect("record succeeds");
+
+        std::fs::remove_dir_all(&log_dir).expect("log directory removed");
+        std::fs::write(&log_dir, b"not a directory").expect("file replaces log directory");
+        assert!(
+            sink.flush().await.is_err(),
+            "flush must fail while the log dir is unwritable"
+        );
+
+        // Repair the directory; the re-queued event must be written now.
+        std::fs::remove_file(&log_dir).expect("sabotage file removed");
+        std::fs::create_dir_all(&log_dir).expect("log directory restored");
+        sink.flush().await.expect("second flush succeeds");
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
+
+        let path = log_dir.join("day=2023-11-14").join("events.jsonl");
+        let content = std::fs::read_to_string(&path).expect("file readable");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "event survived the failed flush"
+        );
+    }
+
+    /// A failure on one day partition must not lose events destined for a
+    /// different, healthy partition within the same flush. With the log dir
+    /// replaced by a file both partitions fail and re-queue; after repair
+    /// both must land in their own partition files.
+    #[tokio::test]
+    async fn multi_partition_flush_failure_preserves_all_partitions() {
+        let parent = tempfile::tempdir().expect("tempdir created successfully");
+        let log_dir = parent.path().join("logs");
+        let config = JsonlSinkConfig {
+            log_dir: log_dir.clone(),
+            buffer_size: 100,
+            flush_interval: Duration::from_secs(3600),
+        };
+        let (sink, task) = JsonlSink::new(config).expect("JsonlSink constructs");
+        tokio::spawn(task);
+
+        let mut day_a = make_event(1);
+        day_a.ts_us = 1_700_000_000_000_000; // 2023-11-14
+        let mut day_b = make_event(2);
+        day_b.ts_us = 1_700_006_400_000_000; // 2023-11-15
+        sink.record(day_a).await.expect("record a");
+        sink.record(day_b).await.expect("record b");
+
+        std::fs::remove_dir_all(&log_dir).expect("log directory removed");
+        std::fs::write(&log_dir, b"not a directory").expect("file replaces log directory");
+        assert!(sink.flush().await.is_err(), "flush must fail");
+
+        std::fs::remove_file(&log_dir).expect("sabotage file removed");
+        std::fs::create_dir_all(&log_dir).expect("log directory restored");
+        sink.flush().await.expect("second flush succeeds");
+        Box::new(sink).shutdown().await.expect("shutdown succeeds");
+
+        for day in ["2023-11-14", "2023-11-15"] {
+            let path = log_dir.join(format!("day={day}")).join("events.jsonl");
+            let content = std::fs::read_to_string(&path).expect("file readable");
+            assert_eq!(content.lines().count(), 1, "partition {day} has its event");
+        }
     }
 
     #[tokio::test]
