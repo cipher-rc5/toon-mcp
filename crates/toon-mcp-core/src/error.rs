@@ -40,4 +40,14 @@ pub enum CoreError {
         /// The duplicated header name (first occurrence preserved here).
         header: String,
     },
+
+    /// A JSON object contains the same key more than once. Returned by
+    /// `JsonParser::parse` to prevent silent data loss when duplicates would
+    /// collapse in `serde_json::Map` (last key wins), mirroring
+    /// [`CoreError::DuplicateHeader`] for CSV/TSV.
+    #[error("JSON parse failed: duplicate key {key:?} appears more than once in one object")]
+    DuplicateKey {
+        /// The duplicated key name.
+        key: String,
+    },
 }

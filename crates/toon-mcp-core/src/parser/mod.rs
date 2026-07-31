@@ -10,6 +10,15 @@ pub mod jsonl;
 
 use crate::error::CoreError;
 
+/// Strip a single leading UTF-8 byte-order mark.
+///
+/// Editors and Windows tooling commonly prepend U+FEFF; every parser strips
+/// it before parsing so a BOM never turns an otherwise valid document into a
+/// parse failure.
+pub(crate) fn strip_bom(input: &str) -> &str {
+    input.strip_prefix('\u{feff}').unwrap_or(input)
+}
+
 /// A stateless parser that converts a raw input string into a normalised
 /// `serde_json::Value`.
 ///

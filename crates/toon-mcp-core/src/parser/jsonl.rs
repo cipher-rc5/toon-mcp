@@ -33,6 +33,7 @@ pub struct JsonlParser;
 
 impl Parser for JsonlParser {
     fn parse(&self, input: &str) -> Result<serde_json::Value, CoreError> {
+        let input = crate::parser::strip_bom(input);
         let mut values: Vec<serde_json::Value> = Vec::new();
 
         for (idx, raw_line) in input.lines().enumerate() {
@@ -140,6 +141,14 @@ not json
         let p = JsonlParser;
         let v = p.parse("   \n\t\n  ").unwrap();
         assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leading_bom_is_stripped() {
+        let v = JsonlParser
+            .parse("\u{feff}{\"a\":1}\n{\"a\":2}")
+            .expect("parse");
+        assert_eq!(v.as_array().unwrap().len(), 2);
     }
 
     #[test]

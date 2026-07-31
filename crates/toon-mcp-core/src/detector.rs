@@ -188,19 +188,32 @@ impl FormatDetector {
         input: &str,
         want_value: bool,
     ) -> (DetectionMetadata, Option<serde_json::Value>) {
+        // A leading UTF-8 BOM would defeat every probe (it is not ASCII
+        // whitespace); the parsers strip it identically.
+        let input = crate::parser::strip_bom(input);
         let mut candidates = Vec::new();
         let mut json_value = None;
 
         // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
         // Metadata-only callers validate with `IgnoredAny` (no `Value` tree
         // allocation); pipeline callers ask for the value so the validation
-        // pass doubles as the parse.
+        // pass doubles as the parse (duplicate-key checked, matching
+        // `JsonParser`).
         let first_nonws = input.bytes().find(|b| !b.is_ascii_whitespace());
         if matches!(first_nonws, Some(b'{') | Some(b'[')) {
             if want_value {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
-                    json_value = Some(v);
-                    candidates.push(InputFormat::Json);
+                match crate::parser::json::parse_dup_checked(input) {
+                    Ok(v) => {
+                        json_value = Some(v);
+                        candidates.push(InputFormat::Json);
+                    }
+                    // Structurally valid JSON with duplicate keys: still a
+                    // JSON candidate, but no value — the pipeline's parser
+                    // fallback re-parses and surfaces the duplicate-key error.
+                    Err(CoreError::DuplicateKey { .. }) => {
+                        candidates.push(InputFormat::Json);
+                    }
+                    Err(_) => {}
                 }
             } else if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
                 candidates.push(InputFormat::Json);
@@ -498,5 +511,47 @@ mod tests {
     fn detect_csv_with_unicode_fields() {
         let input = "name,city\nAlice,東京\nBob,大阪";
         assert_eq!(FormatDetector::detect(input), InputFormat::Csv);
+    }
+
+    #[test]
+    fn detect_strips_leading_bom() {
+        assert_eq!(
+            FormatDetector::detect("\u{feff}{\"a\":1}"),
+            InputFormat::Json
+        );
+        assert_eq!(
+            FormatDetector::detect("\u{feff}id,name\n1,Alice"),
+            InputFormat::Csv
+        );
+    }
+
+    #[test]
+    fn detect_metadata_carries_jsonl_line_count() {
+        let meta = FormatDetector::detect_with_metadata("{\"a\":1}\n\n{\"b\":2}\n{\"c\":3}");
+        assert_eq!(meta.format, InputFormat::Jsonl);
+        assert_eq!(meta.line_count, Some(3));
+
+        let meta = FormatDetector::detect_with_metadata(r#"{"a":1}"#);
+        assert_eq!(meta.line_count, None);
+    }
+
+    #[test]
+    fn detect_with_value_returns_parsed_json() {
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value(r#"{"x":1}"#);
+        assert_eq!(meta.format, InputFormat::Json);
+        assert_eq!(value.expect("value present")["x"], 1);
+
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value("id,name\n1,Alice");
+        assert_eq!(meta.format, InputFormat::Csv);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn detect_with_value_flags_duplicate_key_json_without_value() {
+        // Structurally JSON, but the duplicate key means no value is handed
+        // back; the pipeline's parser fallback surfaces the error.
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value(r#"{"a":1,"a":2}"#);
+        assert_eq!(meta.format, InputFormat::Json);
+        assert!(value.is_none());
     }
 }

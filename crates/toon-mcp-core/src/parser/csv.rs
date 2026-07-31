@@ -99,6 +99,7 @@ impl CsvParser {
     /// spellings of whole numbers, and integer literals longer than 15 digits
     /// (which exceed exact f64 representability in downstream consumers).
     pub fn coercion_metadata(&self, input: &str) -> Result<CsvCoercionMetadata, CoreError> {
+        let input = crate::parser::strip_bom(input);
         let mut rdr = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
             .from_reader(input.as_bytes());
@@ -232,6 +233,7 @@ impl CsvParser {
         &self,
         input: &str,
     ) -> Result<(Value, CsvCoercionMetadata), CoreError> {
+        let input = crate::parser::strip_bom(input);
         let mut rdr = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
             .from_reader(input.as_bytes());
@@ -501,6 +503,20 @@ mod tests {
         assert_eq!(v[0]["id"], "99999999999999999999");
         let meta = p.coercion_metadata(input).unwrap();
         assert!(meta.lossy_coercion_possible);
+    }
+
+    #[test]
+    fn leading_bom_is_stripped() {
+        // Without stripping, the BOM would glue onto the first header name.
+        let v = CsvParser::csv()
+            .parse("\u{feff}id,name\n1,Alice")
+            .expect("parse");
+        let obj = v[0].as_object().expect("row is object");
+        assert!(obj.contains_key("id"), "BOM must not corrupt the header");
+        let meta = CsvParser::csv()
+            .coercion_metadata("\u{feff}id,name\n1,Alice")
+            .expect("metadata");
+        assert!(meta.numeric_coercion_used);
     }
 
     #[test]
