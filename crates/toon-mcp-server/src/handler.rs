@@ -35,6 +35,7 @@ static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HANDLER_LOG_RECORD_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
 static HANDLER_LOG_RECORD_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLOCKING_TASKS_ABANDONED: AtomicU64 = AtomicU64::new(0);
 static REQUEST_SUCCEEDED_COUNT: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_MAX: AtomicU64 = AtomicU64::new(0);
@@ -151,6 +152,7 @@ where
         }
         Err(_) => {
             PIPELINE_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+            BLOCKING_TASKS_ABANDONED.fetch_add(1, Ordering::Relaxed);
             // The abandoned task still runs on the blocking pool; a reaper
             // task holds the permit until it completes so its capacity cost
             // stays visible to the semaphore.
@@ -855,6 +857,10 @@ pub struct HandlerDiagnosticsResult {
     /// Number of pipeline timeout responses returned by handlers.
     #[schemars(schema_with = "schema_as_integer")]
     pub pipeline_timeout_count: u64,
+    /// Number of blocking pipeline tasks abandoned after a timeout. Each
+    /// abandoned task keeps its concurrency permit until it completes.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub blocking_tasks_abandoned: u64,
     /// Number of successful tool requests included in duration gauges.
     #[schemars(schema_with = "schema_as_integer")]
     pub request_succeeded_count: u64,
@@ -917,6 +923,7 @@ pub async fn handle_toon_diagnostics(
             log_record_failed_count: HANDLER_LOG_RECORD_FAILED_COUNT.load(Ordering::Relaxed),
             log_record_dropped_count: HANDLER_LOG_RECORD_DROPPED_COUNT.load(Ordering::Relaxed),
             pipeline_timeout_count: PIPELINE_TIMEOUT_COUNT.load(Ordering::Relaxed),
+            blocking_tasks_abandoned: BLOCKING_TASKS_ABANDONED.load(Ordering::Relaxed),
             request_succeeded_count: succeeded,
             request_duration_us_total: duration_total,
             request_duration_us_max: REQUEST_DURATION_US_MAX.load(Ordering::Relaxed),
