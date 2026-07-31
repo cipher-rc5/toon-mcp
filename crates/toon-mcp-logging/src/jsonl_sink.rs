@@ -100,6 +100,12 @@ struct WriterDiagnostics {
 ///
 /// The writer task owns the open file handles and is the sole writer. Readers
 /// (e.g. `duckdb data/logs/**/*.jsonl`) never need to acquire a lock.
+///
+/// Cloning yields another handle to the same writer task: clones share the
+/// command channel and diagnostics counters. This lets the binary keep an
+/// owned handle for the shutdown command while handlers hold the sink behind
+/// `Arc<dyn LogSink>`.
+#[derive(Clone)]
 pub struct JsonlSink {
     sender: mpsc::Sender<SinkCmd>,
     serialization_failed_count: Arc<AtomicU64>,

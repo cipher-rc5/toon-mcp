@@ -12,13 +12,31 @@ use toon_mcp_logging::{JsonlSink, LogSink, NoopSink};
 
 use toon_mcp_server::{config::Config, error::ServerError, server::ToonMcpServer};
 
+/// Sink handles wired up at startup: the shared handler sink, an optional
+/// owned handle used to issue the acknowledged shutdown command at exit, and
+/// the writer-task supervisor handle.
+type SinkHandles = (
+    Arc<dyn LogSink>,
+    Option<Box<dyn LogSink>>,
+    Option<tokio::task::JoinHandle<()>>,
+);
+
 #[tokio::main]
 async fn main() -> Result<(), ServerError> {
     dotenvy::dotenv().ok();
 
-    let config = Config::load()?;
+    // Install tracing BEFORE loading config: Config::load collects warnings
+    // rather than logging them, and any warning emitted before the subscriber
+    // exists would be silently dropped. The filter string is read directly
+    // from the environment because the subscriber must exist first.
+    init_tracing(&std::env::var("TOON_LOG_LEVEL").unwrap_or_else(|_| "info".into()));
 
-    init_tracing(&config.log_level);
+    let (config, config_warnings) = Config::load()?;
+
+    // Replay config warnings now that the subscriber is live.
+    for w in &config_warnings {
+        warn!(var = w.var, raw = %w.raw, "{}", w.reason);
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -30,24 +48,30 @@ async fn main() -> Result<(), ServerError> {
     let shutdown_initiated = Arc::new(AtomicBool::new(false));
 
     // Construct the log sink and spawn the background writer task.
-    // The sink is wrapped in Arc for shared access from the server handlers.
-    let (sink, supervisor_handle): (Arc<dyn LogSink>, Option<tokio::task::JoinHandle<()>>) =
-        if config.logging_enabled {
-            let logging_config = config.logging.clone();
-            // `start` owns the spawn so callers cannot forget the writer task.
-            let (jsonl_sink, handle) = JsonlSink::start(logging_config)?;
+    // The sink is wrapped in Arc for shared access from the server handlers;
+    // main additionally keeps an owned boxed clone so it can issue the
+    // acknowledged Shutdown command at exit (clones share the writer task).
+    let (sink, sink_shutdown, supervisor_handle): SinkHandles = if config.logging_enabled {
+        let logging_config = config.logging.clone();
+        // `start` owns the spawn so callers cannot forget the writer task.
+        let (jsonl_sink, handle) = JsonlSink::start(logging_config)?;
 
-            // M3: Supervisor — treat unexpected writer task exit as fatal.
-            // Log a structured error so operators can detect silent log loss.
-            let supervisor = tokio::spawn(supervise_writer_task(
-                handle,
-                Arc::clone(&shutdown_initiated),
-            ));
+        // M3: Supervisor — treat unexpected writer task exit as fatal.
+        // Log a structured error so operators can detect silent log loss.
+        let supervisor = tokio::spawn(supervise_writer_task(
+            handle,
+            Arc::clone(&shutdown_initiated),
+        ));
 
-            (Arc::new(jsonl_sink), Some(supervisor))
-        } else {
-            (Arc::new(NoopSink), None)
-        };
+        let shutdown_handle: Box<dyn LogSink> = Box::new(jsonl_sink.clone());
+        (
+            Arc::new(jsonl_sink),
+            Some(shutdown_handle),
+            Some(supervisor),
+        )
+    } else {
+        (Arc::new(NoopSink), None, None)
+    };
 
     let server = ToonMcpServer::new(config.clone(), Arc::clone(&sink));
     let service = server.serve(stdio()).await.map_err(Box::new)?;
@@ -143,18 +167,23 @@ async fn main() -> Result<(), ServerError> {
         }
     }
 
-    // C2/C4: Use the acknowledged flush() which now sends a Flush command and
-    // waits on a oneshot channel for the writer task to confirm all pending
-    // events have been flushed to disk before returning Ok(()).
-    // After the acknowledged flush we drop the Arc, which closes the channel
-    // and causes the writer task to drain and exit cleanly on its next loop.
-    if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(10), sink.flush()).await {
-        warn!("log sink flush timed out after 10 s: {e}");
-    }
-    // Mark shutdown so the supervisor distinguishes clean drain from an
-    // unexpected exit, then drop the Arc so the writer task's channel receiver
-    // sees closure.
+    // C2/C4: Issue the acknowledged shutdown() rather than flush(): the
+    // writer task flushes all pending events AND emits its counter-summary
+    // line before exiting, so operators get the final drop/failure totals.
+    // Mark shutdown first so the supervisor classifies the writer exit as a
+    // clean drain rather than an unexpected termination.
     shutdown_initiated.store(true, Ordering::Relaxed);
+    if let Some(sink_shutdown) = sink_shutdown {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), sink_shutdown.shutdown())
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("log sink shutdown failed: {e}"),
+            Err(e) => warn!("log sink shutdown timed out after 10 s: {e}"),
+        }
+    }
+    // Drop the handler Arc so the writer task's channel receiver sees closure
+    // even on the NoopSink path (where no shutdown command exists).
     drop(sink);
 
     // Await the supervisor task so the writer fully drains before exit. The
