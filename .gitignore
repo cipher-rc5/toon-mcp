@@ -167,7 +167,8 @@ _dev/
 # cargo-fuzz
 # =============================================================================
 /fuzz/target/
-/fuzz/corpus/
+# /fuzz/corpus/ is tracked: it carries the seed corpus and the minimised
+# corpus committed back by the scheduled fuzz job, so coverage accumulates.
 /fuzz/artifacts/
 /fuzz/Cargo.lock
 
