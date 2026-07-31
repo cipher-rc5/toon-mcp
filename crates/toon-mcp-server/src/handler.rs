@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -118,9 +118,16 @@ async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
 /// every handler so the surrounding code does not have to thread two layers
 /// of error mapping. The timeout error message references
 /// `TOON_PIPELINE_TIMEOUT_MS` so operators can find the knob.
+///
+/// The caller's concurrency permit is passed in and held until the blocking
+/// task actually resolves — not merely until the timeout fires. A blocking
+/// task cannot be cancelled, so on timeout the error is returned to the
+/// caller while the abandoned task keeps its permit occupied; releasing it
+/// early would let timed-out work stack up beyond `max_concurrent_calls`.
 async fn run_pipeline<F, T>(
     op_name: &'static str,
     pipeline_timeout_ms: u64,
+    permit: OwnedSemaphorePermit,
     f: F,
 ) -> Result<T, McpError>
 where
@@ -128,11 +135,30 @@ where
     T: Send + 'static,
 {
     let timeout = Duration::from_millis(pipeline_timeout_ms);
-    tokio::time::timeout(timeout, tokio::task::spawn_blocking(f))
-        .await
-        .map_err(|_| {
+    let mut handle = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(join_result) => {
+            drop(permit);
+            join_result.map_err(|e| {
+                McpError::internal_error(
+                    format!("spawn_blocking failed: {e}"),
+                    Some(serde_json::json!({
+                        "code": "spawn_blocking_failed",
+                        "op": op_name,
+                    })),
+                )
+            })
+        }
+        Err(_) => {
             PIPELINE_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-            McpError::internal_error(
+            // The abandoned task still runs on the blocking pool; a reaper
+            // task holds the permit until it completes so its capacity cost
+            // stays visible to the semaphore.
+            tokio::spawn(async move {
+                let _ = handle.await;
+                drop(permit);
+            });
+            Err(McpError::internal_error(
                 format!(
                     "pipeline_timeout: {op_name} did not complete within \
                      {pipeline_timeout_ms}ms (TOON_PIPELINE_TIMEOUT_MS)"
@@ -142,17 +168,9 @@ where
                     "timeout_ms": pipeline_timeout_ms,
                     "op": op_name,
                 })),
-            )
-        })?
-        .map_err(|e| {
-            McpError::internal_error(
-                format!("spawn_blocking failed: {e}"),
-                Some(serde_json::json!({
-                    "code": "spawn_blocking_failed",
-                    "op": op_name,
-                })),
-            )
-        })
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,11 +328,12 @@ pub async fn handle_detect_format(
     }
 
     // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
+    // The owned permit is moved into `run_pipeline`, which holds it until the
+    // blocking task resolves — including past a timeout — so abandoned work
+    // keeps counting against `max_concurrent_calls`.
+    let permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
+        Arc::clone(&semaphore).acquire_owned(),
     )
     .await
     .map_err(|_| {
@@ -340,7 +359,7 @@ pub async fn handle_detect_format(
         // performs a full serde_json::from_str and CSV allocation which must not
         // run on the tokio executor.
         let (metadata, line_count, column_count, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("detection", pipeline_timeout_ms, move || {
+            run_pipeline("detection", pipeline_timeout_ms, permit, move || {
                 let metadata = FormatDetector::detect_with_metadata(&input);
                 let fmt = metadata.format;
                 let line_count = FormatDetector::jsonl_line_count(fmt, &input);
@@ -470,11 +489,12 @@ pub(crate) async fn handle_compress_content_inner(
         ));
     }
 
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
+    // The owned permit is moved into `run_pipeline`, which holds it until the
+    // blocking task resolves — including past a timeout — so abandoned work
+    // keeps counting against `max_concurrent_calls`.
+    let permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
+        Arc::clone(&semaphore).acquire_owned(),
     )
     .await
     .map_err(|_| {
@@ -497,7 +517,7 @@ pub(crate) async fn handle_compress_content_inner(
         // `decide_with_metadata` runs detection and parsing once, surfacing the
         // detection metadata and CSV/TSV coercion visibility from the same pass.
         let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, move || {
+            run_pipeline("compression", pipeline_timeout_ms, permit, move || {
                 let result = Compressor::decide_with_metadata(&input, &compress_config);
                 let (numeric_coercion_used, lossy_coercion_possible) =
                     coercion_visibility(result.coercion);
@@ -667,11 +687,12 @@ pub async fn handle_compression_stats(
         ));
     }
 
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
+    // The owned permit is moved into `run_pipeline`, which holds it until the
+    // blocking task resolves — including past a timeout — so abandoned work
+    // keeps counting against `max_concurrent_calls`.
+    let permit = tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
+        Arc::clone(&semaphore).acquire_owned(),
     )
     .await
     .map_err(|_| {
@@ -691,7 +712,7 @@ pub async fn handle_compression_stats(
         let start = Instant::now();
 
         let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, move || {
+            run_pipeline("compression", pipeline_timeout_ms, permit, move || {
                 let result = Compressor::decide_with_metadata(&input, &compress_config);
                 let (numeric_coercion_used, lossy_coercion_possible) =
                     coercion_visibility(result.coercion);
@@ -1317,9 +1338,25 @@ mod tests {
         assert_eq!(events.lock().expect("not poisoned").len(), 3);
     }
 
-    /// The semaphore permit acquired at handler entry must be released
-    /// even when the pipeline times out. Otherwise, sustained timeouts
-    /// would gradually deplete `max_concurrent_calls` and wedge the server.
+    /// Poll until the semaphore recovers `expected` permits, failing after a
+    /// bounded wait. On timeout the permit is released only once the
+    /// abandoned blocking task completes, which may lag the handler's return.
+    async fn wait_for_permits(sem: &Semaphore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sem.available_permits() != expected {
+            assert!(
+                Instant::now() < deadline,
+                "permit not released within 2 s (available: {}, expected: {expected})",
+                sem.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The semaphore permit acquired at handler entry must be released once
+    /// the (possibly abandoned) blocking task completes — even when the
+    /// pipeline times out. Otherwise, sustained timeouts would gradually
+    /// deplete `max_concurrent_calls` and wedge the server.
     #[tokio::test]
     async fn detect_format_releases_permit_on_timeout() {
         let mut base = (*test_config()).clone();
@@ -1345,14 +1382,11 @@ mod tests {
         .await;
 
         // Whether the timeout fired during semaphore acquire, during the
-        // pipeline body, or never — the permit must always be released by
-        // the time the call returns. Otherwise sustained timeouts would
-        // gradually wedge the server.
-        assert_eq!(
-            sem.available_permits(),
-            initial,
-            "permit was not released after handler returned"
-        );
+        // pipeline body, or never — the permit must be released once the
+        // abandoned blocking task completes. The invariant is "released on
+        // task completion", not "released on handler return", so poll with
+        // a bound instead of asserting immediately.
+        wait_for_permits(&sem, initial).await;
     }
 
     /// Same property for `compress_content`.
@@ -1375,7 +1409,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(sem.available_permits(), initial);
+        wait_for_permits(&sem, initial).await;
     }
 
     /// Same property for `compression_stats`.
@@ -1398,7 +1432,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(sem.available_permits(), initial);
+        wait_for_permits(&sem, initial).await;
     }
 
     #[test]
