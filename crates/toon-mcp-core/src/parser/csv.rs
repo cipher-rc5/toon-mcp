@@ -10,8 +10,9 @@ use serde_json::{Map, Number, Value};
 pub struct CsvCoercionMetadata {
     /// Whether numeric-looking fields were eligible for coercion.
     pub numeric_coercion_used: bool,
-    /// Whether at least one coerced field has syntax that may lose caller
-    /// intent when represented as a JSON number, such as leading zeroes.
+    /// Whether at least one numeric-looking field has syntax that may lose
+    /// caller intent when represented as a JSON number, such as leading
+    /// zeroes or integer literals longer than 15 digits.
     pub lossy_coercion_possible: bool,
 }
 
@@ -19,7 +20,10 @@ pub struct CsvCoercionMetadata {
 ///
 /// The first record is treated as a header row. Each subsequent record becomes
 /// an object whose keys are the header names and whose values are either
-/// `Value::Number` (if the field parses as `f64`) or `Value::String`.
+/// `Value::Number` or `Value::String`. Coercion is two-stage: fields that
+/// parse as `i64` become integer numbers; fields containing `.`, `e`, or `E`
+/// fall back to `f64`. Integer literals whose magnitude exceeds 2^53 stay
+/// `Value::String` so the exact digits survive downstream f64 consumers.
 ///
 /// Numeric coercion improves TOON savings because numbers are emitted without
 /// quotes in the encoded output.
@@ -43,7 +47,7 @@ pub struct CsvCoercionMetadata {
 pub struct CsvParser {
     /// The field delimiter byte (`b','` for CSV, `b'\t'` for TSV).
     delimiter: u8,
-    /// Whether to coerce fields parseable as `f64` into `Value::Number`.
+    /// Whether to coerce numeric-looking fields into `Value::Number`.
     ///
     /// When `false`, every field is emitted as `Value::String` regardless of
     /// content. Disable this when inputs contain identifiers, postal codes,
@@ -73,12 +77,13 @@ impl CsvParser {
         Self::new(b'\t')
     }
 
-    /// Toggle f64 numeric coercion for parsed fields.
+    /// Toggle numeric coercion for parsed fields.
     ///
-    /// When `enabled` is `true` (the default), any field that parses as `f64`
-    /// becomes a `Value::Number`. When `false`, all fields remain as
-    /// `Value::String`, which preserves identifiers, postal codes, and
-    /// leading-zero values verbatim at the cost of larger TOON output.
+    /// When `enabled` is `true` (the default), integer-looking fields become
+    /// `i64` numbers and decimal/exponent fields become `f64` numbers. When
+    /// `false`, all fields remain as `Value::String`, which preserves
+    /// identifiers, postal codes, and leading-zero values verbatim at the
+    /// cost of larger TOON output.
     pub fn with_numeric_coercion(mut self, enabled: bool) -> Self {
         self.numeric_coercion = enabled;
         self
@@ -87,11 +92,12 @@ impl CsvParser {
     /// Inspect input for numeric-coercion visibility without producing values.
     ///
     /// `numeric_coercion_used` is true only when coercion is enabled and at
-    /// least one data field can be represented as a finite JSON number.
+    /// least one data field was coerced into a JSON number.
     /// `lossy_coercion_possible` flags number-like fields whose textual form
     /// carries information JSON numbers do not preserve exactly, including
-    /// leading zeroes, explicit plus signs, exponent notation, and decimal
-    /// spellings of whole numbers.
+    /// leading zeroes, explicit plus signs, exponent notation, decimal
+    /// spellings of whole numbers, and integer literals longer than 15 digits
+    /// (which exceed exact f64 representability in downstream consumers).
     pub fn coercion_metadata(&self, input: &str) -> Result<CsvCoercionMetadata, CoreError> {
         let mut rdr = csv::ReaderBuilder::new()
             .delimiter(self.delimiter)
@@ -111,11 +117,15 @@ impl CsvParser {
         for result in rdr.records() {
             let record = result?;
             for field in &record {
-                if let Ok(n) = field.parse::<f64>()
-                    && Number::from_f64(n).is_some()
-                {
-                    numeric_coercion_used = true;
-                    lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
+                match coerce_numeric_field(field) {
+                    FieldCoercion::Number(_) => {
+                        numeric_coercion_used = true;
+                        lossy_coercion_possible |= numeric_text_may_be_lossy(field);
+                    }
+                    FieldCoercion::PreservedInteger => {
+                        lossy_coercion_possible = true;
+                    }
+                    FieldCoercion::Text => {}
                 }
             }
         }
@@ -127,7 +137,66 @@ impl CsvParser {
     }
 }
 
-fn numeric_text_may_be_lossy(field: &str, parsed: f64) -> bool {
+/// Largest integer magnitude exactly representable as an IEEE 754 f64 (2^53).
+///
+/// Integer literals beyond this bound stay `Value::String`: a downstream
+/// consumer that reads JSON numbers as f64 (JavaScript, many analytics
+/// stacks) would silently round them, so the exact digits must survive.
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_992;
+
+/// Outcome of the two-stage numeric coercion attempt on a single field.
+enum FieldCoercion {
+    /// The field coerces to a JSON number (i64 first, f64 fallback).
+    Number(Number),
+    /// The field is an integer literal too large to coerce without precision
+    /// risk; it must be preserved verbatim as `Value::String`.
+    PreservedInteger,
+    /// The field is not numeric and remains `Value::String`.
+    Text,
+}
+
+/// Attempt numeric coercion: `i64` first, then `f64` only when the trimmed
+/// field contains `.`, `e`, or `E`. Integer literals whose magnitude exceeds
+/// [`MAX_SAFE_INTEGER`] are never coerced.
+fn coerce_numeric_field(field: &str) -> FieldCoercion {
+    if let Ok(i) = field.parse::<i64>() {
+        return if i.unsigned_abs() > MAX_SAFE_INTEGER {
+            FieldCoercion::PreservedInteger
+        } else {
+            FieldCoercion::Number(Number::from(i))
+        };
+    }
+
+    let trimmed = field.trim();
+    if trimmed.contains(['.', 'e', 'E']) {
+        if let Ok(n) = field.parse::<f64>()
+            && let Some(num) = Number::from_f64(n)
+        {
+            // Finite f64: coerce to a JSON number. Infinite/NaN fields fail
+            // `from_f64` and fall through to string.
+            return FieldCoercion::Number(num);
+        }
+        return FieldCoercion::Text;
+    }
+
+    // An integer literal that overflowed i64 is by definition far beyond
+    // MAX_SAFE_INTEGER; preserve it. `field` (not `trimmed`) keeps
+    // whitespace-padded fields on the plain-text path, matching the parse
+    // attempts above which also reject surrounding whitespace.
+    if is_integer_literal(field) {
+        return FieldCoercion::PreservedInteger;
+    }
+
+    FieldCoercion::Text
+}
+
+/// Whether `field` is an optionally signed run of ASCII digits.
+fn is_integer_literal(field: &str) -> bool {
+    let unsigned = field.strip_prefix(['-', '+']).unwrap_or(field);
+    !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn numeric_text_may_be_lossy(field: &str) -> bool {
     let trimmed = field.trim();
     if trimmed.starts_with('+') || trimmed.contains(['e', 'E']) {
         return true;
@@ -139,7 +208,17 @@ fn numeric_text_may_be_lossy(field: &str, parsed: f64) -> bool {
         return true;
     }
 
-    trimmed.contains('.') && parsed.fract() == 0.0
+    // Integer literals longer than 15 digits can exceed the contiguous range
+    // of exactly representable f64 integers; flag them even when this parser
+    // kept exact i64 precision, because downstream consumers may not.
+    if !unsigned.contains('.') && integer_part.len() > 15 {
+        return true;
+    }
+
+    trimmed.contains('.')
+        && field
+            .parse::<f64>()
+            .is_ok_and(|parsed| parsed.fract() == 0.0)
 }
 
 impl CsvParser {
@@ -184,16 +263,19 @@ impl CsvParser {
 
             for (key, field) in headers.iter().zip(record.iter()) {
                 let val = if self.numeric_coercion {
-                    if let Ok(n) = field.parse::<f64>()
-                        && let Some(num) = Number::from_f64(n)
-                    {
-                        // Finite f64: coerce to a JSON number. Infinite/NaN
-                        // fields fail `from_f64` and fall through to string.
-                        numeric_coercion_used = true;
-                        lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
-                        Value::Number(num)
-                    } else {
-                        Value::String(field.to_owned())
+                    match coerce_numeric_field(field) {
+                        FieldCoercion::Number(num) => {
+                            numeric_coercion_used = true;
+                            lossy_coercion_possible |= numeric_text_may_be_lossy(field);
+                            Value::Number(num)
+                        }
+                        FieldCoercion::PreservedInteger => {
+                            // Too large to represent without precision risk:
+                            // keep the exact digits and flag the near-miss.
+                            lossy_coercion_possible = true;
+                            Value::String(field.to_owned())
+                        }
+                        FieldCoercion::Text => Value::String(field.to_owned()),
                     }
                 } else {
                     Value::String(field.to_owned())
@@ -368,6 +450,60 @@ mod tests {
     }
 
     #[test]
+    fn csv_integer_column_stays_integer() {
+        // Integer-looking fields must coerce through the i64 path, not f64:
+        // an f64 detour would serialise `1` as `1.0` and corrupt identifiers.
+        let input = "id,v\n1,a\n2,b\n3,c";
+        let v = CsvParser::csv().parse(input).unwrap();
+        let arr = v.as_array().unwrap();
+        for (idx, expected) in [(0usize, 1i64), (1, 2), (2, 3)] {
+            let num = &arr[idx]["id"];
+            assert!(num.is_i64(), "id must be an i64 number, got {num:?}");
+            assert!(!num.is_f64(), "id must not be an f64 number");
+            assert_eq!(num.as_i64(), Some(expected));
+        }
+        assert_eq!(serde_json::to_string(&arr[0]["id"]).unwrap(), "1");
+    }
+
+    #[test]
+    fn csv_large_integer_id_preserved_as_string() {
+        // 1234567890123456789 fits i64 but exceeds 2^53, so f64 consumers
+        // would round it. The exact text must survive as a string.
+        let input = "id,v\n1234567890123456789,a";
+        let v = CsvParser::csv().parse(input).unwrap();
+        assert_eq!(v[0]["id"], "1234567890123456789");
+    }
+
+    #[test]
+    fn csv_large_integer_flags_lossy() {
+        let meta = CsvParser::csv()
+            .coercion_metadata("id,v\n1234567890123456789,a")
+            .unwrap();
+        assert!(meta.lossy_coercion_possible);
+    }
+
+    #[test]
+    fn csv_float_column_still_coerces() {
+        let input = "id,score\n1,9.5";
+        let v = CsvParser::csv().parse(input).unwrap();
+        let score = &v[0]["score"];
+        assert!(score.is_f64(), "score must remain an f64, got {score:?}");
+        assert_eq!(score.as_f64(), Some(9.5));
+    }
+
+    #[test]
+    fn integer_beyond_i64_preserved_as_string() {
+        // 20 digits overflows i64 entirely; the literal must stay a string
+        // and still raise the lossy flag for callers.
+        let input = "id\n99999999999999999999";
+        let p = CsvParser::csv();
+        let v = p.parse(input).unwrap();
+        assert_eq!(v[0]["id"], "99999999999999999999");
+        let meta = p.coercion_metadata(input).unwrap();
+        assert!(meta.lossy_coercion_possible);
+    }
+
+    #[test]
     fn infinity_and_nan_fields_become_strings() {
         // f64::INFINITY and f64::NAN cannot be represented as serde_json::Number,
         // so the parser should fall back to a string for those fields.
@@ -460,6 +596,49 @@ mod proptest_tests {
                     let val = obj.get(header).expect("header present");
                     let s = val.as_str().expect("value is string");
                     prop_assert_eq!(s, row_cells[col_idx].as_str());
+                }
+            }
+        }
+
+        /// Integer-valued cells round-trip exactly: every generated i64 in
+        /// the f64-safe range must come back as the same `is_i64` number,
+        /// never an f64 approximation.
+        #[test]
+        fn csv_round_trip_preserves_integer_cells(
+            headers in prop::collection::vec(header_strategy(), 1..4)
+                .prop_filter("headers must be unique", |hs| {
+                    let mut seen: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+                    hs.iter().all(|h| seen.insert(h.as_str()))
+                }),
+            values in prop::collection::vec(
+                prop::collection::vec(
+                    -9_007_199_254_740_992i64..=9_007_199_254_740_992i64,
+                    1..4,
+                ),
+                1..6,
+            ),
+        ) {
+            let cols = headers.len();
+            let rows: Vec<Vec<String>> = values
+                .iter()
+                .map(|row| {
+                    (0..cols)
+                        .map(|c| row[c % row.len()].to_string())
+                        .collect()
+                })
+                .collect();
+            let input = render_table(&headers, &rows, ',');
+            let parsed = CsvParser::csv().parse(&input).expect("parse");
+            let arr = parsed.as_array().expect("array root");
+            prop_assert_eq!(arr.len(), rows.len());
+            for (row_idx, row_cells) in rows.iter().enumerate() {
+                let obj = arr[row_idx].as_object().expect("row is object");
+                for (col_idx, header) in headers.iter().enumerate() {
+                    let val = obj.get(header).expect("header present");
+                    prop_assert!(val.is_i64(), "expected i64, got {:?}", val);
+                    let expected: i64 = row_cells[col_idx].parse().expect("i64 cell");
+                    prop_assert_eq!(val.as_i64(), Some(expected));
                 }
             }
         }
