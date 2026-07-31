@@ -31,22 +31,22 @@ description = "MCP server that detects, classifies, and compresses structured da
 
 [workspace.dependencies]
 # MCP
-rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "=3.0.1", features = ["server", "transport-io", "macros", "schemars"] }
 
 # TOON
 toon-format = { version = "=0.5.0", default-features = false }
 
 # Serialization
-schemars = "=1.2.1"
+schemars = "=1.2.2"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.150"
+serde_json = "=1.0.151"
 
 # CSV/TSV parsing
 csv = "=1.4.0"
 
 # Async
 async-trait = "=0.1.91"
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Benchmarking
 criterion = { version = "=0.8.2", features = ["html_reports"] }
@@ -58,11 +58,11 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 # Utilities
 anyhow = "=1.0.104"
 dotenvy = "=0.15.7"
-jiff = "=0.2.32"
+jiff = "=0.2.35"
 temp-env = "=0.3.6"
 tempfile = "=3.27.0"
-thiserror = "=2.0.18"
-xxhash-rust = { version = "=0.8.16", features = ["xxh3"] }
+thiserror = "=2.0.19"
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 # Property-based testing
 proptest = "=1.11.0"
