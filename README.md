@@ -33,7 +33,7 @@ LLM tool calls often return large structured payloads — JSON API responses, CS
 ## Highlights
 
 - **Four MCP tools** over stdio: `detect_format`, `compression_stats`, `compress_content`, `toon_diagnostics`.
-- **Lossy-free by construction.** When TOON encoding does not produce meaningful savings the original input is returned verbatim along with a structured `pass_reason`.
+- **Byte-identical pass-through; explicit coercion elsewhere.** When TOON encoding does not produce meaningful savings the original input is returned verbatim along with a structured `pass_reason`. CSV/TSV numeric coercion — enabled by default — is a lossy transform: numeric-looking cells become JSON numbers, and every call reports its effect via `numeric_coercion_used` and `lossy_coercion_possible`. Set `TOON_CSV_NUMERIC_COERCION=false` for identifier-bearing data.
 - **Bounded by design.** Hard per-input size cap, per-call timeout, and a concurrency permit gate make resource use predictable. Logging is fire-and-forget and never fails a tool response.
 - **Production-grade observability.** Every call writes a JSONL row to a hive-partitioned directory that is queryable in place with DuckDB; runtime counters are exposed via `toon_diagnostics`.
 - **Reproducible, signed releases.** Linux (glibc 2.17 baseline) and macOS binaries for `x86_64` and `aarch64`, with SHA256 checksums, a CycloneDX SBOM, and Sigstore keyless signatures.
@@ -361,12 +361,12 @@ Use the `handler.*` fields to spot tail latency and pipeline timeouts; use the `
 
 ### Numeric coercion (CSV / TSV)
 
-When `TOON_CSV_NUMERIC_COERCION=true` (the default), numeric-looking CSV/TSV cells are parsed as JSON numbers in the intermediate value tree. This improves compression but can lose information for identifiers, postal codes, and leading-zero values.
+When `TOON_CSV_NUMERIC_COERCION=true` (the default), numeric-looking CSV/TSV cells are parsed as JSON numbers in the intermediate value tree: integers first (exact `i64`), with floating point used only for cells containing a decimal point or exponent. Integer literals whose magnitude exceeds 2^53 are preserved verbatim as strings so downstream f64 consumers cannot silently round them. Coercion improves compression but can lose information for identifiers, postal codes, and leading-zero values.
 
 Each tool result includes:
 
 - `numeric_coercion_used` — `true` when at least one cell was coerced.
-- `lossy_coercion_possible` — `true` when at least one coerced cell has syntax (leading zeros, explicit `+` sign, exponent, decimal spelling of a whole number) that JSON numbers cannot round-trip exactly.
+- `lossy_coercion_possible` — `true` when at least one numeric-looking cell has syntax (leading zeros, explicit `+` sign, exponent, decimal spelling of a whole number, or more than 15 integer digits) that JSON numbers cannot round-trip exactly.
 
 Set `TOON_CSV_NUMERIC_COERCION=false` per-call (via env override) or globally if your data contains identifiers that must remain strings.
 
