@@ -36,6 +36,9 @@ static HANDLER_LOG_RECORD_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
 static HANDLER_LOG_RECORD_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static BLOCKING_TASKS_ABANDONED: AtomicU64 = AtomicU64::new(0);
+static REQUEST_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static INPUT_REJECTED_COUNT: AtomicU64 = AtomicU64::new(0);
+static SERVER_BUSY_COUNT: AtomicU64 = AtomicU64::new(0);
 static REQUEST_SUCCEEDED_COUNT: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_DURATION_US_MAX: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +109,131 @@ async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
                 "log event failed; preserving successful tool response"
             );
         }
+    }
+}
+
+/// Classify a `run_pipeline` error into a `LogEvent` outcome string.
+fn error_outcome(err: &McpError) -> &'static str {
+    let is_timeout = err
+        .data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(|c| c.as_str())
+        == Some("pipeline_timeout");
+    if is_timeout { "timeout" } else { "failed" }
+}
+
+/// Increment the failure counters, emit a failure `LogEvent`, and hand the
+/// error back for the handler to propagate.
+///
+/// Failure events use `"unknown"` / pass-through placeholders for fields the
+/// pipeline never produced (the input was rejected, timed out, or could not
+/// be processed).
+async fn record_failure(
+    err: McpError,
+    outcome: &'static str,
+    tool_name: &'static str,
+    input_bytes: usize,
+    duration_us: u64,
+    config: &Config,
+    log_sink: &Arc<dyn LogSink>,
+) -> McpError {
+    REQUEST_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+    match outcome {
+        "rejected" => {
+            INPUT_REJECTED_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        "busy" => {
+            SERVER_BUSY_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    let event = LogEvent {
+        event_id: new_event_id(),
+        ts_us: jiff::Timestamp::now().as_microsecond(),
+        tool_name: tool_name.into(),
+        input_format: InputFormat::Unknown.as_str().into(),
+        shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+        input_bytes: input_bytes as u64,
+        output_bytes: input_bytes as u64,
+        compressed: false,
+        savings_pct: 0.0,
+        threshold_used: config.max_output_ratio,
+        duration_us,
+        outcome: outcome.into(),
+        pass_reason: None,
+        client_hint: config.client_hint.clone(),
+    };
+    record_log_event(log_sink, event).await;
+    err
+}
+
+/// Reject inputs above `TOON_MAX_INPUT_BYTES`, recording the failure.
+/// Returns `None` when the input is within bounds.
+async fn reject_oversized(
+    tool_name: &'static str,
+    input_bytes: usize,
+    config: &Config,
+    log_sink: &Arc<dyn LogSink>,
+) -> Option<McpError> {
+    if input_bytes <= config.max_input_bytes {
+        return None;
+    }
+    let err = McpError::invalid_params(
+        format!(
+            "input_exceeds_limit: input is {input_bytes} bytes; \
+             maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
+            config.max_input_bytes
+        ),
+        None,
+    );
+    Some(record_failure(err, "rejected", tool_name, input_bytes, 0, config, log_sink).await)
+}
+
+/// Queue for up to `TOON_PIPELINE_TIMEOUT_MS` for an owned concurrency
+/// permit, recording a busy failure when the deadline expires.
+///
+/// The owned permit is later moved into `run_pipeline`, which holds it until
+/// the blocking task resolves — including past a timeout — so abandoned work
+/// keeps counting against `max_concurrent_calls`.
+async fn acquire_permit(
+    tool_name: &'static str,
+    input_bytes: usize,
+    config: &Config,
+    log_sink: &Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, McpError> {
+    match tokio::time::timeout(
+        Duration::from_millis(config.pipeline_timeout_ms),
+        semaphore.acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(record_failure(
+            McpError::internal_error("semaphore closed", None),
+            "failed",
+            tool_name,
+            input_bytes,
+            0,
+            config,
+            log_sink,
+        )
+        .await),
+        Err(_) => Err(record_failure(
+            McpError::internal_error(
+                "server busy: too many concurrent calls",
+                Some(serde_json::json!({ "code": "server_busy" })),
+            ),
+            "busy",
+            tool_name,
+            input_bytes,
+            0,
+            config,
+            log_sink,
+        )
+        .await),
     }
 }
 
@@ -315,36 +443,23 @@ pub async fn handle_detect_format(
     log_sink: Arc<dyn LogSink>,
     semaphore: Arc<Semaphore>,
 ) -> Result<DetectResult, McpError> {
+    let tool_name = "detect_format";
     let input = params.input;
     let input_bytes = input.len();
 
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
+    if let Some(err) = reject_oversized(tool_name, input_bytes, &config, &log_sink).await {
+        return Err(err);
     }
 
     // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
-    // The owned permit is moved into `run_pipeline`, which holds it until the
-    // blocking task resolves — including past a timeout — so abandoned work
-    // keeps counting against `max_concurrent_calls`.
-    let permit = tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        Arc::clone(&semaphore).acquire_owned(),
+    let permit = acquire_permit(
+        tool_name,
+        input_bytes,
+        &config,
+        &log_sink,
+        Arc::clone(&semaphore),
     )
-    .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
+    .await?;
 
     let event_id = new_event_id();
 
@@ -360,24 +475,40 @@ pub async fn handle_detect_format(
         // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
         // performs a full serde_json::from_str and CSV allocation which must not
         // run on the tokio executor.
+        let pipeline_result = run_pipeline("detection", pipeline_timeout_ms, permit, move || {
+            let metadata = FormatDetector::detect_with_metadata(&input);
+            let fmt = metadata.format;
+            let line_count = FormatDetector::jsonl_line_count(fmt, &input);
+            let column_count = FormatDetector::column_count(fmt, &input);
+            let (numeric_coercion_used, lossy_coercion_possible) =
+                coercion_visibility(detect_coercion_metadata(fmt, &input, csv_numeric_coercion));
+            (
+                metadata,
+                line_count,
+                column_count,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            )
+        })
+        .await;
         let (metadata, line_count, column_count, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("detection", pipeline_timeout_ms, permit, move || {
-                let metadata = FormatDetector::detect_with_metadata(&input);
-                let fmt = metadata.format;
-                let line_count = FormatDetector::jsonl_line_count(fmt, &input);
-                let column_count = FormatDetector::column_count(fmt, &input);
-                let (numeric_coercion_used, lossy_coercion_possible) = coercion_visibility(
-                    detect_coercion_metadata(fmt, &input, csv_numeric_coercion),
-                );
-                (
-                    metadata,
-                    line_count,
-                    column_count,
-                    numeric_coercion_used,
-                    lossy_coercion_possible,
-                )
-            })
-            .await?;
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    return Err(record_failure(
+                        err,
+                        outcome,
+                        tool_name,
+                        input_bytes,
+                        duration_us,
+                        &config,
+                        &log_sink,
+                    )
+                    .await);
+                }
+            };
         let fmt = metadata.format;
 
         let duration_us = start.elapsed().as_micros() as u64;
@@ -477,35 +608,22 @@ pub(crate) async fn handle_compress_content_inner(
     log_sink: Arc<dyn LogSink>,
     semaphore: Arc<Semaphore>,
 ) -> Result<CompressResult, McpError> {
+    let tool_name = "compress_content";
     let input = params.input;
     let input_bytes = input.len();
 
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
+    if let Some(err) = reject_oversized(tool_name, input_bytes, &config, &log_sink).await {
+        return Err(err);
     }
 
-    // The owned permit is moved into `run_pipeline`, which holds it until the
-    // blocking task resolves — including past a timeout — so abandoned work
-    // keeps counting against `max_concurrent_calls`.
-    let permit = tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        Arc::clone(&semaphore).acquire_owned(),
+    let permit = acquire_permit(
+        tool_name,
+        input_bytes,
+        &config,
+        &log_sink,
+        Arc::clone(&semaphore),
     )
-    .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
+    .await?;
 
     let event_id = new_event_id();
     let span = tracing::info_span!("compress_content", event_id = %event_id);
@@ -518,20 +636,37 @@ pub(crate) async fn handle_compress_content_inner(
         // L1: Return (input, decision) so input is available for pass-through output.
         // `decide_with_metadata` runs detection and parsing once, surfacing the
         // detection metadata and CSV/TSV coercion visibility from the same pass.
+        let pipeline_result = run_pipeline("compression", pipeline_timeout_ms, permit, move || {
+            let result = Compressor::decide_with_metadata(&input, &compress_config);
+            let (numeric_coercion_used, lossy_coercion_possible) =
+                coercion_visibility(result.coercion);
+            (
+                input,
+                result.decision,
+                result.detection,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            )
+        })
+        .await;
         let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, permit, move || {
-                let result = Compressor::decide_with_metadata(&input, &compress_config);
-                let (numeric_coercion_used, lossy_coercion_possible) =
-                    coercion_visibility(result.coercion);
-                (
-                    input,
-                    result.decision,
-                    result.detection,
-                    numeric_coercion_used,
-                    lossy_coercion_possible,
-                )
-            })
-            .await?;
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    return Err(record_failure(
+                        err,
+                        outcome,
+                        tool_name,
+                        input_bytes,
+                        duration_us,
+                        &config,
+                        &log_sink,
+                    )
+                    .await);
+                }
+            };
 
         let duration_us = start.elapsed().as_micros() as u64;
 
@@ -675,35 +810,22 @@ pub async fn handle_compression_stats(
     log_sink: Arc<dyn LogSink>,
     semaphore: Arc<Semaphore>,
 ) -> Result<StatsResult, McpError> {
+    let tool_name = "compression_stats";
     let input = params.input;
     let input_bytes = input.len();
 
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
+    if let Some(err) = reject_oversized(tool_name, input_bytes, &config, &log_sink).await {
+        return Err(err);
     }
 
-    // The owned permit is moved into `run_pipeline`, which holds it until the
-    // blocking task resolves — including past a timeout — so abandoned work
-    // keeps counting against `max_concurrent_calls`.
-    let permit = tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        Arc::clone(&semaphore).acquire_owned(),
+    let permit = acquire_permit(
+        tool_name,
+        input_bytes,
+        &config,
+        &log_sink,
+        Arc::clone(&semaphore),
     )
-    .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
+    .await?;
 
     let event_id = new_event_id();
     let span = tracing::info_span!("compression_stats", event_id = %event_id);
@@ -713,19 +835,36 @@ pub async fn handle_compression_stats(
         let pipeline_timeout_ms = config.pipeline_timeout_ms;
         let start = Instant::now();
 
+        let pipeline_result = run_pipeline("compression", pipeline_timeout_ms, permit, move || {
+            let result = Compressor::decide_with_metadata(&input, &compress_config);
+            let (numeric_coercion_used, lossy_coercion_possible) =
+                coercion_visibility(result.coercion);
+            (
+                result.decision,
+                result.detection,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            )
+        })
+        .await;
         let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, permit, move || {
-                let result = Compressor::decide_with_metadata(&input, &compress_config);
-                let (numeric_coercion_used, lossy_coercion_possible) =
-                    coercion_visibility(result.coercion);
-                (
-                    result.decision,
-                    result.detection,
-                    numeric_coercion_used,
-                    lossy_coercion_possible,
-                )
-            })
-            .await?;
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    return Err(record_failure(
+                        err,
+                        outcome,
+                        tool_name,
+                        input_bytes,
+                        duration_us,
+                        &config,
+                        &log_sink,
+                    )
+                    .await);
+                }
+            };
 
         let duration_us = start.elapsed().as_micros() as u64;
 
@@ -861,6 +1000,16 @@ pub struct HandlerDiagnosticsResult {
     /// abandoned task keeps its concurrency permit until it completes.
     #[schemars(schema_with = "schema_as_integer")]
     pub blocking_tasks_abandoned: u64,
+    /// Number of tool requests that returned an error (any failure kind).
+    #[schemars(schema_with = "schema_as_integer")]
+    pub request_failed_count: u64,
+    /// Number of inputs rejected before processing (over the size limit).
+    #[schemars(schema_with = "schema_as_integer")]
+    pub input_rejected_count: u64,
+    /// Number of requests rejected because no concurrency permit became
+    /// available within the queue deadline.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub server_busy_count: u64,
     /// Number of successful tool requests included in duration gauges.
     #[schemars(schema_with = "schema_as_integer")]
     pub request_succeeded_count: u64,
@@ -924,6 +1073,9 @@ pub async fn handle_toon_diagnostics(
             log_record_dropped_count: HANDLER_LOG_RECORD_DROPPED_COUNT.load(Ordering::Relaxed),
             pipeline_timeout_count: PIPELINE_TIMEOUT_COUNT.load(Ordering::Relaxed),
             blocking_tasks_abandoned: BLOCKING_TASKS_ABANDONED.load(Ordering::Relaxed),
+            request_failed_count: REQUEST_FAILED_COUNT.load(Ordering::Relaxed),
+            input_rejected_count: INPUT_REJECTED_COUNT.load(Ordering::Relaxed),
+            server_busy_count: SERVER_BUSY_COUNT.load(Ordering::Relaxed),
             request_succeeded_count: succeeded,
             request_duration_us_total: duration_total,
             request_duration_us_max: REQUEST_DURATION_US_MAX.load(Ordering::Relaxed),
@@ -1207,6 +1359,102 @@ mod tests {
         let events = events.lock().expect("not poisoned");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "detect_format");
+        assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn oversized_input_records_rejected_failure_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let mut base = (*test_config()).clone();
+        base.max_input_bytes = 8;
+        let cfg = Arc::new(base);
+        let sem = test_semaphore(&cfg);
+
+        let err = handle_detect_format(
+            DetectParams {
+                input: "x".repeat(9),
+            },
+            cfg,
+            Arc::clone(&sink),
+            sem,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("input_exceeds_limit"));
+
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1, "rejection must emit a failure event");
+        assert_eq!(events[0].tool_name, "detect_format");
+        assert_eq!(events[0].outcome, "rejected");
+        assert!(!events[0].compressed);
+    }
+
+    #[tokio::test]
+    async fn busy_rejection_records_busy_failure_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let mut base = (*test_config()).clone();
+        // Short queue deadline so the held permit forces a busy rejection.
+        base.pipeline_timeout_ms = 50;
+        base.max_concurrent_calls = 1;
+        let cfg = Arc::new(base);
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).acquire_owned().await.expect("permit");
+
+        let err = handle_compression_stats(
+            StatsParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            cfg,
+            Arc::clone(&sink),
+            Arc::clone(&sem),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("server busy"));
+        drop(held);
+
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1, "busy rejection must emit a failure event");
+        assert_eq!(events[0].tool_name, "compression_stats");
+        assert_eq!(events[0].outcome, "busy");
+    }
+
+    #[tokio::test]
+    async fn failure_counters_increment_on_rejection() {
+        let mut base = (*test_config()).clone();
+        base.max_input_bytes = 8;
+        let cfg = Arc::new(base);
+        let sem = test_semaphore(&cfg);
+
+        let before = handle_toon_diagnostics(
+            DiagnosticsParams {},
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("diagnostics succeeds");
+
+        let _ = handle_compress_content_inner(
+            CompressParams {
+                input: "x".repeat(9),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&sem),
+        )
+        .await
+        .unwrap_err();
+
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), sem)
+            .await
+            .expect("diagnostics succeeds");
+        // Counters are process-global until the Metrics refactor lands, so
+        // assert deltas with >= (other tests may run concurrently).
+        assert!(after.handler.request_failed_count > before.handler.request_failed_count);
+        assert!(after.handler.input_rejected_count > before.handler.input_rejected_count);
     }
 
     #[tokio::test]
