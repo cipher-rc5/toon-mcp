@@ -111,6 +111,9 @@ impl ToonMcpServer {
         &self,
         Parameters(params): Parameters<DiagnosticsParams>,
     ) -> Result<Json<DiagnosticsResult>, McpError> {
+        // Deliberately takes no concurrency permit: this tool runs no
+        // blocking pipeline work, and it must stay responsive when the
+        // semaphore is saturated — diagnosing that saturation is its job.
         handle_toon_diagnostics(
             params,
             Arc::clone(&self.config),

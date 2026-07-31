@@ -1166,24 +1166,57 @@ pub async fn handle_toon_diagnostics(
     metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 ) -> Result<DiagnosticsResult, McpError> {
-    let log = log_sink.diagnostics();
+    let event_id = metrics.new_event_id();
+    // M6: same span + LogEvent treatment as the data tools so diagnostics
+    // calls are correlated and audited like every other invocation.
+    let span = tracing::info_span!("toon_diagnostics", event_id = %event_id);
 
-    Ok(DiagnosticsResult {
-        logging_enabled: config.logging_enabled,
-        logging: LoggingDiagnosticsResult {
-            record_dropped_count: log.record_dropped_count,
-            record_failed_count: log.record_failed_count,
-            serialization_failed_count: log.serialization_failed_count,
-            writer_failed_count: log.writer_failed_count,
-            last_error: log.last_error,
-            queue_capacity: log.queue_capacity,
-            queue_queued: log.queue_queued,
-            queue_available: log.queue_available,
-        },
-        handler: metrics.handler_diagnostics(),
-        semaphore_available_permits: semaphore.available_permits(),
-        max_concurrent_calls: config.max_concurrent_calls,
-    })
+    async move {
+        let start = Instant::now();
+        let log = log_sink.diagnostics();
+
+        let result = DiagnosticsResult {
+            logging_enabled: config.logging_enabled,
+            logging: LoggingDiagnosticsResult {
+                record_dropped_count: log.record_dropped_count,
+                record_failed_count: log.record_failed_count,
+                serialization_failed_count: log.serialization_failed_count,
+                writer_failed_count: log.writer_failed_count,
+                last_error: log.last_error,
+                queue_capacity: log.queue_capacity,
+                queue_queued: log.queue_queued,
+                queue_available: log.queue_available,
+            },
+            handler: metrics.handler_diagnostics(),
+            semaphore_available_permits: semaphore.available_permits(),
+            max_concurrent_calls: config.max_concurrent_calls,
+        };
+
+        // Recorded after the snapshot so the returned counters do not include
+        // this call's own event. Diagnostics stays out of the success-duration
+        // gauges: those measure the data pipeline, which this tool never runs.
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
+            tool_name: "toon_diagnostics".into(),
+            input_format: InputFormat::Unknown.as_str().into(),
+            shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+            input_bytes: 0,
+            output_bytes: 0,
+            compressed: false,
+            savings_pct: 0.0,
+            threshold_used: config.max_output_ratio,
+            duration_us: start.elapsed().as_micros() as u64,
+            outcome: "ok".into(),
+            pass_reason: None,
+            client_hint: config.client_hint.clone(),
+        };
+        record_log_event(&metrics, &log_sink, event).await;
+
+        Ok(result)
+    }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1527,21 @@ mod tests {
         let events = events.lock().expect("not poisoned");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "detect_format");
+        assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn toon_diagnostics_logs_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        handle_toon_diagnostics(DiagnosticsParams {}, cfg, sink, test_metrics(), sem)
+            .await
+            .unwrap();
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "toon_diagnostics");
         assert_eq!(events[0].outcome, "ok");
     }
 
