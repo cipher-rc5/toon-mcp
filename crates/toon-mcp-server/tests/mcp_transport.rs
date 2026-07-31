@@ -65,7 +65,7 @@ fn first_text(result: &rmcp::model::CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content in tool result")
 }
@@ -429,9 +429,18 @@ async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()>
         )
         .await;
 
+    // rmcp 3.x surfaces schema mismatches as a tool-level error result
+    // (is_error = true) rather than a protocol-level error.
+    let result = result.expect("call must complete at the protocol level");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected tool-level error for malformed params (missing input field), got: {result:?}"
+    );
+    let msg = first_text(&result);
     assert!(
-        result.is_err(),
-        "expected error for malformed params (missing input field), got: {result:?}"
+        msg.contains("input"),
+        "expected error text to mention the missing `input` field, got: {msg}"
     );
 
     client.cancel().await?;
