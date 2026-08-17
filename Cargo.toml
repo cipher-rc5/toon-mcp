@@ -31,7 +31,7 @@ description = "MCP server that detects, classifies, and compresses structured da
 
 [workspace.dependencies]
 # MCP
-rmcp = { version = "=3.0.1", features = ["server", "transport-io", "macros", "schemars"] }
+rmcp = { version = "=3.1.2", features = ["server", "transport-io", "macros", "schemars"] }
 
 # TOON
 toon-format = { version = "=0.5.0", default-features = false }
