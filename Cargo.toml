@@ -45,7 +45,7 @@ serde_json = "=1.0.151"
 csv = "=1.4.0"
 
 # Async
-async-trait = "=0.1.91"
+async-trait = "=0.1.92"
 tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 
 # Benchmarking
