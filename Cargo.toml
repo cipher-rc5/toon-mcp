@@ -34,7 +34,7 @@ description = "MCP server that detects, classifies, and compresses structured da
 rmcp = { version = "=3.4.1", features = ["server", "transport-io", "macros", "schemars"] }
 
 # TOON
-toon-format = { version = "=0.5.0", default-features = false }
+toon-format = { version = "=0.6.1", default-features = false }
 
 # Serialization
 schemars = "=1.2.2"
