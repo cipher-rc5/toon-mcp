@@ -50,10 +50,26 @@ pub struct LogEvent {
     /// Wall-clock duration in microseconds covering detect + classify + encode.
     pub duration_us: u64,
 
+    /// How the tool invocation ended: `"ok"` for a successful response,
+    /// `"rejected"` for an input rejected before processing (e.g. over the
+    /// size limit), `"timeout"` for a pipeline timeout, `"busy"` when no
+    /// concurrency permit was available, or `"failed"` for an internal
+    /// failure such as a crashed blocking task.
+    ///
+    /// Deserialisation defaults to `"ok"` so rows written before this field
+    /// existed remain readable.
+    #[serde(default = "default_outcome")]
+    pub outcome: String,
+
     /// Human-readable pass-through reason when `compressed` is false.
     pub pass_reason: Option<String>,
 
     /// Client identifier set via `TOON_CLIENT_HINT` env var.
     /// Allows log queries to split metrics by host.
     pub client_hint: Option<String>,
+}
+
+/// Default for [`LogEvent::outcome`] when deserialising pre-outcome rows.
+fn default_outcome() -> String {
+    "ok".into()
 }

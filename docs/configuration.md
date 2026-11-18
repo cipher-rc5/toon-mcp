@@ -35,6 +35,19 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 
 **`TOON_CSV_NUMERIC_COERCION`** controls a behavioural tradeoff, not a performance one. Leave at `true` to maximise compression density for genuinely numeric CSV columns. Flip to `false` when you see downstream consumers complaining about lost leading zeros, mis-typed phone numbers, or identifiers being silently rewritten as integers — those are the diagnostic symptoms. See `docs/runbook.md` for matching incident patterns.
 
+Coercion is two-stage: a cell is first parsed as an exact 64-bit integer; only cells containing a decimal point or exponent (`.`, `e`, `E`) fall back to floating point.
+
+Worked example — a Snowflake-style ID column:
+
+```csv
+id,region
+1234567890123456789,eu
+```
+
+The `id` value fits an `i64`, but its magnitude exceeds 2^53 (`9007199254740992`), the largest integer an IEEE 754 double represents exactly. Emitting it as a JSON number would let any f64-based consumer (JavaScript, most analytics stacks) silently round it to `1234567890123456768`. The parser therefore preserves the cell verbatim as the string `"1234567890123456789"` and reports `lossy_coercion_possible: true` on the call.
+
+Smaller integers (magnitude at most 2^53) coerce to exact integer JSON numbers. Cells whose text carries information a JSON number cannot represent — leading zeros (`00123`), explicit plus signs (`+5`), exponent notation (`1e3`), decimal spellings of whole numbers (`1.0`) — still coerce (to `123`, `5`, `1000`, `1`) and set `lossy_coercion_possible: true`. Set `TOON_CSV_NUMERIC_COERCION=false` when those spellings must survive byte-for-byte.
+
 ### Concurrency and Timeouts
 
 | Variable                    | Type                 | Default | Description                                                                                                                                                                                                                                          |

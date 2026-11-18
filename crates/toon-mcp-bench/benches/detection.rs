@@ -2,6 +2,8 @@
 // description: Criterion benchmarks for format detection across all input formats
 // reference: https://docs.rs/criterion/latest/criterion/
 
+//! Criterion benchmarks for format detection.
+
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};

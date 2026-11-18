@@ -1,12 +1,16 @@
 // file: crates/toon-mcp-core/src/parser/json.rs
-// description: JSON parser — thin wrapper around serde_json::from_str
+// description: JSON parser — serde_json deserialization with duplicate-key rejection
 
 use crate::{error::CoreError, parser::Parser};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 /// Parses a raw JSON string into a `serde_json::Value`.
 ///
-/// This is a stateless unit struct that delegates entirely to `serde_json`.
-/// No transformation of the value tree is performed.
+/// Unlike a plain `serde_json::from_str`, objects containing the same key
+/// more than once are rejected with [`CoreError::DuplicateKey`]: `serde_json`
+/// would otherwise keep only the last occurrence, silently dropping data.
+/// No other transformation of the value tree is performed.
 ///
 /// # Examples
 ///
@@ -18,13 +22,122 @@ use crate::{error::CoreError, parser::Parser};
 /// assert_eq!(val["a"], 1);
 ///
 /// assert!(parser.parse("not json").is_err());
+/// // Duplicate keys are rejected rather than silently collapsed.
+/// assert!(parser.parse(r#"{"a":1,"a":2}"#).is_err());
 /// ```
 pub struct JsonParser;
 
 impl Parser for JsonParser {
-    fn parse(&self, input: &str) -> Result<serde_json::Value, CoreError> {
-        let value = serde_json::from_str(input)?;
-        Ok(value)
+    fn parse(&self, input: &str) -> Result<Value, CoreError> {
+        parse_dup_checked(crate::parser::strip_bom(input))
+    }
+}
+
+/// Marker embedded in the custom serde error so the duplicate key can be
+/// recovered from `serde_json::Error`'s string-only payload.
+const DUPLICATE_KEY_MARKER: &str = "toon-mcp duplicate key: ";
+
+/// Parse `input` into a `Value`, rejecting duplicate object keys at any depth.
+pub(crate) fn parse_dup_checked(input: &str) -> Result<Value, CoreError> {
+    let mut de = serde_json::Deserializer::from_str(input);
+    let result = DupCheckedValue
+        .deserialize(&mut de)
+        .and_then(|value| de.end().map(|()| value));
+    result.map_err(|e| {
+        let msg = e.to_string();
+        match msg.find(DUPLICATE_KEY_MARKER) {
+            Some(idx) => {
+                // The message is "{marker}{key} at line L column C"; recover
+                // the key between the marker and the location suffix.
+                let tail = &msg[idx + DUPLICATE_KEY_MARKER.len()..];
+                let key = tail.rsplit_once(" at line ").map_or(tail, |(k, _)| k);
+                CoreError::DuplicateKey {
+                    key: key.to_owned(),
+                }
+            }
+            None => CoreError::JsonError(e),
+        }
+    })
+}
+
+/// Seed that builds a `Value` while rejecting duplicate object keys.
+struct DupCheckedValue;
+
+impl<'de> DeserializeSeed<'de> for DupCheckedValue {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DupCheckedVisitor)
+    }
+}
+
+struct DupCheckedVisitor;
+
+impl<'de> Visitor<'de> for DupCheckedVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::Number(Number::from(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::Number(Number::from(v)))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        // JSON text cannot spell NaN/Infinity, so `from_f64` cannot fail for
+        // input arriving through the deserializer; fall back to Null anyway.
+        Ok(Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(v) = seq.next_element_seed(DupCheckedValue)? {
+            values.push(v);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(DupCheckedValue)?;
+            if out.insert(key.clone(), value).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "{DUPLICATE_KEY_MARKER}{key}"
+                )));
+            }
+        }
+        Ok(Value::Object(out))
     }
 }
 
@@ -73,6 +186,40 @@ mod tests {
         // Unterminated string literal — must surface a parse error.
         let p = JsonParser;
         assert!(p.parse(r#"{"id":"alice"#).is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected() {
+        let err = JsonParser
+            .parse(r#"{"a":1,"a":2}"#)
+            .expect_err("must reject");
+        match err {
+            crate::error::CoreError::DuplicateKey { key } => assert_eq!(key, "a"),
+            other => panic!("expected DuplicateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_duplicate_keys_are_rejected() {
+        let err = JsonParser
+            .parse(r#"{"outer":{"k":1,"k":2}}"#)
+            .expect_err("must reject");
+        match err {
+            crate::error::CoreError::DuplicateKey { key } => assert_eq!(key, "k"),
+            other => panic!("expected DuplicateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_key_in_distinct_objects_is_allowed() {
+        let v = JsonParser.parse(r#"[{"a":1},{"a":2}]"#).expect("parse");
+        assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn leading_bom_is_stripped() {
+        let v = JsonParser.parse("\u{feff}{\"a\":1}").expect("parse");
+        assert_eq!(v["a"], 1);
     }
 }
 

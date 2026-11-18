@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rmcp::ErrorData as McpError;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -30,77 +30,140 @@ fn schema_as_optional_integer(_: &mut SchemaGenerator) -> Schema {
     schemars::json_schema!({ "type": ["integer", "null"] })
 }
 
-// Process-lifetime diagnostic counters. All use `Relaxed` ordering because
-// they are independent monotonic tallies with no cross-counter invariants.
-// Overflow wraps silently and is not a correctness concern: at one event per
-// nanosecond a u64 still takes ~585 years to wrap, and these feed gauges, not
-// control flow.
-static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static HANDLER_LOG_RECORD_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
-static HANDLER_LOG_RECORD_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
-static PIPELINE_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
-static REQUEST_SUCCEEDED_COUNT: AtomicU64 = AtomicU64::new(0);
-static REQUEST_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
-static REQUEST_DURATION_US_MAX: AtomicU64 = AtomicU64::new(0);
+/// Histogram bucket upper bounds in microseconds: 1 ms, 10 ms, 100 ms, 1 s,
+/// 10 s. Durations above the last bound land in the +Inf bucket (index 5).
+const DURATION_BUCKET_BOUNDS_US: [u64; 5] = [1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
-/// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
-/// Avoids OS RNG. The output is a 64-bit xxh3 hash; under the birthday paradox,
-/// collisions become non-negligible around 2^32 (~4.3 billion) generated IDs.
-/// Practically irrelevant for an MCP server but worth knowing for high-throughput consumers.
-fn new_event_id() -> String {
-    let seq = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let mut buf = [0u8; 16];
-    buf[..8].copy_from_slice(&seq.to_le_bytes());
-    buf[8..].copy_from_slice(&ts.to_le_bytes());
-    format!("{:016x}", xxh3_64(&buf))
+/// Per-server diagnostic counters, held in `ToonMcpServer` behind `Arc` and
+/// threaded through every handler.
+///
+/// All counters use `Relaxed` ordering because they are independent
+/// monotonic tallies with no cross-counter invariants. Overflow wraps
+/// silently and is not a correctness concern: at one event per nanosecond a
+/// u64 still takes ~585 years to wrap, and these feed gauges, not control
+/// flow.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    event_counter: AtomicU64,
+    log_record_failed_count: AtomicU64,
+    log_record_dropped_count: AtomicU64,
+    pipeline_timeout_count: AtomicU64,
+    blocking_tasks_abandoned: AtomicU64,
+    request_failed_count: AtomicU64,
+    input_rejected_count: AtomicU64,
+    server_busy_count: AtomicU64,
+    request_succeeded_count: AtomicU64,
+    request_duration_us_total: AtomicU64,
+    request_duration_us_max: AtomicU64,
+    /// Per-band counts for successful request durations; index i covers
+    /// durations in (bound[i-1], bound[i]], index 5 is the +Inf band.
+    request_duration_buckets: [AtomicU64; 6],
 }
 
-fn record_success_duration(duration_us: u64) {
-    REQUEST_SUCCEEDED_COUNT.fetch_add(1, Ordering::Relaxed);
-    REQUEST_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
-    let mut current = REQUEST_DURATION_US_MAX.load(Ordering::Relaxed);
-    while duration_us > current {
-        match REQUEST_DURATION_US_MAX.compare_exchange_weak(
-            current,
-            duration_us,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
+impl Metrics {
+    /// Generate a unique event ID using xxh3_64 over a counter + nanosecond timestamp.
+    /// Avoids OS RNG. The output is a 64-bit xxh3 hash; under the birthday paradox,
+    /// collisions become non-negligible around 2^32 (~4.3 billion) generated IDs.
+    /// Practically irrelevant for an MCP server but worth knowing for high-throughput consumers.
+    fn new_event_id(&self) -> String {
+        let seq = self.event_counter.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&seq.to_le_bytes());
+        buf[8..].copy_from_slice(&ts.to_le_bytes());
+        format!("{:016x}", xxh3_64(&buf))
+    }
+
+    fn record_success_duration(&self, duration_us: u64) {
+        self.request_succeeded_count.fetch_add(1, Ordering::Relaxed);
+        self.request_duration_us_total
+            .fetch_add(duration_us, Ordering::Relaxed);
+        let bucket = DURATION_BUCKET_BOUNDS_US
+            .iter()
+            .position(|&bound| duration_us <= bound)
+            .unwrap_or(DURATION_BUCKET_BOUNDS_US.len());
+        self.request_duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        let mut current = self.request_duration_us_max.load(Ordering::Relaxed);
+        while duration_us > current {
+            match self.request_duration_us_max.compare_exchange_weak(
+                current,
+                duration_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Snapshot the per-band bucket counters as a cumulative `le`-style
+    /// histogram.
+    fn duration_histogram(&self) -> DurationHistogramResult {
+        let bands: Vec<u64> = self
+            .request_duration_buckets
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        DurationHistogramResult {
+            le_1ms: bands[0],
+            le_10ms: bands[0] + bands[1],
+            le_100ms: bands[0] + bands[1] + bands[2],
+            le_1s: bands[..4].iter().sum(),
+            le_10s: bands[..5].iter().sum(),
+            gt_10s: bands[5],
+        }
+    }
+
+    /// Snapshot every handler-level counter for `toon_diagnostics`.
+    fn handler_diagnostics(&self) -> HandlerDiagnosticsResult {
+        let succeeded = self.request_succeeded_count.load(Ordering::Relaxed);
+        let duration_total = self.request_duration_us_total.load(Ordering::Relaxed);
+        let duration_avg = if succeeded == 0 {
+            0.0
+        } else {
+            duration_total as f64 / succeeded as f64
+        };
+        HandlerDiagnosticsResult {
+            log_record_failed_count: self.log_record_failed_count.load(Ordering::Relaxed),
+            log_record_dropped_count: self.log_record_dropped_count.load(Ordering::Relaxed),
+            pipeline_timeout_count: self.pipeline_timeout_count.load(Ordering::Relaxed),
+            blocking_tasks_abandoned: self.blocking_tasks_abandoned.load(Ordering::Relaxed),
+            request_failed_count: self.request_failed_count.load(Ordering::Relaxed),
+            input_rejected_count: self.input_rejected_count.load(Ordering::Relaxed),
+            server_busy_count: self.server_busy_count.load(Ordering::Relaxed),
+            request_succeeded_count: succeeded,
+            request_duration_us_total: duration_total,
+            request_duration_us_max: self.request_duration_us_max.load(Ordering::Relaxed),
+            request_duration_us_avg: duration_avg,
+            request_duration_us_histogram: self.duration_histogram(),
         }
     }
 }
 
-async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
+async fn record_log_event(metrics: &Metrics, log_sink: &Arc<dyn LogSink>, event: LogEvent) {
     let event_id = event.event_id.clone();
     let tool_name = event.tool_name.clone();
-    let before = log_sink.diagnostics();
 
     match log_sink.record(event).await {
-        Ok(()) => {
-            let after = log_sink.diagnostics();
-            let dropped = after
-                .record_dropped_count
-                .saturating_sub(before.record_dropped_count);
-            if dropped > 0 {
-                HANDLER_LOG_RECORD_DROPPED_COUNT.fetch_add(dropped, Ordering::Relaxed);
+        Ok(outcome) => {
+            if outcome.dropped {
+                metrics
+                    .log_record_dropped_count
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     component = "handler_logging",
-                    tool_name,
-                    event_id,
-                    dropped,
-                    total_dropped = after.record_dropped_count,
-                    "log event dropped by logging sink"
+                    tool_name, event_id, "log event dropped by logging sink"
                 );
             }
         }
         Err(err) => {
-            HANDLER_LOG_RECORD_FAILED_COUNT.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .log_record_failed_count
+                .fetch_add(1, Ordering::Relaxed);
             warn!(
                 component = "handler_logging",
                 tool_name,
@@ -109,6 +172,129 @@ async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
                 "log event failed; preserving successful tool response"
             );
         }
+    }
+}
+
+/// Classify a `run_pipeline` error into a `LogEvent` outcome string.
+fn error_outcome(err: &McpError) -> &'static str {
+    let is_timeout = err
+        .data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(|c| c.as_str())
+        == Some("pipeline_timeout");
+    if is_timeout { "timeout" } else { "failed" }
+}
+
+/// Per-request context shared by the failure-path helpers.
+struct RequestContext<'a> {
+    metrics: &'a Metrics,
+    config: &'a Config,
+    log_sink: &'a Arc<dyn LogSink>,
+    tool_name: &'static str,
+    input_bytes: usize,
+}
+
+/// Increment the failure counters, emit a failure `LogEvent`, and hand the
+/// error back for the handler to propagate.
+///
+/// Failure events use `"unknown"` / pass-through placeholders for fields the
+/// pipeline never produced (the input was rejected, timed out, or could not
+/// be processed).
+async fn record_failure(
+    ctx: &RequestContext<'_>,
+    err: McpError,
+    outcome: &'static str,
+    duration_us: u64,
+) -> McpError {
+    ctx.metrics
+        .request_failed_count
+        .fetch_add(1, Ordering::Relaxed);
+    match outcome {
+        "rejected" => {
+            ctx.metrics
+                .input_rejected_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        "busy" => {
+            ctx.metrics
+                .server_busy_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    let event = LogEvent {
+        event_id: ctx.metrics.new_event_id(),
+        ts_us: jiff::Timestamp::now().as_microsecond(),
+        tool_name: ctx.tool_name.into(),
+        input_format: InputFormat::Unknown.as_str().into(),
+        shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+        input_bytes: ctx.input_bytes as u64,
+        output_bytes: ctx.input_bytes as u64,
+        compressed: false,
+        savings_pct: 0.0,
+        threshold_used: ctx.config.max_output_ratio,
+        duration_us,
+        outcome: outcome.into(),
+        pass_reason: None,
+        client_hint: ctx.config.client_hint.clone(),
+    };
+    record_log_event(ctx.metrics, ctx.log_sink, event).await;
+    err
+}
+
+/// Reject inputs above `TOON_MAX_INPUT_BYTES`, recording the failure.
+/// Returns `None` when the input is within bounds.
+async fn reject_oversized(ctx: &RequestContext<'_>) -> Option<McpError> {
+    if ctx.input_bytes <= ctx.config.max_input_bytes {
+        return None;
+    }
+    let err = McpError::invalid_params(
+        format!(
+            "input_exceeds_limit: input is {} bytes; \
+             maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
+            ctx.input_bytes, ctx.config.max_input_bytes
+        ),
+        None,
+    );
+    Some(record_failure(ctx, err, "rejected", 0).await)
+}
+
+/// Queue for up to `TOON_PIPELINE_TIMEOUT_MS` for an owned concurrency
+/// permit, recording a busy failure when the deadline expires.
+///
+/// The owned permit is later moved into `run_pipeline`, which holds it until
+/// the blocking task resolves — including past a timeout — so abandoned work
+/// keeps counting against `max_concurrent_calls`.
+async fn acquire_permit(
+    ctx: &RequestContext<'_>,
+    semaphore: Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, McpError> {
+    match tokio::time::timeout(
+        Duration::from_millis(ctx.config.pipeline_timeout_ms),
+        semaphore.acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(record_failure(
+            ctx,
+            McpError::internal_error("semaphore closed", None),
+            "failed",
+            0,
+        )
+        .await),
+        Err(_) => Err(record_failure(
+            ctx,
+            McpError::internal_error(
+                "server busy: too many concurrent calls",
+                Some(serde_json::json!({ "code": "server_busy" })),
+            ),
+            "busy",
+            0,
+        )
+        .await),
     }
 }
 
@@ -122,9 +308,17 @@ async fn record_log_event(log_sink: &Arc<dyn LogSink>, event: LogEvent) {
 /// every handler so the surrounding code does not have to thread two layers
 /// of error mapping. The timeout error message references
 /// `TOON_PIPELINE_TIMEOUT_MS` so operators can find the knob.
+///
+/// The caller's concurrency permit is passed in and held until the blocking
+/// task actually resolves — not merely until the timeout fires. A blocking
+/// task cannot be cancelled, so on timeout the error is returned to the
+/// caller while the abandoned task keeps its permit occupied; releasing it
+/// early would let timed-out work stack up beyond `max_concurrent_calls`.
 async fn run_pipeline<F, T>(
+    metrics: &Metrics,
     op_name: &'static str,
     pipeline_timeout_ms: u64,
+    permit: OwnedSemaphorePermit,
     f: F,
 ) -> Result<T, McpError>
 where
@@ -132,11 +326,35 @@ where
     T: Send + 'static,
 {
     let timeout = Duration::from_millis(pipeline_timeout_ms);
-    tokio::time::timeout(timeout, tokio::task::spawn_blocking(f))
-        .await
-        .map_err(|_| {
-            PIPELINE_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-            McpError::internal_error(
+    let mut handle = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(join_result) => {
+            drop(permit);
+            join_result.map_err(|e| {
+                McpError::internal_error(
+                    format!("spawn_blocking failed: {e}"),
+                    Some(serde_json::json!({
+                        "code": "spawn_blocking_failed",
+                        "op": op_name,
+                    })),
+                )
+            })
+        }
+        Err(_) => {
+            metrics
+                .pipeline_timeout_count
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .blocking_tasks_abandoned
+                .fetch_add(1, Ordering::Relaxed);
+            // The abandoned task still runs on the blocking pool; a reaper
+            // task holds the permit until it completes so its capacity cost
+            // stays visible to the semaphore.
+            tokio::spawn(async move {
+                let _ = handle.await;
+                drop(permit);
+            });
+            Err(McpError::internal_error(
                 format!(
                     "pipeline_timeout: {op_name} did not complete within \
                      {pipeline_timeout_ms}ms (TOON_PIPELINE_TIMEOUT_MS)"
@@ -146,17 +364,9 @@ where
                     "timeout_ms": pipeline_timeout_ms,
                     "op": op_name,
                 })),
-            )
-        })?
-        .map_err(|e| {
-            McpError::internal_error(
-                format!("spawn_blocking failed: {e}"),
-                Some(serde_json::json!({
-                    "code": "spawn_blocking_failed",
-                    "op": op_name,
-                })),
-            )
-        })
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +389,24 @@ impl From<&Config> for CompressConfig {
         cfg.csv_numeric_coercion = c.csv_numeric_coercion;
         cfg
     }
+}
+
+// ---------------------------------------------------------------------------
+// Named outcome struct for compress pipeline (L2)
+// ---------------------------------------------------------------------------
+
+/// Intermediate result derived from a `CompressDecision` for use in handlers.
+struct CompressOutcome {
+    output: String,
+    compressed: bool,
+    format_str: String,
+    shape_str: String,
+    output_bytes: usize,
+    savings_pct: f64,
+    pass_reason_str: Option<String>,
+    detection_metadata: DetectionMetadata,
+    numeric_coercion_used: Option<bool>,
+    lossy_coercion_possible: Option<bool>,
 }
 
 fn detection_candidates_as_strings(metadata: &DetectionMetadata) -> Vec<String> {
@@ -274,49 +502,33 @@ pub struct DetectResult {
     pub lossy_coercion_possible: Option<bool>,
 }
 
-async fn admit_input<'a>(
-    input_bytes: usize,
-    config: &Config,
-    semaphore: &'a Semaphore,
-) -> Result<tokio::sync::SemaphorePermit<'a>, McpError> {
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
-    }
-
-    tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
-    )
-    .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))
-}
-
 /// Handle the `detect_format` MCP tool.
 pub async fn handle_detect_format(
     params: DetectParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 ) -> Result<DetectResult, McpError> {
+    let tool_name = "detect_format";
     let input = params.input;
     let input_bytes = input.len();
 
-    let _permit = admit_input(input_bytes, &config, &semaphore).await?;
+    let ctx = RequestContext {
+        metrics: &metrics,
+        config: &config,
+        log_sink: &log_sink,
+        tool_name,
+        input_bytes,
+    };
+    if let Some(err) = reject_oversized(&ctx).await {
+        return Err(err);
+    }
 
-    let event_id = new_event_id();
+    // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
+    let permit = acquire_permit(&ctx, Arc::clone(&semaphore)).await?;
+
+    let event_id = metrics.new_event_id();
 
     // M6: event_id is attached to the span for correlation with LogEvent.
     // Concurrency: use `.instrument(span).await` instead of `span.enter()` so
@@ -330,11 +542,16 @@ pub async fn handle_detect_format(
         // C1: Run the synchronous detect call on a blocking thread — FormatDetector::detect
         // performs a full serde_json::from_str and CSV allocation which must not
         // run on the tokio executor.
-        let (metadata, line_count, column_count, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("detection", pipeline_timeout_ms, move || {
+        let pipeline_result = run_pipeline(
+            &metrics,
+            "detection",
+            pipeline_timeout_ms,
+            permit,
+            move || {
                 let metadata = FormatDetector::detect_with_metadata(&input);
                 let fmt = metadata.format;
-                let line_count = FormatDetector::jsonl_line_count(fmt, &input);
+                // Counted during the detection probe; no second scan needed.
+                let line_count = metadata.line_count;
                 let column_count = FormatDetector::column_count(fmt, &input);
                 let (numeric_coercion_used, lossy_coercion_possible) = coercion_visibility(
                     detect_coercion_metadata(fmt, &input, csv_numeric_coercion),
@@ -346,14 +563,31 @@ pub async fn handle_detect_format(
                     numeric_coercion_used,
                     lossy_coercion_possible,
                 )
-            })
-            .await?;
+            },
+        )
+        .await;
+        let (metadata, line_count, column_count, numeric_coercion_used, lossy_coercion_possible) =
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    let ctx = RequestContext {
+                        metrics: &metrics,
+                        config: &config,
+                        log_sink: &log_sink,
+                        tool_name,
+                        input_bytes,
+                    };
+                    return Err(record_failure(&ctx, err, outcome, duration_us).await);
+                }
+            };
         let fmt = metadata.format;
 
         let duration_us = start.elapsed().as_micros() as u64;
 
         let event = LogEvent {
-            event_id,
+            event_id: event_id.clone(),
             ts_us: jiff::Timestamp::now().as_microsecond(),
             tool_name: "detect_format".into(),
             input_format: fmt.as_str().into(),
@@ -364,12 +598,13 @@ pub async fn handle_detect_format(
             savings_pct: 0.0,
             threshold_used: config.max_output_ratio,
             duration_us,
+            outcome: "ok".into(),
             pass_reason: None,
             client_hint: config.client_hint.clone(),
         };
 
-        record_success_duration(duration_us);
-        record_log_event(&log_sink, event).await;
+        metrics.record_success_duration(duration_us);
+        record_log_event(&metrics, &log_sink, event).await;
 
         Ok(DetectResult {
             format: fmt.as_str().into(),
@@ -444,103 +679,156 @@ pub(crate) async fn handle_compress_content_inner(
     params: CompressParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 ) -> Result<CompressResult, McpError> {
-    compress_for_tool(
-        params.input,
-        config,
-        log_sink,
-        semaphore,
-        "compress_content",
-    )
-    .await
-}
-
-async fn compress_for_tool(
-    input: String,
-    config: Arc<Config>,
-    log_sink: Arc<dyn LogSink>,
-    semaphore: Arc<Semaphore>,
-    tool_name: &'static str,
-) -> Result<CompressResult, McpError> {
+    let tool_name = "compress_content";
+    let input = params.input;
     let input_bytes = input.len();
-    let _permit = admit_input(input_bytes, &config, &semaphore).await?;
-    let event_id = new_event_id();
-    let span = if tool_name == "compression_stats" {
-        tracing::info_span!("compression_stats", event_id = %event_id)
-    } else {
-        tracing::info_span!("compress_content", event_id = %event_id)
+
+    let ctx = RequestContext {
+        metrics: &metrics,
+        config: &config,
+        log_sink: &log_sink,
+        tool_name,
+        input_bytes,
     };
+    if let Some(err) = reject_oversized(&ctx).await {
+        return Err(err);
+    }
+
+    let permit = acquire_permit(&ctx, Arc::clone(&semaphore)).await?;
+
+    let event_id = metrics.new_event_id();
+    let span = tracing::info_span!("compress_content", event_id = %event_id);
+
     async move {
         let compress_config = CompressConfig::from(config.as_ref());
+        let pipeline_timeout_ms = config.pipeline_timeout_ms;
         let start = Instant::now();
-        let mut response = run_pipeline("compression", config.pipeline_timeout_ms, move || {
-            let result = Compressor::decide_with_metadata(&input, &compress_config);
-            let (output, format, shape, savings_pct, pass_reason) = match result.decision {
-                CompressDecision::Compressed {
-                    toon,
-                    input_format,
-                    shape_class,
-                    savings_pct,
-                    ..
-                } => (toon, input_format, shape_class, savings_pct, None),
-                CompressDecision::PassedThrough {
-                    reason,
-                    input_format,
-                } => (
+
+        // L1: Return (input, decision) so input is available for pass-through output.
+        // `decide_with_metadata` runs detection and parsing once, surfacing the
+        // detection metadata and CSV/TSV coercion visibility from the same pass.
+        let pipeline_result = run_pipeline(
+            &metrics,
+            "compression",
+            pipeline_timeout_ms,
+            permit,
+            move || {
+                let result = Compressor::decide_with_metadata(&input, &compress_config);
+                let (numeric_coercion_used, lossy_coercion_possible) =
+                    coercion_visibility(result.coercion);
+                (
                     input,
-                    input_format.unwrap_or(InputFormat::Unknown),
-                    toon_mcp_core::ShapeClass::PassThrough,
-                    0.0,
-                    Some(reason.as_str().into()),
-                ),
-            };
-            let (numeric_coercion_used, lossy_coercion_possible) =
-                coercion_visibility(result.coercion);
-            CompressResult {
-                output_bytes: output.len(),
-                output: if tool_name == "compression_stats" {
-                    String::new()
-                } else {
-                    output
-                },
-                compressed: pass_reason.is_none(),
-                format: format.as_str().into(),
-                shape_class: shape.as_str().into(),
-                input_bytes,
-                savings_pct,
-                duration_us: 0,
-                pass_reason,
-                detection_confidence: result.detection.confidence.as_str().into(),
-                detection_ambiguous: result.detection.ambiguous,
-                detection_candidates: detection_candidates_as_strings(&result.detection),
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            }
-        })
-        .await?;
-        response.duration_us = start.elapsed().as_micros() as u64;
-        record_success_duration(response.duration_us);
-        record_log_event(
-            &log_sink,
-            LogEvent {
-                event_id,
-                ts_us: jiff::Timestamp::now().as_microsecond(),
-                tool_name: tool_name.into(),
-                input_format: response.format.clone(),
-                shape_class: response.shape_class.clone(),
-                input_bytes: input_bytes as u64,
-                output_bytes: response.output_bytes as u64,
-                compressed: response.compressed,
-                savings_pct: response.savings_pct,
-                threshold_used: config.max_output_ratio,
-                duration_us: response.duration_us,
-                pass_reason: response.pass_reason.clone(),
-                client_hint: config.client_hint.clone(),
+                    result.decision,
+                    result.detection,
+                    numeric_coercion_used,
+                    lossy_coercion_possible,
+                )
             },
         )
         .await;
-        Ok(response)
+        let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    let ctx = RequestContext {
+                        metrics: &metrics,
+                        config: &config,
+                        log_sink: &log_sink,
+                        tool_name,
+                        input_bytes,
+                    };
+                    return Err(record_failure(&ctx, err, outcome, duration_us).await);
+                }
+            };
+
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        // L2 + H3: named struct, no second detect call.
+        // Match is exhaustive over `CompressDecision` (no wildcard) so any new
+        // variant produces a compile-time error.
+        // Move `input` into the pass-through output to avoid a String clone;
+        // `decision` is consumed here so the compressed branch can take `toon`
+        // by value.
+        let outcome = match decision {
+            CompressDecision::Compressed {
+                toon,
+                toon_bytes,
+                savings_pct,
+                input_format,
+                shape_class,
+                ..
+            } => CompressOutcome {
+                output: toon,
+                compressed: true,
+                format_str: input_format.as_str().into(),
+                shape_str: shape_class.as_str().into(),
+                output_bytes: toon_bytes,
+                savings_pct,
+                pass_reason_str: None,
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            },
+            CompressDecision::PassedThrough {
+                reason,
+                input_format,
+            } => CompressOutcome {
+                output: input,
+                compressed: false,
+                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+                output_bytes: input_bytes,
+                savings_pct: 0.0,
+                pass_reason_str: Some(reason.as_str().into()),
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            },
+        };
+
+        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
+
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
+            tool_name: "compress_content".into(),
+            input_format: outcome.format_str.clone(),
+            shape_class: outcome.shape_str.clone(),
+            input_bytes: input_bytes as u64,
+            output_bytes: outcome.output_bytes as u64,
+            compressed: outcome.compressed,
+            savings_pct: outcome.savings_pct,
+            threshold_used: config.max_output_ratio,
+            duration_us,
+            outcome: "ok".into(),
+            pass_reason: outcome.pass_reason_str.clone(),
+            client_hint: config.client_hint.clone(),
+        };
+
+        metrics.record_success_duration(duration_us);
+        record_log_event(&metrics, &log_sink, event).await;
+
+        Ok(CompressResult {
+            output: outcome.output,
+            compressed: outcome.compressed,
+            format: outcome.format_str,
+            shape_class: outcome.shape_str,
+            input_bytes,
+            output_bytes: outcome.output_bytes,
+            savings_pct: outcome.savings_pct,
+            duration_us,
+            pass_reason: outcome.pass_reason_str,
+            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
+            detection_ambiguous: outcome.detection_metadata.ambiguous,
+            detection_candidates,
+            numeric_coercion_used: outcome.numeric_coercion_used,
+            lossy_coercion_possible: outcome.lossy_coercion_possible,
+        })
     }
     .instrument(span)
     .await
@@ -598,32 +886,149 @@ pub async fn handle_compression_stats(
     params: StatsParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 ) -> Result<StatsResult, McpError> {
-    let threshold = config.max_output_ratio;
-    let result = compress_for_tool(
-        params.input,
-        config,
-        log_sink,
-        semaphore,
-        "compression_stats",
-    )
-    .await?;
-    Ok(StatsResult {
-        would_compress: result.compressed,
-        format: result.format,
-        shape_class: result.shape_class,
-        input_bytes: result.input_bytes,
-        estimated_output_bytes: result.output_bytes,
-        estimated_savings_pct: result.savings_pct,
-        threshold,
-        pass_reason: result.pass_reason,
-        detection_confidence: result.detection_confidence,
-        detection_ambiguous: result.detection_ambiguous,
-        detection_candidates: result.detection_candidates,
-        numeric_coercion_used: result.numeric_coercion_used,
-        lossy_coercion_possible: result.lossy_coercion_possible,
-    })
+    let tool_name = "compression_stats";
+    let input = params.input;
+    let input_bytes = input.len();
+
+    let ctx = RequestContext {
+        metrics: &metrics,
+        config: &config,
+        log_sink: &log_sink,
+        tool_name,
+        input_bytes,
+    };
+    if let Some(err) = reject_oversized(&ctx).await {
+        return Err(err);
+    }
+
+    let permit = acquire_permit(&ctx, Arc::clone(&semaphore)).await?;
+
+    let event_id = metrics.new_event_id();
+    let span = tracing::info_span!("compression_stats", event_id = %event_id);
+
+    async move {
+        let compress_config = CompressConfig::from(config.as_ref());
+        let pipeline_timeout_ms = config.pipeline_timeout_ms;
+        let start = Instant::now();
+
+        let pipeline_result = run_pipeline(
+            &metrics,
+            "compression",
+            pipeline_timeout_ms,
+            permit,
+            move || {
+                let result = Compressor::decide_with_metadata(&input, &compress_config);
+                let (numeric_coercion_used, lossy_coercion_possible) =
+                    coercion_visibility(result.coercion);
+                (
+                    result.decision,
+                    result.detection,
+                    numeric_coercion_used,
+                    lossy_coercion_possible,
+                )
+            },
+        )
+        .await;
+        let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
+            match pipeline_result {
+                Ok(v) => v,
+                Err(err) => {
+                    let outcome = error_outcome(&err);
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    let ctx = RequestContext {
+                        metrics: &metrics,
+                        config: &config,
+                        log_sink: &log_sink,
+                        tool_name,
+                        input_bytes,
+                    };
+                    return Err(record_failure(&ctx, err, outcome, duration_us).await);
+                }
+            };
+
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        // L2 + H3: named struct, no second detect call.
+        // Exhaustive match — see `handle_compress_content_inner` for rationale.
+        let outcome = match &decision {
+            CompressDecision::Compressed {
+                toon_bytes,
+                savings_pct,
+                input_format,
+                shape_class,
+                ..
+            } => CompressOutcome {
+                output: String::new(),
+                compressed: true,
+                format_str: input_format.as_str().into(),
+                shape_str: shape_class.as_str().into(),
+                output_bytes: *toon_bytes,
+                savings_pct: *savings_pct,
+                pass_reason_str: None,
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            },
+            CompressDecision::PassedThrough {
+                reason,
+                input_format,
+            } => CompressOutcome {
+                output: String::new(),
+                compressed: false,
+                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
+                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+                output_bytes: input_bytes,
+                savings_pct: 0.0,
+                pass_reason_str: Some(reason.as_str().into()),
+                detection_metadata,
+                numeric_coercion_used,
+                lossy_coercion_possible,
+            },
+        };
+
+        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
+
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
+            tool_name: "compression_stats".into(),
+            input_format: outcome.format_str.clone(),
+            shape_class: outcome.shape_str.clone(),
+            input_bytes: input_bytes as u64,
+            output_bytes: outcome.output_bytes as u64,
+            compressed: outcome.compressed,
+            savings_pct: outcome.savings_pct,
+            threshold_used: config.max_output_ratio,
+            duration_us,
+            outcome: "ok".into(),
+            pass_reason: outcome.pass_reason_str.clone(),
+            client_hint: config.client_hint.clone(),
+        };
+
+        metrics.record_success_duration(duration_us);
+        record_log_event(&metrics, &log_sink, event).await;
+
+        Ok(StatsResult {
+            would_compress: outcome.compressed,
+            format: outcome.format_str,
+            shape_class: outcome.shape_str,
+            input_bytes,
+            estimated_output_bytes: outcome.output_bytes,
+            estimated_savings_pct: outcome.savings_pct,
+            threshold: config.max_output_ratio,
+            pass_reason: outcome.pass_reason_str,
+            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
+            detection_ambiguous: outcome.detection_metadata.ambiguous,
+            detection_candidates,
+            numeric_coercion_used: outcome.numeric_coercion_used,
+            lossy_coercion_possible: outcome.lossy_coercion_possible,
+        })
+    }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +1067,34 @@ pub struct LoggingDiagnosticsResult {
     pub queue_available: Option<usize>,
 }
 
+/// Cumulative fixed-bucket histogram of successful request durations.
+///
+/// Buckets are cumulative in the Prometheus `le` style: `le_10ms` counts
+/// every request completing in at most 10 ms, including those counted by
+/// `le_1ms`. `gt_10s` is the overflow band. The total number of observed
+/// requests is `le_10s + gt_10s`, which equals `request_succeeded_count`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DurationHistogramResult {
+    /// Requests completing in at most 1 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_1ms: u64,
+    /// Requests completing in at most 10 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_10ms: u64,
+    /// Requests completing in at most 100 ms.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_100ms: u64,
+    /// Requests completing in at most 1 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_1s: u64,
+    /// Requests completing in at most 10 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub le_10s: u64,
+    /// Requests taking longer than 10 s.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub gt_10s: u64,
+}
+
 /// Handler-level diagnostics returned by `toon_diagnostics`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct HandlerDiagnosticsResult {
@@ -674,6 +1107,20 @@ pub struct HandlerDiagnosticsResult {
     /// Number of pipeline timeout responses returned by handlers.
     #[schemars(schema_with = "schema_as_integer")]
     pub pipeline_timeout_count: u64,
+    /// Number of blocking pipeline tasks abandoned after a timeout. Each
+    /// abandoned task keeps its concurrency permit until it completes.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub blocking_tasks_abandoned: u64,
+    /// Number of tool requests that returned an error (any failure kind).
+    #[schemars(schema_with = "schema_as_integer")]
+    pub request_failed_count: u64,
+    /// Number of inputs rejected before processing (over the size limit).
+    #[schemars(schema_with = "schema_as_integer")]
+    pub input_rejected_count: u64,
+    /// Number of requests rejected because no concurrency permit became
+    /// available within the queue deadline.
+    #[schemars(schema_with = "schema_as_integer")]
+    pub server_busy_count: u64,
     /// Number of successful tool requests included in duration gauges.
     #[schemars(schema_with = "schema_as_integer")]
     pub request_succeeded_count: u64,
@@ -685,6 +1132,9 @@ pub struct HandlerDiagnosticsResult {
     pub request_duration_us_max: u64,
     /// Average successful request duration in microseconds.
     pub request_duration_us_avg: f64,
+    /// Cumulative duration histogram for successful requests. The three
+    /// total/max/avg gauges above are retained for backward compatibility.
+    pub request_duration_us_histogram: DurationHistogramResult,
 }
 
 /// Output from `toon_diagnostics`.
@@ -709,41 +1159,60 @@ pub async fn handle_toon_diagnostics(
     _params: DiagnosticsParams,
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 ) -> Result<DiagnosticsResult, McpError> {
-    let log = log_sink.diagnostics();
-    let succeeded = REQUEST_SUCCEEDED_COUNT.load(Ordering::Relaxed);
-    let duration_total = REQUEST_DURATION_US_TOTAL.load(Ordering::Relaxed);
-    let duration_avg = if succeeded == 0 {
-        0.0
-    } else {
-        duration_total as f64 / succeeded as f64
-    };
+    let event_id = metrics.new_event_id();
+    // M6: same span + LogEvent treatment as the data tools so diagnostics
+    // calls are correlated and audited like every other invocation.
+    let span = tracing::info_span!("toon_diagnostics", event_id = %event_id);
 
-    Ok(DiagnosticsResult {
-        logging_enabled: config.logging_enabled,
-        logging: LoggingDiagnosticsResult {
-            record_dropped_count: log.record_dropped_count,
-            record_failed_count: log.record_failed_count,
-            serialization_failed_count: log.serialization_failed_count,
-            writer_failed_count: log.writer_failed_count,
-            last_error: log.last_error,
-            queue_capacity: log.queue_capacity,
-            queue_queued: log.queue_queued,
-            queue_available: log.queue_available,
-        },
-        handler: HandlerDiagnosticsResult {
-            log_record_failed_count: HANDLER_LOG_RECORD_FAILED_COUNT.load(Ordering::Relaxed),
-            log_record_dropped_count: HANDLER_LOG_RECORD_DROPPED_COUNT.load(Ordering::Relaxed),
-            pipeline_timeout_count: PIPELINE_TIMEOUT_COUNT.load(Ordering::Relaxed),
-            request_succeeded_count: succeeded,
-            request_duration_us_total: duration_total,
-            request_duration_us_max: REQUEST_DURATION_US_MAX.load(Ordering::Relaxed),
-            request_duration_us_avg: duration_avg,
-        },
-        semaphore_available_permits: semaphore.available_permits(),
-        max_concurrent_calls: config.max_concurrent_calls,
-    })
+    async move {
+        let start = Instant::now();
+        let log = log_sink.diagnostics();
+
+        let result = DiagnosticsResult {
+            logging_enabled: config.logging_enabled,
+            logging: LoggingDiagnosticsResult {
+                record_dropped_count: log.record_dropped_count,
+                record_failed_count: log.record_failed_count,
+                serialization_failed_count: log.serialization_failed_count,
+                writer_failed_count: log.writer_failed_count,
+                last_error: log.last_error,
+                queue_capacity: log.queue_capacity,
+                queue_queued: log.queue_queued,
+                queue_available: log.queue_available,
+            },
+            handler: metrics.handler_diagnostics(),
+            semaphore_available_permits: semaphore.available_permits(),
+            max_concurrent_calls: config.max_concurrent_calls,
+        };
+
+        // Recorded after the snapshot so the returned counters do not include
+        // this call's own event. Diagnostics stays out of the success-duration
+        // gauges: those measure the data pipeline, which this tool never runs.
+        let event = LogEvent {
+            event_id: event_id.clone(),
+            ts_us: jiff::Timestamp::now().as_microsecond(),
+            tool_name: "toon_diagnostics".into(),
+            input_format: InputFormat::Unknown.as_str().into(),
+            shape_class: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
+            input_bytes: 0,
+            output_bytes: 0,
+            compressed: false,
+            savings_pct: 0.0,
+            threshold_used: config.max_output_ratio,
+            duration_us: start.elapsed().as_micros() as u64,
+            outcome: "ok".into(),
+            pass_reason: None,
+            client_hint: config.client_hint.clone(),
+        };
+        record_log_event(&metrics, &log_sink, event).await;
+
+        Ok(result)
+    }
+    .instrument(span)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +1253,10 @@ mod tests {
         Arc::new(Semaphore::new(config.max_concurrent_calls))
     }
 
+    fn test_metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::default())
+    }
+
     fn schema_has_property<T: JsonSchema>(property: &str) -> bool {
         let schema = schemars::schema_for!(T);
         let value = serde_json::to_value(schema).expect("schema must serialize to JSON");
@@ -805,6 +1278,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -830,6 +1304,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -849,6 +1324,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -872,6 +1348,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -891,6 +1368,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -903,9 +1381,15 @@ mod tests {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
         let huge = "x".repeat(cfg.max_input_bytes + 1);
-        let err = handle_detect_format(DetectParams { input: huge }, cfg, noop_sink(), sem)
-            .await
-            .unwrap_err();
+        let err = handle_detect_format(
+            DetectParams { input: huge },
+            cfg,
+            noop_sink(),
+            test_metrics(),
+            sem,
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.contains("input_exceeds_limit"));
     }
 
@@ -928,9 +1412,15 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let result = handle_compress_content_inner(CompressParams { input }, cfg, noop_sink(), sem)
-            .await
-            .unwrap();
+        let result = handle_compress_content_inner(
+            CompressParams { input },
+            cfg,
+            noop_sink(),
+            test_metrics(),
+            sem,
+        )
+        .await
+        .unwrap();
         assert!(result.compressed || result.output_bytes <= result.input_bytes);
         assert!(!result.detection_confidence.is_empty());
     }
@@ -946,6 +1436,7 @@ mod tests {
             },
             cfg,
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -960,10 +1451,15 @@ mod tests {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
         let huge = "x".repeat(cfg.max_input_bytes + 1);
-        let err =
-            handle_compress_content_inner(CompressParams { input: huge }, cfg, noop_sink(), sem)
-                .await
-                .unwrap_err();
+        let err = handle_compress_content_inner(
+            CompressParams { input: huge },
+            cfg,
+            noop_sink(),
+            test_metrics(),
+            sem,
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.contains("input_exceeds_limit"));
     }
 
@@ -979,6 +1475,7 @@ mod tests {
             },
             cfg.clone(),
             noop_sink(),
+            test_metrics(),
             sem,
         )
         .await
@@ -992,9 +1489,15 @@ mod tests {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
         let huge = "x".repeat(cfg.max_input_bytes + 1);
-        let err = handle_compression_stats(StatsParams { input: huge }, cfg, noop_sink(), sem)
-            .await
-            .unwrap_err();
+        let err = handle_compression_stats(
+            StatsParams { input: huge },
+            cfg,
+            noop_sink(),
+            test_metrics(),
+            sem,
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.contains("input_exceeds_limit"));
     }
 
@@ -1012,6 +1515,7 @@ mod tests {
             },
             Arc::clone(&cfg),
             sink,
+            test_metrics(),
             sem,
         )
         .await
@@ -1019,6 +1523,113 @@ mod tests {
         let events = events.lock().expect("not poisoned");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "detect_format");
+        assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn toon_diagnostics_logs_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        handle_toon_diagnostics(DiagnosticsParams {}, cfg, sink, test_metrics(), sem)
+            .await
+            .unwrap();
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, "toon_diagnostics");
+        assert_eq!(events[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn oversized_input_records_rejected_failure_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let mut base = (*test_config()).clone();
+        base.max_input_bytes = 8;
+        let cfg = Arc::new(base);
+        let sem = test_semaphore(&cfg);
+
+        let err = handle_detect_format(
+            DetectParams {
+                input: "x".repeat(9),
+            },
+            cfg,
+            Arc::clone(&sink),
+            test_metrics(),
+            sem,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("input_exceeds_limit"));
+
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1, "rejection must emit a failure event");
+        assert_eq!(events[0].tool_name, "detect_format");
+        assert_eq!(events[0].outcome, "rejected");
+        assert!(!events[0].compressed);
+    }
+
+    #[tokio::test]
+    async fn busy_rejection_records_busy_failure_event() {
+        let (memory_sink, events) = MemorySink::new();
+        let sink: Arc<dyn LogSink> = Arc::new(memory_sink);
+        let mut base = (*test_config()).clone();
+        // Short queue deadline so the held permit forces a busy rejection.
+        base.pipeline_timeout_ms = 50;
+        base.max_concurrent_calls = 1;
+        let cfg = Arc::new(base);
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).acquire_owned().await.expect("permit");
+
+        let err = handle_compression_stats(
+            StatsParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            cfg,
+            Arc::clone(&sink),
+            test_metrics(),
+            Arc::clone(&sem),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.contains("server busy"));
+        drop(held);
+
+        let events = events.lock().expect("not poisoned");
+        assert_eq!(events.len(), 1, "busy rejection must emit a failure event");
+        assert_eq!(events[0].tool_name, "compression_stats");
+        assert_eq!(events[0].outcome, "busy");
+    }
+
+    #[tokio::test]
+    async fn failure_counters_increment_on_rejection() {
+        let mut base = (*test_config()).clone();
+        base.max_input_bytes = 8;
+        let cfg = Arc::new(base);
+        let sem = test_semaphore(&cfg);
+        let metrics = test_metrics();
+
+        let _ = handle_compress_content_inner(
+            CompressParams {
+                input: "x".repeat(9),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&metrics),
+            Arc::clone(&sem),
+        )
+        .await
+        .unwrap_err();
+
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), metrics, sem)
+            .await
+            .expect("diagnostics succeeds");
+        // Metrics are per-server, so exact equality holds.
+        assert_eq!(after.handler.request_failed_count, 1);
+        assert_eq!(after.handler.input_rejected_count, 1);
+        assert_eq!(after.handler.server_busy_count, 0);
+        assert_eq!(after.handler.request_succeeded_count, 0);
     }
 
     #[tokio::test]
@@ -1033,6 +1644,7 @@ mod tests {
             },
             Arc::clone(&cfg),
             sink,
+            test_metrics(),
             sem,
         )
         .await
@@ -1054,6 +1666,7 @@ mod tests {
             },
             Arc::clone(&cfg),
             sink,
+            test_metrics(),
             sem,
         )
         .await
@@ -1065,7 +1678,10 @@ mod tests {
 
     #[tokio::test]
     async fn handler_preserves_success_when_logging_channel_closed() {
-        let dir = std::env::temp_dir().join(format!("toon-mcp-server-test-{}", new_event_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "toon-mcp-server-test-{}",
+            test_metrics().new_event_id()
+        ));
         let config = JsonlSinkConfig {
             log_dir: dir.clone(),
             buffer_size: 4,
@@ -1077,24 +1693,32 @@ mod tests {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
 
+        let metrics = test_metrics();
         let result = handle_detect_format(
             DetectParams {
                 input: r#"{"a":1}"#.into(),
             },
             Arc::clone(&cfg),
             Arc::clone(&sink),
+            Arc::clone(&metrics),
             sem,
         )
         .await
         .expect("tool call succeeds despite logging failure");
 
         assert_eq!(result.format, "json");
-        let diagnostics =
-            handle_toon_diagnostics(DiagnosticsParams {}, cfg, sink, Arc::new(Semaphore::new(1)))
-                .await
-                .expect("diagnostics succeeds");
+        let diagnostics = handle_toon_diagnostics(
+            DiagnosticsParams {},
+            cfg,
+            sink,
+            metrics,
+            Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .expect("diagnostics succeeds");
         assert_eq!(diagnostics.logging.record_failed_count, 1);
-        assert!(diagnostics.handler.log_record_failed_count >= 1);
+        // Metrics are per-server, so exact equality holds.
+        assert_eq!(diagnostics.handler.log_record_failed_count, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1102,14 +1726,7 @@ mod tests {
     async fn diagnostics_reports_request_durations() {
         let cfg = test_config();
         let sem = test_semaphore(&cfg);
-        let before = handle_toon_diagnostics(
-            DiagnosticsParams {},
-            Arc::clone(&cfg),
-            noop_sink(),
-            Arc::clone(&sem),
-        )
-        .await
-        .expect("diagnostics succeeds");
+        let metrics = test_metrics();
 
         handle_detect_format(
             DetectParams {
@@ -1117,21 +1734,55 @@ mod tests {
             },
             Arc::clone(&cfg),
             noop_sink(),
+            Arc::clone(&metrics),
             Arc::clone(&sem),
         )
         .await
         .expect("tool call succeeds");
 
-        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), sem)
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), metrics, sem)
             .await
             .expect("diagnostics succeeds");
-        assert!(
-            after.handler.request_succeeded_count > before.handler.request_succeeded_count,
-            "request counter increments"
+        // Metrics are per-server, so exact equality holds.
+        assert_eq!(after.handler.request_succeeded_count, 1);
+        assert_eq!(
+            after.handler.request_duration_us_total,
+            after.handler.request_duration_us_max
         );
-        assert!(
-            after.handler.request_duration_us_total >= before.handler.request_duration_us_total
-        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_histogram_counts_successful_requests() {
+        let cfg = test_config();
+        let sem = test_semaphore(&cfg);
+        let metrics = test_metrics();
+        let total = |h: &DurationHistogramResult| h.le_10s + h.gt_10s;
+
+        handle_detect_format(
+            DetectParams {
+                input: r#"{"a":1}"#.into(),
+            },
+            Arc::clone(&cfg),
+            noop_sink(),
+            Arc::clone(&metrics),
+            Arc::clone(&sem),
+        )
+        .await
+        .expect("tool call succeeds");
+
+        let after = handle_toon_diagnostics(DiagnosticsParams {}, cfg, noop_sink(), metrics, sem)
+            .await
+            .expect("diagnostics succeeds");
+        let h = &after.handler.request_duration_us_histogram;
+        // Metrics are per-server, so exact equality holds.
+        assert_eq!(total(h), 1, "histogram total observes the one request");
+        // Cumulative monotonicity across buckets.
+        assert!(h.le_1ms <= h.le_10ms);
+        assert!(h.le_10ms <= h.le_100ms);
+        assert!(h.le_100ms <= h.le_1s);
+        assert!(h.le_1s <= h.le_10s);
+        // The histogram and the succeeded counter observe the same stream.
+        assert_eq!(total(h), after.handler.request_succeeded_count);
     }
 
     // --- memory sink ---
@@ -1149,6 +1800,7 @@ mod tests {
                 },
                 Arc::clone(&cfg),
                 Arc::clone(&sink),
+                test_metrics(),
                 Arc::clone(&sem),
             )
             .await
@@ -1157,9 +1809,25 @@ mod tests {
         assert_eq!(events.lock().expect("not poisoned").len(), 3);
     }
 
-    /// The semaphore permit acquired at handler entry must be released
-    /// even when the pipeline times out. Otherwise, sustained timeouts
-    /// would gradually deplete `max_concurrent_calls` and wedge the server.
+    /// Poll until the semaphore recovers `expected` permits, failing after a
+    /// bounded wait. On timeout the permit is released only once the
+    /// abandoned blocking task completes, which may lag the handler's return.
+    async fn wait_for_permits(sem: &Semaphore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sem.available_permits() != expected {
+            assert!(
+                Instant::now() < deadline,
+                "permit not released within 2 s (available: {}, expected: {expected})",
+                sem.available_permits()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The semaphore permit acquired at handler entry must be released once
+    /// the (possibly abandoned) blocking task completes — even when the
+    /// pipeline times out. Otherwise, sustained timeouts would gradually
+    /// deplete `max_concurrent_calls` and wedge the server.
     #[tokio::test]
     async fn detect_format_releases_permit_on_timeout() {
         let mut base = (*test_config()).clone();
@@ -1180,19 +1848,17 @@ mod tests {
             },
             Arc::clone(&cfg),
             noop_sink(),
+            test_metrics(),
             Arc::clone(&sem),
         )
         .await;
 
         // Whether the timeout fired during semaphore acquire, during the
-        // pipeline body, or never — the permit must always be released by
-        // the time the call returns. Otherwise sustained timeouts would
-        // gradually wedge the server.
-        assert_eq!(
-            sem.available_permits(),
-            initial,
-            "permit was not released after handler returned"
-        );
+        // pipeline body, or never — the permit must be released once the
+        // abandoned blocking task completes. The invariant is "released on
+        // task completion", not "released on handler return", so poll with
+        // a bound instead of asserting immediately.
+        wait_for_permits(&sem, initial).await;
     }
 
     /// Same property for `compress_content`.
@@ -1211,11 +1877,12 @@ mod tests {
             },
             Arc::clone(&cfg),
             noop_sink(),
+            test_metrics(),
             Arc::clone(&sem),
         )
         .await;
 
-        assert_eq!(sem.available_permits(), initial);
+        wait_for_permits(&sem, initial).await;
     }
 
     /// Same property for `compression_stats`.
@@ -1234,24 +1901,26 @@ mod tests {
             },
             Arc::clone(&cfg),
             noop_sink(),
+            test_metrics(),
             Arc::clone(&sem),
         )
         .await;
 
-        assert_eq!(sem.available_permits(), initial);
+        wait_for_permits(&sem, initial).await;
     }
 
     #[test]
     fn new_event_id_is_unique() {
-        let a = new_event_id();
-        let b = new_event_id();
+        let metrics = test_metrics();
+        let a = metrics.new_event_id();
+        let b = metrics.new_event_id();
         assert_ne!(a, b);
         assert_eq!(a.len(), 16);
     }
 
     #[test]
     fn new_event_id_is_hex() {
-        let id = new_event_id();
+        let id = test_metrics().new_event_id();
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

@@ -2,6 +2,7 @@
 // description: Public API surface for toon-mcp-logging
 
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 //! Async `LogSink` trait and implementations for structured event logging.
 //!
@@ -27,4 +28,4 @@ pub use event::LogEvent;
 pub use jsonl_sink::{JsonlSink, JsonlSinkConfig};
 pub use memory_sink::MemorySink;
 pub use noop_sink::NoopSink;
-pub use sink::{LogDiagnostics, LogSink};
+pub use sink::{LogDiagnostics, LogSink, RecordOutcome};

@@ -430,9 +430,19 @@ async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()>
         )
         .await;
 
+    // rmcp 3.x surfaces schema mismatches as a tool-level error result
+    // (is_error = true) rather than a protocol-level error.
     let result = result?;
-    assert_eq!(result.is_error, Some(true));
-    assert!(first_text(&result).contains("missing field `input`"));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected tool-level error for malformed params (missing input field), got: {result:?}"
+    );
+    let msg = first_text(&result);
+    assert!(
+        msg.contains("missing field `input`"),
+        "expected error text to mention the missing `input` field, got: {msg}"
+    );
 
     client.cancel().await?;
     join_server(server_handle).await;

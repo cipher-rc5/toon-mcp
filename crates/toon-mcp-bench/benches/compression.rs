@@ -2,6 +2,8 @@
 // description: Full pipeline benchmarks (detect + parse + classify + encode)
 // reference: https://docs.rs/criterion/latest/criterion/
 
+//! Criterion benchmarks for the end-to-end compression pipeline.
+
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};

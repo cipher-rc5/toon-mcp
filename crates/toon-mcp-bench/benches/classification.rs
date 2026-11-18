@@ -2,6 +2,8 @@
 // description: Criterion benchmarks for shape classification on pre-parsed values
 // reference: https://docs.rs/criterion/latest/criterion/
 
+//! Criterion benchmarks for shape classification.
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};

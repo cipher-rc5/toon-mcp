@@ -1,7 +1,6 @@
 # The harness source is tracked; generated data and host-specific config are not.
 /target/
 /results/
-Cargo.lock
 *.log
 
 # Private server config (model path, port, …). Commit .env.eval.example only.

@@ -91,8 +91,6 @@ find /absolute/path/to/toon-mcp/data/logs -maxdepth 1 -type d -name 'day=*' -mti
 - No network listener.
 - No multi-tenant isolation.
 - No built-in log retention or rotation.
-- No signed or attested release artifacts yet; releases currently publish checksums only.
-- No SBOM artifact in releases yet.
 - No cancellation of already-started blocking compression work after handler timeout.
 
 ## See Also

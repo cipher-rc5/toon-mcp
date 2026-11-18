@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [master]
   pull_request:
-    branches: [main, master]
+    branches: [master]
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -61,8 +61,8 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      # Coverage gate. Floor raised from 70 -> 75 once non-trivial coverage
-      # was confirmed; bump again when coverage matures.
+      # Coverage gate. Floor raised 70 -> 75 -> 85; measured line coverage
+      # was 90.9% when the floor moved to 85, leaving ~6 points of headroom.
       - name: cargo llvm-cov (coverage gate)
         run: |
           cargo llvm-cov --workspace \
@@ -72,7 +72,7 @@ jobs:
             --ignore-filename-regex "crates/toon-mcp-bench"
           cargo llvm-cov report \
             --ignore-filename-regex "crates/toon-mcp-bench" \
-            --fail-under-lines 75
+            --fail-under-lines 85
 
       - name: Upload coverage report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -130,6 +130,45 @@ jobs:
 
       - name: just eval-build
         run: just eval-build
+
+      # Round-trip fidelity gate: run the deterministic pipeline subcommand
+      # over the committed fixture corpus (no llama-server required) and fail
+      # the build if any item drifts through the encode/decode cycle.
+      - name: Round-trip fidelity gate (fixture corpus)
+        run: |
+          mkdir -p evals/results
+          cp evals/fixtures/corpus.jsonl evals/results/corpus.jsonl
+          just eval-pipeline
+          just eval-report
+          failures=$(jq '.roundtrip_failures' evals/results/summary.json)
+          echo "roundtrip_failures=$failures"
+          test "$failures" -eq 0
+
+  windows-check:
+    name: Windows cargo check
+    # Compiles the #[cfg(not(unix))] shutdown branch on every PR so the
+    # non-Unix code path cannot silently rot.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install toolchain (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache Cargo registry and build artefacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: cargo check --workspace
+        run: cargo check --workspace
 
   audit:
     name: Security audit
@@ -200,6 +239,17 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # The committed seed corpus lives in fuzz/corpus/<target>/; the cache
+      # layers each run's discoveries on top so coverage accumulates between
+      # runs instead of restarting from the seeds.
+      - name: Cache fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
       - name: Run bounded fuzz smoke targets (PR budget)
         working-directory: fuzz
         run: |
@@ -219,9 +269,12 @@ jobs:
           path: fuzz/artifacts
 
   fuzz-smoke-extended:
-    name: Fuzz smoke (extended — 30s/target)
+    name: Fuzz smoke (extended — 300s/target)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    permissions:
+      # Required to commit the minimised corpus back to the repository.
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -234,16 +287,45 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      - name: Cache fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
       - name: Run bounded fuzz smoke targets (extended)
         working-directory: fuzz
         run: |
           mkdir -p artifacts
           for target in detect_and_parse json_parse jsonl_parse csv_parse; do
             cargo +nightly fuzz run "$target" -- \
-              -max_total_time=30 \
+              -max_total_time=300 \
               -rss_limit_mb=512 \
               -artifact_prefix="artifacts/$target-"
           done
+
+      # Minimise the grown corpus and commit it back so coverage accumulates
+      # in the repository instead of resetting each run.
+      - name: Minimise corpus (cargo fuzz cmin)
+        working-directory: fuzz
+        run: |
+          for target in detect_and_parse json_parse jsonl_parse csv_parse; do
+            cargo +nightly fuzz cmin "$target"
+          done
+
+      - name: Commit minimised corpus
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuzz/corpus
+          if git diff --cached --quiet; then
+            echo "corpus unchanged; nothing to commit"
+          else
+            git commit -m "chore(fuzz): update minimised corpus from scheduled run"
+            git push origin "HEAD:${GITHUB_REF_NAME:-master}"
+          fi
 
       - name: Upload fuzz artifacts
         if: failure()

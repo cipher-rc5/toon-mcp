@@ -2,6 +2,7 @@
 // description: Library entry point — re-exports server internals for integration tests
 
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
 //! Library entry point for the `toon-mcp-server` crate.
 //!

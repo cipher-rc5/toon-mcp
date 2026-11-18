@@ -24,7 +24,7 @@ use crate::{
     config::Config,
     handler::{
         CompressParams, CompressResult, DetectParams, DetectResult, DiagnosticsParams,
-        DiagnosticsResult, StatsParams, StatsResult, handle_compress_content_inner,
+        DiagnosticsResult, Metrics, StatsParams, StatsResult, handle_compress_content_inner,
         handle_compression_stats, handle_detect_format, handle_toon_diagnostics,
     },
 };
@@ -49,6 +49,7 @@ impl IntoCallToolResult for ToolFailure {
 pub struct ToonMcpServer {
     config: Arc<Config>,
     log_sink: Arc<dyn LogSink>,
+    metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -60,6 +61,7 @@ impl ToonMcpServer {
         Self {
             config: Arc::new(config),
             log_sink,
+            metrics: Arc::new(Metrics::default()),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
         }
     }
@@ -75,6 +77,7 @@ impl ToonMcpServer {
             params,
             Arc::clone(&self.config),
             Arc::clone(&self.log_sink),
+            Arc::clone(&self.metrics),
             Arc::clone(&self.semaphore),
         )
         .await
@@ -95,6 +98,7 @@ impl ToonMcpServer {
             params,
             Arc::clone(&self.config),
             Arc::clone(&self.log_sink),
+            Arc::clone(&self.metrics),
             Arc::clone(&self.semaphore),
         )
         .await
@@ -116,6 +120,7 @@ impl ToonMcpServer {
             params,
             Arc::clone(&self.config),
             Arc::clone(&self.log_sink),
+            Arc::clone(&self.metrics),
             Arc::clone(&self.semaphore),
         )
         .await
@@ -132,10 +137,14 @@ impl ToonMcpServer {
         &self,
         Parameters(params): Parameters<DiagnosticsParams>,
     ) -> Result<Json<DiagnosticsResult>, McpError> {
+        // Deliberately takes no concurrency permit: this tool runs no
+        // blocking pipeline work, and it must stay responsive when the
+        // semaphore is saturated — diagnosing that saturation is its job.
         handle_toon_diagnostics(
             params,
             Arc::clone(&self.config),
             Arc::clone(&self.log_sink),
+            Arc::clone(&self.metrics),
             Arc::clone(&self.semaphore),
         )
         .await

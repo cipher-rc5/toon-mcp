@@ -51,6 +51,10 @@ pub struct DetectionMetadata {
     pub ambiguous: bool,
     /// All formats that matched, in detection precedence order.
     pub candidates: Vec<InputFormat>,
+    /// Number of non-empty lines, populated when `format` is
+    /// [`InputFormat::Jsonl`]. Counted during the detection probe so callers
+    /// do not need a second scan over the input.
+    pub line_count: Option<usize>,
 }
 
 impl DetectionMetadata {
@@ -66,6 +70,7 @@ impl DetectionMetadata {
             confidence: DetectionConfidence::Certain,
             ambiguous: false,
             candidates: Vec::new(),
+            line_count: None,
         }
     }
 }
@@ -142,32 +147,6 @@ impl FormatDetector {
             .map(|h| h.len())
     }
 
-    /// Count non-empty lines in JSONL input, or return `None` for other formats.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use toon_mcp_core::{FormatDetector, InputFormat};
-    ///
-    /// assert_eq!(
-    ///     FormatDetector::jsonl_line_count(InputFormat::Jsonl, "{\"a\":1}\n\n{\"b\":2}"),
-    ///     Some(2)
-    /// );
-    /// assert_eq!(FormatDetector::jsonl_line_count(InputFormat::Json, r#"{"a":1}"#), None);
-    /// ```
-    pub fn jsonl_line_count(fmt: InputFormat, input: &str) -> Option<usize> {
-        if fmt == InputFormat::Jsonl {
-            // Single efficient pass over the input. This re-scans lines the
-            // detector already iterated during `detect_with_metadata`; that
-            // caller-side double-scan is a known, accepted tradeoff because
-            // eliminating it would require threading a count through the public
-            // detection API, which we intentionally keep stable.
-            Some(input.lines().filter(|l| !l.trim().is_empty()).count())
-        } else {
-            None
-        }
-    }
-
     /// Detect the format of `input` without parsing the full document.
     ///
     /// Detection operates solely on the string slice; no I/O is performed.
@@ -188,28 +167,75 @@ impl FormatDetector {
 
     /// Detect the format of `input` and include confidence/ambiguity metadata.
     pub fn detect_with_metadata(input: &str) -> DetectionMetadata {
+        Self::detect_inner(input, false).0
+    }
+
+    /// Detect the format of `input` and, when the JSON probe validated the
+    /// document, hand back the parsed `serde_json::Value` from that same
+    /// pass.
+    ///
+    /// Callers that go on to parse a detected-JSON input (the compression
+    /// pipeline) should use this instead of [`Self::detect_with_metadata`]
+    /// followed by a fresh `serde_json::from_str`: it collapses the probe's
+    /// validation walk and the parse into one traversal of the payload.
+    pub fn detect_with_metadata_and_value(
+        input: &str,
+    ) -> (DetectionMetadata, Option<serde_json::Value>) {
+        Self::detect_inner(input, true)
+    }
+
+    fn detect_inner(
+        input: &str,
+        want_value: bool,
+    ) -> (DetectionMetadata, Option<serde_json::Value>) {
+        // A leading UTF-8 BOM would defeat every probe (it is not ASCII
+        // whitespace); the parsers strip it identically.
+        let input = crate::parser::strip_bom(input);
         let mut candidates = Vec::new();
+        let mut json_value = None;
 
         // 1. JSON probe — fast byte-level pre-check before the O(N) parse.
-        // Use `IgnoredAny` so serde_json validates structure without
-        // allocating a `Value` tree; we re-parse with a real Value if and
-        // when the caller invokes `detect_and_parse`.
+        // Metadata-only callers validate with `IgnoredAny` (no `Value` tree
+        // allocation); pipeline callers ask for the value so the validation
+        // pass doubles as the parse (duplicate-key checked, matching
+        // `JsonParser`).
         let first_nonws = input.bytes().find(|b| !b.is_ascii_whitespace());
-        if matches!(first_nonws, Some(b'{') | Some(b'['))
-            && serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok()
-        {
-            candidates.push(InputFormat::Json);
+        if matches!(first_nonws, Some(b'{') | Some(b'[')) {
+            if want_value {
+                match crate::parser::json::parse_dup_checked(input) {
+                    Ok(v) => {
+                        json_value = Some(v);
+                        candidates.push(InputFormat::Json);
+                    }
+                    // Structurally valid JSON with duplicate keys: still a
+                    // JSON candidate, but no value — the pipeline's parser
+                    // fallback re-parses and surfaces the duplicate-key error.
+                    Err(CoreError::DuplicateKey { .. }) => {
+                        candidates.push(InputFormat::Json);
+                    }
+                    Err(_) => {}
+                }
+            } else if serde_json::from_str::<serde::de::IgnoredAny>(input).is_ok() {
+                candidates.push(InputFormat::Json);
+            }
         }
 
         // Every other format requires at least two records. csv accepts CR
-        // as well as LF, and skips empty lines before the header.
-        let records = input.strip_prefix('\u{feff}').unwrap_or(input);
-        if let Some((first_line, _)) = records.trim_matches(['\r', '\n']).split_once(['\r', '\n']) {
-            if candidates.is_empty() && Self::probe_jsonl(input) {
-                candidates.push(InputFormat::Jsonl);
+        // as well as LF, and skips empty lines before the header. (The BOM
+        // was already stripped above.)
+        let mut jsonl_line_count = None;
+        if let Some((first_line, _)) = input.trim_matches(['\r', '\n']).split_once(['\r', '\n']) {
+            // 2. JSONL probe — validate the first two non-empty lines,
+            // counting the rest so the line count needs no second scan.
+            if candidates.is_empty() {
+                jsonl_line_count = Self::probe_jsonl(input);
+                if jsonl_line_count.is_some() {
+                    candidates.push(InputFormat::Jsonl);
+                }
             }
-            // Without a delimiter, only a quoted first field can continue
-            // onto the next physical line and introduce more columns.
+            // 3./4. CSV and TSV probes. Without a delimiter, only a quoted
+            // first field can continue onto the next physical line and
+            // introduce more columns.
             let quoted = first_line.starts_with('"');
             for (delim, format) in [(',', InputFormat::Csv), ('\t', InputFormat::Tsv)] {
                 if (quoted || first_line.contains(delim))
@@ -227,12 +253,16 @@ impl FormatDetector {
                 DetectionConfidence::Heuristic
             }
         };
-        DetectionMetadata {
+        let metadata = DetectionMetadata {
+            line_count: (format == InputFormat::Jsonl)
+                .then_some(jsonl_line_count)
+                .flatten(),
             format,
             confidence,
             ambiguous: candidates.len() > 1,
             candidates,
-        }
+        };
+        (metadata, json_value)
     }
 
     /// Detect the format and immediately parse to a normalised `serde_json::Value`.
@@ -272,18 +302,23 @@ impl FormatDetector {
 
     // --- private helpers ---
 
-    fn probe_jsonl(input: &str) -> bool {
+    /// Probe for JSONL: the first two non-empty lines must each be valid
+    /// JSON. Returns the total non-empty line count on success so callers
+    /// get the count from the same scan; `None` when the input is not JSONL.
+    fn probe_jsonl(input: &str) -> Option<usize> {
         let mut checked = 0usize;
+        let mut count = 0usize;
         for line in input.lines().filter(|l| !l.trim().is_empty()) {
-            if serde_json::from_str::<serde_json::Value>(line).is_err() {
-                return false;
+            if checked < 2 {
+                // `IgnoredAny` validates without allocating a `Value` tree.
+                if serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+                    return None;
+                }
+                checked += 1;
             }
-            checked += 1;
-            if checked == 2 {
-                return true;
-            }
+            count += 1;
         }
-        false
+        (checked == 2).then_some(count)
     }
 
     fn probe_delimited(input: &str, delimiter: u8) -> bool {
@@ -497,5 +532,47 @@ mod tests {
     fn detect_csv_with_unicode_fields() {
         let input = "name,city\nAlice,東京\nBob,大阪";
         assert_eq!(FormatDetector::detect(input), InputFormat::Csv);
+    }
+
+    #[test]
+    fn detect_strips_leading_bom() {
+        assert_eq!(
+            FormatDetector::detect("\u{feff}{\"a\":1}"),
+            InputFormat::Json
+        );
+        assert_eq!(
+            FormatDetector::detect("\u{feff}id,name\n1,Alice"),
+            InputFormat::Csv
+        );
+    }
+
+    #[test]
+    fn detect_metadata_carries_jsonl_line_count() {
+        let meta = FormatDetector::detect_with_metadata("{\"a\":1}\n\n{\"b\":2}\n{\"c\":3}");
+        assert_eq!(meta.format, InputFormat::Jsonl);
+        assert_eq!(meta.line_count, Some(3));
+
+        let meta = FormatDetector::detect_with_metadata(r#"{"a":1}"#);
+        assert_eq!(meta.line_count, None);
+    }
+
+    #[test]
+    fn detect_with_value_returns_parsed_json() {
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value(r#"{"x":1}"#);
+        assert_eq!(meta.format, InputFormat::Json);
+        assert_eq!(value.expect("value present")["x"], 1);
+
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value("id,name\n1,Alice");
+        assert_eq!(meta.format, InputFormat::Csv);
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn detect_with_value_flags_duplicate_key_json_without_value() {
+        // Structurally JSON, but the duplicate key means no value is handed
+        // back; the pipeline's parser fallback surfaces the error.
+        let (meta, value) = FormatDetector::detect_with_metadata_and_value(r#"{"a":1,"a":2}"#);
+        assert_eq!(meta.format, InputFormat::Json);
+        assert!(value.is_none());
     }
 }

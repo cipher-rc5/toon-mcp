@@ -12,6 +12,9 @@ documentation.workspace = true
 readme.workspace = true
 description = "Async LogSink trait and implementations for toon-mcp"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 jiff.workspace = true
