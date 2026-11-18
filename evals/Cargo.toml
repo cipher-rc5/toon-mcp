@@ -17,11 +17,11 @@ path = "src/main.rs"
 
 [dependencies]
 toon-mcp-core = { path = "../crates/toon-mcp-core" }
-toon-format = { version = "=0.5.0", default-features = false }
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.150"
-ureq = { version = "=3.3.0", features = ["json"] }
-anyhow = "=1.0.102"
+toon-format = { version = "=0.7.0", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+ureq = { version = "=3.5.2", features = ["json"] }
+anyhow = "=1.0.104"
 
 [profile.release]
 opt-level = 2

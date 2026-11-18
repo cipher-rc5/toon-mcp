@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use jiff::civil::Date;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -300,8 +301,8 @@ async fn writer_task(
     diagnostics: WriterDiagnostics,
 ) {
     let mut pending: Vec<LogEvent> = Vec::with_capacity(buffer_size);
-    // Open file handles keyed by YYYY-MM-DD partition string.
-    let mut file_handles: HashMap<String, std::fs::File> = HashMap::new();
+    // Open file handles keyed by UTC date.
+    let mut file_handles: HashMap<Date, std::fs::File> = HashMap::new();
     let mut interval = time::interval(flush_interval);
     // Skip the first tick to avoid flushing immediately on startup.
     interval.tick().await;
@@ -317,9 +318,7 @@ async fn writer_task(
                                 &mut pending,
                                 &log_dir,
                                 &mut file_handles,
-                                &diagnostics.serialization_failed_count,
-                                &diagnostics.writer_failed_count,
-                                &diagnostics.last_error,
+                                &diagnostics,
                             ).await {
                                 warn!("JsonlSink flush (buffer full) failed: {e}");
                             }
@@ -329,9 +328,7 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            &diagnostics,
                         )
                         .await;
                         let _ = ack.send(result);
@@ -341,9 +338,7 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            &diagnostics,
                         )
                         .await;
                         let _ = ack.send(result);
@@ -367,9 +362,7 @@ async fn writer_task(
                             &mut pending,
                             &log_dir,
                             &mut file_handles,
-                            &diagnostics.serialization_failed_count,
-                            &diagnostics.writer_failed_count,
-                            &diagnostics.last_error,
+                            &diagnostics,
                         ).await {
                             warn!("JsonlSink flush (channel closed) failed: {e}");
                         }
@@ -385,9 +378,7 @@ async fn writer_task(
                         &mut pending,
                         &log_dir,
                         &mut file_handles,
-                        &diagnostics.serialization_failed_count,
-                        &diagnostics.writer_failed_count,
-                        &diagnostics.last_error,
+                        &diagnostics,
                     ).await {
                         warn!("JsonlSink flush (periodic) failed: {e}");
                     }
@@ -412,129 +403,92 @@ async fn writer_task(
 ///
 /// File handles are cached in `file_handles` and re-used across calls to avoid
 /// repeated `open(2)` / `close(2)` syscalls. A handle is opened the first time
-/// a partition key is seen; it is closed only when the writer task exits.
+/// a partition key is seen and closed on eviction or shutdown.
 async fn flush_pending(
     pending: &mut Vec<LogEvent>,
     log_dir: &Path,
-    file_handles: &mut HashMap<String, std::fs::File>,
-    serialization_failed_count: &Arc<AtomicU64>,
-    writer_failed_count: &AtomicU64,
-    last_error: &Mutex<Option<String>>,
+    file_handles: &mut HashMap<Date, std::fs::File>,
+    diagnostics: &WriterDiagnostics,
 ) -> Result<(), LogError> {
     if pending.is_empty() {
         return Ok(());
     }
-
-    // Group events by UTC day to write to the correct partition.
-    // Drain the source vec into owned per-day buckets so the heavy
-    // serialization work runs on the blocking pool, not the async executor,
-    // without cloning every event.
-    let mut by_day: HashMap<String, Vec<LogEvent>> = HashMap::new();
-    for event in pending.drain(..) {
-        let day = day_partition_key(event.ts_us);
-        by_day.entry(day).or_default().push(event);
-    }
-
-    let mut day_events: Vec<(String, PathBuf, Vec<LogEvent>)> = Vec::with_capacity(by_day.len());
-    for (day, events) in by_day {
-        let partition_dir = log_dir.join(format!("day={day}"));
-        day_events.push((day, partition_dir, events));
-    }
-
-    if day_events.is_empty() {
-        return Ok(());
-    }
-
-    // Move file handles into spawn_blocking and get them back after.
-    let mut handles_snapshot = std::mem::take(file_handles);
-    let serialization_failed_count = Arc::clone(serialization_failed_count);
-
-    let (handles_snapshot, result) = tokio::task::spawn_blocking(
-        move || -> (HashMap<String, std::fs::File>, Result<(), LogError>) {
-            for (day, partition_dir, events) in day_events {
-                // Serialize events on the blocking thread so allocation-heavy
-                // work is kept off the async executor.
-                let lines: String = events
-                    .iter()
-                    .map(|e| match serde_json::to_string(e) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            // H1: visible error — never silently drop events.
-                            serialization_failed_count.fetch_add(1, Ordering::Relaxed);
-                            error!(
-                                event_id = %e.event_id,
-                                "JsonlSink: serialization failed, event skipped: {err}"
-                            );
-                            String::new()
-                        }
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if lines.is_empty() {
-                    continue;
-                }
-                let lines = lines + "\n";
-
-                if let Err(e) = std::fs::create_dir_all(&partition_dir) {
-                    return (handles_snapshot, Err(LogError::IoError(e)));
-                }
-
-                let file_path = partition_dir.join("events.jsonl");
-                // Bound the handle map: before opening a brand-new day
-                // partition, evict the oldest day(s) once we are at the cap.
-                // Keys are lexicographically sortable `YYYY-MM-DD`, so the
-                // minimum key is the oldest. Dropping a `File` flushes/closes
-                // it. Skip eviction when the day is already cached.
-                if !handles_snapshot.contains_key(&day) {
-                    while handles_snapshot.len() >= MAX_OPEN_DAY_PARTITIONS {
-                        if let Some(oldest) = handles_snapshot.keys().min().cloned() {
-                            handles_snapshot.remove(&oldest);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                // L3: re-use open handle; open once per partition per process run.
-                let entry = handles_snapshot.entry(day);
-                let file = match entry {
-                    std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&file_path)
-                        {
-                            Ok(f) => v.insert(f),
-                            Err(e) => return (handles_snapshot, Err(LogError::IoError(e))),
-                        }
-                    }
-                };
-
-                if let Err(e) = file.write_all(lines.as_bytes()) {
-                    return (handles_snapshot, Err(LogError::IoError(e)));
-                }
-            }
-            (handles_snapshot, Ok(()))
-        },
-    )
+    let mut events = std::mem::take(pending);
+    let mut handles = std::mem::take(file_handles);
+    let log_dir = log_dir.to_owned();
+    let serialization_failures = diagnostics.serialization_failed_count.clone();
+    let result = match tokio::task::spawn_blocking(move || {
+        let result = write_batch(
+            events.drain(..),
+            &log_dir,
+            &mut handles,
+            &serialization_failures,
+        );
+        (events, handles, result)
+    })
     .await
-    .map_err(|e| {
-        error!("JsonlSink spawn_blocking task failed: {e}");
-        let message = format!("spawn_blocking failed: {e}");
-        writer_failed_count.fetch_add(1, Ordering::Relaxed);
-        set_last_error(last_error, message.clone());
-        LogError::IoError(std::io::Error::other(message))
-    })?;
+    {
+        Ok((events, handles, result)) => {
+            *pending = events;
+            *file_handles = handles;
+            result.map_err(LogError::IoError)
+        }
+        Err(err) => Err(LogError::IoError(std::io::Error::other(format!(
+            "spawn_blocking failed: {err}"
+        )))),
+    };
+    if let Err(err) = &result {
+        diagnostics
+            .writer_failed_count
+            .fetch_add(1, Ordering::Relaxed);
+        set_last_error(&diagnostics.last_error, err.to_string());
+    }
+    result
+}
 
-    // Restore the file handles regardless of outcome.
-    *file_handles = handles_snapshot;
-
-    if let Err(err) = result {
-        writer_failed_count.fetch_add(1, Ordering::Relaxed);
-        set_last_error(last_error, err.to_string());
-        return Err(err);
+fn write_batch(
+    events: impl Iterator<Item = LogEvent>,
+    log_dir: &Path,
+    handles: &mut HashMap<Date, std::fs::File>,
+    serialization_failures: &AtomicU64,
+) -> std::io::Result<()> {
+    let mut by_day: HashMap<Date, Vec<u8>> = HashMap::new();
+    for event in events {
+        let bytes = by_day.entry(partition_date(event.ts_us)).or_default();
+        let start = bytes.len();
+        match serde_json::to_writer(&mut *bytes, &event) {
+            Ok(()) => bytes.push(b'\n'),
+            Err(err) => {
+                bytes.truncate(start);
+                serialization_failures.fetch_add(1, Ordering::Relaxed);
+                error!(event_id = %event.event_id, "JsonlSink: serialization failed, event skipped: {err}");
+            }
+        }
+    }
+    for (day, bytes) in by_day {
+        if bytes.is_empty() {
+            continue;
+        }
+        if handles.len() >= MAX_OPEN_DAY_PARTITIONS
+            && !handles.contains_key(&day)
+            && let Some(oldest) = handles.keys().min().copied()
+        {
+            handles.remove(&oldest);
+        }
+        let file = match handles.entry(day) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let dir = log_dir.join(format!("day={}", partition_name(day)));
+                std::fs::create_dir_all(&dir)?;
+                entry.insert(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("events.jsonl"))?,
+                )
+            }
+        };
+        file.write_all(&bytes)?;
     }
     Ok(())
 }
@@ -545,8 +499,8 @@ fn set_last_error(last_error: &Mutex<Option<String>>, message: String) {
     }
 }
 
-/// Returns a `YYYY-MM-DD` string from a microsecond Unix timestamp.
-fn day_partition_key(ts_us: i64) -> String {
+/// UTC day containing the event.
+fn partition_date(ts_us: i64) -> Date {
     let ts = match jiff::Timestamp::from_microsecond(ts_us) {
         Ok(ts) => ts,
         Err(err) => {
@@ -559,7 +513,11 @@ fn day_partition_key(ts_us: i64) -> String {
             jiff::Timestamp::UNIX_EPOCH
         }
     };
-    ts.strftime("%Y-%m-%d").to_string()
+    jiff::tz::Offset::UTC.to_datetime(ts).date()
+}
+
+fn partition_name(day: Date) -> String {
+    format!("{:04}-{:02}-{:02}", day.year(), day.month(), day.day())
 }
 
 #[cfg(test)]
@@ -691,14 +649,25 @@ mod tests {
     #[test]
     fn day_partition_key_correct() {
         // 2023-11-14 00:00:00 UTC in microseconds
-        assert_eq!(day_partition_key(1_699_920_000_000_000), "2023-11-14");
+        assert_eq!(
+            partition_name(partition_date(1_699_920_000_000_000)),
+            "2023-11-14"
+        );
+    }
+
+    #[test]
+    fn partition_names_match_existing_directories_across_eras() {
+        for year in [-9998, -100, -1, 0, 1, 9999] {
+            let day = Date::new(year, 1, 2).unwrap();
+            assert_eq!(partition_name(day), day.strftime("%Y-%m-%d").to_string());
+        }
     }
 
     #[test]
     fn day_partition_key_out_of_range_falls_back_to_epoch() {
         // `i64::MAX` microseconds is far outside jiff's representable range,
         // so the key falls back to the UNIX_EPOCH partition (and warns).
-        assert_eq!(day_partition_key(i64::MAX), "1970-01-01");
+        assert_eq!(partition_name(partition_date(i64::MAX)), "1970-01-01");
     }
 
     /// Eviction: writing across more than `MAX_OPEN_DAY_PARTITIONS` distinct
@@ -744,7 +713,7 @@ mod tests {
         // number of lines (the first day gets two: original + reopened write).
         for d in 0..days {
             let day_us = base_us + (d as i64) * micros_per_day;
-            let key = day_partition_key(day_us);
+            let key = partition_name(partition_date(day_us));
             let path = dir.path().join(format!("day={key}")).join("events.jsonl");
             assert!(path.exists(), "partition for {key} exists");
             let content = std::fs::read_to_string(&path).expect("file readable");

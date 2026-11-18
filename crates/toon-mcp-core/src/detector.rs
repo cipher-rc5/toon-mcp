@@ -201,19 +201,23 @@ impl FormatDetector {
             candidates.push(InputFormat::Json);
         }
 
-        // 2. JSONL probe — try first two non-empty lines.
-        if Self::probe_jsonl(input) {
-            candidates.push(InputFormat::Jsonl);
-        }
-
-        // 3. CSV probe — comma delimiter.
-        if Self::probe_delimited(input, b',') {
-            candidates.push(InputFormat::Csv);
-        }
-
-        // 4. TSV probe — tab delimiter.
-        if Self::probe_delimited(input, b'\t') {
-            candidates.push(InputFormat::Tsv);
+        // Every other format requires at least two records. csv accepts CR
+        // as well as LF, and skips empty lines before the header.
+        let records = input.strip_prefix('\u{feff}').unwrap_or(input);
+        if let Some((first_line, _)) = records.trim_matches(['\r', '\n']).split_once(['\r', '\n']) {
+            if candidates.is_empty() && Self::probe_jsonl(input) {
+                candidates.push(InputFormat::Jsonl);
+            }
+            // Without a delimiter, only a quoted first field can continue
+            // onto the next physical line and introduce more columns.
+            let quoted = first_line.starts_with('"');
+            for (delim, format) in [(',', InputFormat::Csv), ('\t', InputFormat::Tsv)] {
+                if (quoted || first_line.contains(delim))
+                    && Self::probe_delimited(input, delim as u8)
+                {
+                    candidates.push(format);
+                }
+            }
         }
 
         let format = candidates.first().copied().unwrap_or(InputFormat::Unknown);
@@ -350,6 +354,18 @@ mod tests {
         assert_eq!(meta.confidence, DetectionConfidence::Heuristic);
         assert!(!meta.ambiguous);
         assert_eq!(meta.candidates, vec![InputFormat::Csv]);
+    }
+
+    #[test]
+    fn delimited_probes_preserve_multiline_headers_and_cr_records() {
+        for input in [
+            "\"first\nname\",score\nAlice,3",
+            "\u{feff}\r\rname,score\rAlice,3\r",
+        ] {
+            assert_eq!(FormatDetector::detect(input), InputFormat::Csv);
+        }
+        let both = FormatDetector::detect_with_metadata("a,b\tc\n1,2\t3");
+        assert_eq!(both.candidates, [InputFormat::Csv, InputFormat::Tsv]);
     }
 
     #[test]

@@ -4,9 +4,12 @@ version.workspace = true
 authors.workspace = true
 categories = ["asynchronous"]
 edition.workspace = true
+rust-version.workspace = true
 keywords = ["toon", "mcp", "logging", "jsonl"]
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Async LogSink trait and implementations for toon-mcp"
 
 [dependencies]

@@ -41,7 +41,7 @@ compressed). A dedicated line contrasts mean token vs mean byte savings:
 ## 2. Round-trip fidelity
 
 For each parseable item: `parse → encode → decode`, then `values_equiv` against
-the parsed value (path-expansion on; int/float drift tolerated). The report
+the parsed value (int/float drift tolerated). The report
 shows **Tested / Lossless / Failures**, and lists failing items with a truncated
 diff. **Any failure is a correctness bug** — TOON is lossless by design, so the
 target is zero.

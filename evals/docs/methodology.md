@@ -58,9 +58,9 @@ flowchart TD
     P --> V["parse → Value (core parser)"]
     V --> CL["Classifier::classify(Value)"]
     CL --> SC["actual_shape, shape_correct vs intended"]
-    V --> EN["encode_pipeline (comma, safe key-folding)"]
+    V --> EN["encode_pipeline (comma delimiter)"]
     EN --> BY["self-encoded byte savings"]
-    EN --> RT["decode_pipeline (path-expansion on)"]
+    EN --> RT["decode_pipeline"]
     RT --> EQ{"values_equiv(Value, decoded)?"}
     EQ -- yes --> OK["roundtrip_ok = true"]
     EQ -- no --> BAD["roundtrip_ok = false + diff"]
@@ -77,9 +77,7 @@ Two key choices:
 - **Round-trip is semantic.** The decoded value is compared to the _parsed_
   value (not the raw string) with `values_equiv`, which tolerates int/float
   representation drift (`30` vs `30.0`) within a small relative epsilon but flags
-  any real corruption — wrong value, missing key, reordered array. Decoding uses
-  `PathExpansionMode::Safe` so keys folded by safe key-folding are reconstructed
-  into nested objects before comparison.
+  any real corruption — wrong value, missing key, reordered array.
 
 ## Comprehension parity
 

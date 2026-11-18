@@ -136,17 +136,7 @@ stateDiagram-v2
 
 ### Hive Partitioning
 
-Events are grouped by UTC day before writing. The partition key is derived from `ts_us`:
-
-```rust
-fn day_partition_key(ts_us: i64) -> String {
-    // produces "YYYY-MM-DD"
-    let dt = DateTime::from_timestamp_micros(ts_us).unwrap();
-    dt.format("%Y-%m-%d").to_string()
-}
-```
-
-The directory layout:
+The writer groups events by the UTC date of `ts_us` and formats the partition name when it opens the file. Events outside the supported date range go into the epoch partition and produce a warning.
 
 ```
 data/logs/
@@ -160,25 +150,7 @@ Each `events.jsonl` contains newline-delimited JSON objects, one per event. Even
 
 ### Blocking I/O on a Tokio Executor
 
-File writes use `tokio::task::spawn_blocking` to move the blocking I/O off the async executor thread pool:
-
-```rust
-let events_clone = pending_events.clone();
-let path_clone = path.clone();
-spawn_blocking(move || {
-    let file = OpenOptions::new().create(true).append(true).open(&path_clone)?;
-    let mut writer = BufWriter::new(file);
-    for event in &events_clone {
-        serde_json::to_writer(&mut writer, event)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok::<(), std::io::Error>(())
-})
-.await??;
-```
-
-This is required because the Tokio runtime's async tasks should not call blocking system calls — doing so would stall other tasks sharing the same executor thread.
+The writer moves each batch to a Tokio blocking thread. It serializes directly into one JSONL byte buffer per UTC day, preserving event order within each file. The next flush reuses the event vector and the open file handles.
 
 ---
 

@@ -94,4 +94,4 @@ Benchmarks cover format detection, shape classification, and the full compressio
 
 ---
 
-_Built with Rust 1.95.0. Tokio async runtime. rmcp for MCP protocol. toon-format for TOON encoding._
+_Built with Rust 1.100.0. Tokio async runtime. rmcp for MCP protocol. toon-format for TOON encoding._

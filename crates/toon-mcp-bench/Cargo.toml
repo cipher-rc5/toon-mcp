@@ -3,9 +3,12 @@ name = "toon-mcp-bench"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Criterion benchmarks for toon-mcp-core"
 
 [[bench]]

@@ -9,7 +9,7 @@ scores the pipeline on four axes:
    is the real context-window win, distinct from the byte ratio the pipeline
    gates on.
 2. **Lossless round-trip** — `parse → encode → decode` must reproduce the parsed
-   value (path-expansion on, so safe key-folding is reconstructed).
+   value.
 3. **Comprehension parity** — the model answers deterministic retrieval
    questions over the JSON form vs the TOON form; accuracy is compared.
 4. **Classification accuracy** — the classifier's shape vs the shape the

@@ -26,7 +26,7 @@ const SHAPES: &[ShapeRecipe] = &[
     },
     ShapeRecipe {
         name: "fold_chain",
-        instruction: "a deeply nested object: several levels of single-key wrapper objects (e.g. data->result->items) that finally contain a uniform array of objects at the leaf. Designed to exercise key folding.",
+        instruction: "a deeply nested object: several levels of single-key wrapper objects (e.g. data->result->items) that finally contain a uniform array of objects at the leaf. Designed to exercise nested chain classification.",
     },
     ShapeRecipe {
         name: "primitive_array",

@@ -26,6 +26,10 @@ fn schema_as_integer(_: &mut SchemaGenerator) -> Schema {
     schemars::json_schema!({ "type": "integer" })
 }
 
+fn schema_as_optional_integer(_: &mut SchemaGenerator) -> Schema {
+    schemars::json_schema!({ "type": ["integer", "null"] })
+}
+
 // Process-lifetime diagnostic counters. All use `Relaxed` ordering because
 // they are independent monotonic tallies with no cross-counter invariants.
 // Overflow wraps silently and is not a correctness concern: at one event per
@@ -177,24 +181,6 @@ impl From<&Config> for CompressConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Named outcome struct for compress pipeline (L2)
-// ---------------------------------------------------------------------------
-
-/// Intermediate result derived from a `CompressDecision` for use in handlers.
-struct CompressOutcome {
-    output: String,
-    compressed: bool,
-    format_str: String,
-    shape_str: String,
-    output_bytes: usize,
-    savings_pct: f64,
-    pass_reason_str: Option<String>,
-    detection_metadata: DetectionMetadata,
-    numeric_coercion_used: Option<bool>,
-    lossy_coercion_possible: Option<bool>,
-}
-
 fn detection_candidates_as_strings(metadata: &DetectionMetadata) -> Vec<String> {
     metadata
         .candidates
@@ -270,10 +256,10 @@ pub struct DetectResult {
     #[schemars(schema_with = "schema_as_integer")]
     pub input_bytes: usize,
     /// Number of non-empty lines (populated for JSONL inputs).
-    #[schemars(schema_with = "schema_as_integer")]
+    #[schemars(schema_with = "schema_as_optional_integer")]
     pub line_count: Option<usize>,
     /// Number of columns in the first header row (populated for CSV/TSV inputs).
-    #[schemars(schema_with = "schema_as_integer")]
+    #[schemars(schema_with = "schema_as_optional_integer")]
     pub column_count: Option<usize>,
     /// Detection confidence: `"certain"` for validated JSON/unknown, or
     /// `"heuristic"` for JSONL/CSV/TSV probes.
@@ -288,16 +274,11 @@ pub struct DetectResult {
     pub lossy_coercion_possible: Option<bool>,
 }
 
-/// Handle the `detect_format` MCP tool.
-pub async fn handle_detect_format(
-    params: DetectParams,
-    config: Arc<Config>,
-    log_sink: Arc<dyn LogSink>,
-    semaphore: Arc<Semaphore>,
-) -> Result<DetectResult, McpError> {
-    let input = params.input;
-    let input_bytes = input.len();
-
+async fn admit_input<'a>(
+    input_bytes: usize,
+    config: &Config,
+    semaphore: &'a Semaphore,
+) -> Result<tokio::sync::SemaphorePermit<'a>, McpError> {
     if input_bytes > config.max_input_bytes {
         return Err(McpError::invalid_params(
             format!(
@@ -309,10 +290,7 @@ pub async fn handle_detect_format(
         ));
     }
 
-    // M1: Queue for up to pipeline_timeout_ms before rejecting — honours TOON_PIPELINE_TIMEOUT_MS.
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_millis(config.pipeline_timeout_ms),
         semaphore.acquire(),
     )
@@ -323,7 +301,20 @@ pub async fn handle_detect_format(
             Some(serde_json::json!({ "code": "server_busy" })),
         )
     })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
+    .map_err(|_| McpError::internal_error("semaphore closed", None))
+}
+
+/// Handle the `detect_format` MCP tool.
+pub async fn handle_detect_format(
+    params: DetectParams,
+    config: Arc<Config>,
+    log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
+) -> Result<DetectResult, McpError> {
+    let input = params.input;
+    let input_bytes = input.len();
+
+    let _permit = admit_input(input_bytes, &config, &semaphore).await?;
 
     let event_id = new_event_id();
 
@@ -362,7 +353,7 @@ pub async fn handle_detect_format(
         let duration_us = start.elapsed().as_micros() as u64;
 
         let event = LogEvent {
-            event_id: event_id.clone(),
+            event_id,
             ts_us: jiff::Timestamp::now().as_microsecond(),
             tool_name: "detect_format".into(),
             input_format: fmt.as_str().into(),
@@ -455,143 +446,101 @@ pub(crate) async fn handle_compress_content_inner(
     log_sink: Arc<dyn LogSink>,
     semaphore: Arc<Semaphore>,
 ) -> Result<CompressResult, McpError> {
-    let input = params.input;
-    let input_bytes = input.len();
-
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
-    }
-
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
+    compress_for_tool(
+        params.input,
+        config,
+        log_sink,
+        semaphore,
+        "compress_content",
     )
     .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
+}
 
+async fn compress_for_tool(
+    input: String,
+    config: Arc<Config>,
+    log_sink: Arc<dyn LogSink>,
+    semaphore: Arc<Semaphore>,
+    tool_name: &'static str,
+) -> Result<CompressResult, McpError> {
+    let input_bytes = input.len();
+    let _permit = admit_input(input_bytes, &config, &semaphore).await?;
     let event_id = new_event_id();
-    let span = tracing::info_span!("compress_content", event_id = %event_id);
-
+    let span = if tool_name == "compression_stats" {
+        tracing::info_span!("compression_stats", event_id = %event_id)
+    } else {
+        tracing::info_span!("compress_content", event_id = %event_id)
+    };
     async move {
         let compress_config = CompressConfig::from(config.as_ref());
-        let pipeline_timeout_ms = config.pipeline_timeout_ms;
         let start = Instant::now();
-
-        // L1: Return (input, decision) so input is available for pass-through output.
-        // `decide_with_metadata` runs detection and parsing once, surfacing the
-        // detection metadata and CSV/TSV coercion visibility from the same pass.
-        let (input, decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, move || {
-                let result = Compressor::decide_with_metadata(&input, &compress_config);
-                let (numeric_coercion_used, lossy_coercion_possible) =
-                    coercion_visibility(result.coercion);
-                (
+        let mut response = run_pipeline("compression", config.pipeline_timeout_ms, move || {
+            let result = Compressor::decide_with_metadata(&input, &compress_config);
+            let (output, format, shape, savings_pct, pass_reason) = match result.decision {
+                CompressDecision::Compressed {
+                    toon,
+                    input_format,
+                    shape_class,
+                    savings_pct,
+                    ..
+                } => (toon, input_format, shape_class, savings_pct, None),
+                CompressDecision::PassedThrough {
+                    reason,
+                    input_format,
+                } => (
                     input,
-                    result.decision,
-                    result.detection,
-                    numeric_coercion_used,
-                    lossy_coercion_possible,
-                )
-            })
-            .await?;
-
-        let duration_us = start.elapsed().as_micros() as u64;
-
-        // L2 + H3: named struct, no second detect call.
-        // Match is exhaustive over `CompressDecision` (no wildcard) so any new
-        // variant produces a compile-time error.
-        // Move `input` into the pass-through output to avoid a String clone;
-        // `decision` is consumed here so the compressed branch can take `toon`
-        // by value.
-        let outcome = match decision {
-            CompressDecision::Compressed {
-                toon,
-                toon_bytes,
+                    input_format.unwrap_or(InputFormat::Unknown),
+                    toon_mcp_core::ShapeClass::PassThrough,
+                    0.0,
+                    Some(reason.as_str().into()),
+                ),
+            };
+            let (numeric_coercion_used, lossy_coercion_possible) =
+                coercion_visibility(result.coercion);
+            CompressResult {
+                output_bytes: output.len(),
+                output: if tool_name == "compression_stats" {
+                    String::new()
+                } else {
+                    output
+                },
+                compressed: pass_reason.is_none(),
+                format: format.as_str().into(),
+                shape_class: shape.as_str().into(),
+                input_bytes,
                 savings_pct,
-                input_format,
-                shape_class,
-                ..
-            } => CompressOutcome {
-                output: toon,
-                compressed: true,
-                format_str: input_format.as_str().into(),
-                shape_str: shape_class.as_str().into(),
-                output_bytes: toon_bytes,
-                savings_pct,
-                pass_reason_str: None,
-                detection_metadata,
+                duration_us: 0,
+                pass_reason,
+                detection_confidence: result.detection.confidence.as_str().into(),
+                detection_ambiguous: result.detection.ambiguous,
+                detection_candidates: detection_candidates_as_strings(&result.detection),
                 numeric_coercion_used,
                 lossy_coercion_possible,
-            },
-            CompressDecision::PassedThrough {
-                reason,
-                input_format,
-            } => CompressOutcome {
-                output: input,
-                compressed: false,
-                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
-                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-                output_bytes: input_bytes,
-                savings_pct: 0.0,
-                pass_reason_str: Some(reason.as_str().into()),
-                detection_metadata,
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            },
-        };
-
-        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
-
-        let event = LogEvent {
-            event_id: event_id.clone(),
-            ts_us: jiff::Timestamp::now().as_microsecond(),
-            tool_name: "compress_content".into(),
-            input_format: outcome.format_str.clone(),
-            shape_class: outcome.shape_str.clone(),
-            input_bytes: input_bytes as u64,
-            output_bytes: outcome.output_bytes as u64,
-            compressed: outcome.compressed,
-            savings_pct: outcome.savings_pct,
-            threshold_used: config.max_output_ratio,
-            duration_us,
-            pass_reason: outcome.pass_reason_str.clone(),
-            client_hint: config.client_hint.clone(),
-        };
-
-        record_success_duration(duration_us);
-        record_log_event(&log_sink, event).await;
-
-        Ok(CompressResult {
-            output: outcome.output,
-            compressed: outcome.compressed,
-            format: outcome.format_str,
-            shape_class: outcome.shape_str,
-            input_bytes,
-            output_bytes: outcome.output_bytes,
-            savings_pct: outcome.savings_pct,
-            duration_us,
-            pass_reason: outcome.pass_reason_str,
-            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
-            detection_ambiguous: outcome.detection_metadata.ambiguous,
-            detection_candidates,
-            numeric_coercion_used: outcome.numeric_coercion_used,
-            lossy_coercion_possible: outcome.lossy_coercion_possible,
+            }
         })
+        .await?;
+        response.duration_us = start.elapsed().as_micros() as u64;
+        record_success_duration(response.duration_us);
+        record_log_event(
+            &log_sink,
+            LogEvent {
+                event_id,
+                ts_us: jiff::Timestamp::now().as_microsecond(),
+                tool_name: tool_name.into(),
+                input_format: response.format.clone(),
+                shape_class: response.shape_class.clone(),
+                input_bytes: input_bytes as u64,
+                output_bytes: response.output_bytes as u64,
+                compressed: response.compressed,
+                savings_pct: response.savings_pct,
+                threshold_used: config.max_output_ratio,
+                duration_us: response.duration_us,
+                pass_reason: response.pass_reason.clone(),
+                client_hint: config.client_hint.clone(),
+            },
+        )
+        .await;
+        Ok(response)
     }
     .instrument(span)
     .await
@@ -651,136 +600,30 @@ pub async fn handle_compression_stats(
     log_sink: Arc<dyn LogSink>,
     semaphore: Arc<Semaphore>,
 ) -> Result<StatsResult, McpError> {
-    let input = params.input;
-    let input_bytes = input.len();
-
-    if input_bytes > config.max_input_bytes {
-        return Err(McpError::invalid_params(
-            format!(
-                "input_exceeds_limit: input is {input_bytes} bytes; \
-                 maximum allowed is {} bytes (TOON_MAX_INPUT_BYTES)",
-                config.max_input_bytes
-            ),
-            None,
-        ));
-    }
-
-    // `_permit` is held by the enclosing scope across `.instrument(span).await`
-    // so the semaphore slot releases on every exit path, including panic unwind.
-    let _permit = tokio::time::timeout(
-        Duration::from_millis(config.pipeline_timeout_ms),
-        semaphore.acquire(),
+    let threshold = config.max_output_ratio;
+    let result = compress_for_tool(
+        params.input,
+        config,
+        log_sink,
+        semaphore,
+        "compression_stats",
     )
-    .await
-    .map_err(|_| {
-        McpError::internal_error(
-            "server busy: too many concurrent calls",
-            Some(serde_json::json!({ "code": "server_busy" })),
-        )
-    })?
-    .map_err(|_| McpError::internal_error("semaphore closed", None))?;
-
-    let event_id = new_event_id();
-    let span = tracing::info_span!("compression_stats", event_id = %event_id);
-
-    async move {
-        let compress_config = CompressConfig::from(config.as_ref());
-        let pipeline_timeout_ms = config.pipeline_timeout_ms;
-        let start = Instant::now();
-
-        let (decision, detection_metadata, numeric_coercion_used, lossy_coercion_possible) =
-            run_pipeline("compression", pipeline_timeout_ms, move || {
-                let result = Compressor::decide_with_metadata(&input, &compress_config);
-                let (numeric_coercion_used, lossy_coercion_possible) =
-                    coercion_visibility(result.coercion);
-                (
-                    result.decision,
-                    result.detection,
-                    numeric_coercion_used,
-                    lossy_coercion_possible,
-                )
-            })
-            .await?;
-
-        let duration_us = start.elapsed().as_micros() as u64;
-
-        // L2 + H3: named struct, no second detect call.
-        // Exhaustive match — see `handle_compress_content_inner` for rationale.
-        let outcome = match &decision {
-            CompressDecision::Compressed {
-                toon_bytes,
-                savings_pct,
-                input_format,
-                shape_class,
-                ..
-            } => CompressOutcome {
-                output: String::new(),
-                compressed: true,
-                format_str: input_format.as_str().into(),
-                shape_str: shape_class.as_str().into(),
-                output_bytes: *toon_bytes,
-                savings_pct: *savings_pct,
-                pass_reason_str: None,
-                detection_metadata,
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            },
-            CompressDecision::PassedThrough {
-                reason,
-                input_format,
-            } => CompressOutcome {
-                output: String::new(),
-                compressed: false,
-                format_str: input_format.unwrap_or(InputFormat::Unknown).as_str().into(),
-                shape_str: toon_mcp_core::ShapeClass::PassThrough.as_str().into(),
-                output_bytes: input_bytes,
-                savings_pct: 0.0,
-                pass_reason_str: Some(reason.as_str().into()),
-                detection_metadata,
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            },
-        };
-
-        let detection_candidates = detection_candidates_as_strings(&outcome.detection_metadata);
-
-        let event = LogEvent {
-            event_id: event_id.clone(),
-            ts_us: jiff::Timestamp::now().as_microsecond(),
-            tool_name: "compression_stats".into(),
-            input_format: outcome.format_str.clone(),
-            shape_class: outcome.shape_str.clone(),
-            input_bytes: input_bytes as u64,
-            output_bytes: outcome.output_bytes as u64,
-            compressed: outcome.compressed,
-            savings_pct: outcome.savings_pct,
-            threshold_used: config.max_output_ratio,
-            duration_us,
-            pass_reason: outcome.pass_reason_str.clone(),
-            client_hint: config.client_hint.clone(),
-        };
-
-        record_success_duration(duration_us);
-        record_log_event(&log_sink, event).await;
-
-        Ok(StatsResult {
-            would_compress: outcome.compressed,
-            format: outcome.format_str,
-            shape_class: outcome.shape_str,
-            input_bytes,
-            estimated_output_bytes: outcome.output_bytes,
-            estimated_savings_pct: outcome.savings_pct,
-            threshold: config.max_output_ratio,
-            pass_reason: outcome.pass_reason_str,
-            detection_confidence: outcome.detection_metadata.confidence.as_str().into(),
-            detection_ambiguous: outcome.detection_metadata.ambiguous,
-            detection_candidates,
-            numeric_coercion_used: outcome.numeric_coercion_used,
-            lossy_coercion_possible: outcome.lossy_coercion_possible,
-        })
-    }
-    .instrument(span)
-    .await
+    .await?;
+    Ok(StatsResult {
+        would_compress: result.compressed,
+        format: result.format,
+        shape_class: result.shape_class,
+        input_bytes: result.input_bytes,
+        estimated_output_bytes: result.output_bytes,
+        estimated_savings_pct: result.savings_pct,
+        threshold,
+        pass_reason: result.pass_reason,
+        detection_confidence: result.detection_confidence,
+        detection_ambiguous: result.detection_ambiguous,
+        detection_candidates: result.detection_candidates,
+        numeric_coercion_used: result.numeric_coercion_used,
+        lossy_coercion_possible: result.lossy_coercion_possible,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -809,13 +652,13 @@ pub struct LoggingDiagnosticsResult {
     /// Last writer, queue, or channel error observed by the sink.
     pub last_error: Option<String>,
     /// Total bounded queue capacity, if applicable.
-    #[schemars(schema_with = "schema_as_integer")]
+    #[schemars(schema_with = "schema_as_optional_integer")]
     pub queue_capacity: Option<usize>,
     /// Currently queued commands, if applicable.
-    #[schemars(schema_with = "schema_as_integer")]
+    #[schemars(schema_with = "schema_as_optional_integer")]
     pub queue_queued: Option<usize>,
     /// Currently available queue slots, if applicable.
-    #[schemars(schema_with = "schema_as_integer")]
+    #[schemars(schema_with = "schema_as_optional_integer")]
     pub queue_available: Option<usize>,
 }
 
@@ -1410,6 +1253,24 @@ mod tests {
     fn new_event_id_is_hex() {
         let id = new_event_id();
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn optional_counts_accept_json_null_in_tool_output_schemas() {
+        let detection = schemars::schema_for!(DetectResult);
+        let logging = schemars::schema_for!(LoggingDiagnosticsResult);
+        for (schema, fields) in [
+            (&detection, &["line_count", "column_count"][..]),
+            (
+                &logging,
+                &["queue_capacity", "queue_queued", "queue_available"][..],
+            ),
+        ] {
+            for field in fields {
+                let types = &schema.as_value()["properties"][field]["type"];
+                assert_eq!(types, &serde_json::json!(["integer", "null"]));
+            }
+        }
     }
 
     #[test]

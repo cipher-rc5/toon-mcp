@@ -74,7 +74,7 @@ compression **quality** end-to-end:
 | Axis                    | What it checks                                                            |
 | ----------------------- | ------------------------------------------------------------------------- |
 | Token savings           | Original vs TOON token counts under a real model tokenizer (`/tokenize`)  |
-| Round-trip fidelity     | `parse → encode → decode` reproduces the parsed value (path-expansion on) |
+| Round-trip fidelity     | `parse → encode → decode` reproduces the parsed value |
 | Classification accuracy | Classifier shape vs the shape the generator intended                      |
 | Comprehension parity    | Model answer accuracy on the same questions over JSON vs TOON             |
 

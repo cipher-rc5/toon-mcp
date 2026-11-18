@@ -30,7 +30,7 @@ pub struct Config {
     /// immediately without parsing.
     pub max_input_bytes: usize,
 
-    /// Whether TOON key folding is enabled for FoldChain shapes.
+    /// Legacy configuration field. TOON 4.4 preserves nested keys.
     pub key_folding: bool,
 
     /// Array delimiter used in TOON output.

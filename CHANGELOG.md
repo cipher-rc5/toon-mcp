@@ -12,6 +12,12 @@ Each release header records the date (UTC) the tag was published.
 
 ## [Unreleased] — 0.2.0 (in progress)
 
+### Migration notes
+
+- TOON 4.4 preserves nested object keys. Existing `TOON_KEY_FOLDING` settings are accepted and have no effect. The byte savings gate still applies to nested chains.
+- The server supports MCP 2026-07-28 discovery over stdio and serves its bundled agent skill through the skills extension.
+- Building this revision requires Rust 1.100.0.
+
 ### Added
 
 - Fourth MCP tool `toon_diagnostics` that returns runtime health counters:

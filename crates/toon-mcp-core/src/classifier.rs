@@ -34,7 +34,7 @@ pub enum ShapeClass {
     /// TOON header compression delivers the highest savings here.
     Tabular,
     /// Singly-keyed object chain of depth >= `FOLD_MIN_DEPTH`.
-    /// Key folding eliminates repetitive nesting braces.
+    /// Nested object chains are eligible for the savings gate.
     FoldChain,
     /// Flat array of scalar values (no objects or nested arrays).
     PrimitiveArray,
@@ -191,18 +191,18 @@ impl Classifier {
             _ => return false,
         };
 
-        // Every element must be an object sharing the reference key set and
-        // holding only primitive values. This single pass also enforces the
-        // "all objects" requirement, so no separate pre-scan is needed.
-        arr.iter().all(|v| match v {
-            Value::Object(map) => {
-                let keys_match =
-                    map.len() == first.len() && first.keys().all(|k| map.contains_key(k));
-                let all_primitive = map.values().all(is_primitive);
-                keys_match && all_primitive
-            }
-            _ => false,
-        })
+        // Most producers emit columns in the same order on every row.
+        // Compare those keys sequentially, but accept reordered JSON objects.
+        first.values().all(is_primitive)
+            && arr[1..].iter().all(|row| {
+                let Some(map) = row.as_object() else {
+                    return false;
+                };
+                map.len() == first.len()
+                    && map.values().all(is_primitive)
+                    && (map.keys().eq(first.keys())
+                        || map.keys().all(|key| first.contains_key(key)))
+            })
     }
 
     /// Walk `value` looking for any sub-tree the classifier would label
@@ -280,6 +280,12 @@ mod tests {
             {"id": 3, "name": "Carol", "score": 7.5},
         ]);
         assert_eq!(Classifier::classify(&v), ShapeClass::Tabular);
+    }
+
+    #[test]
+    fn tabular_accepts_reordered_columns() {
+        let rows = json!([{"a": 1, "b": 2}, {"b": 3, "a": 4}, {"a": 5, "b": 6}]);
+        assert_eq!(Classifier::classify(&rows), ShapeClass::Tabular);
     }
 
     #[test]

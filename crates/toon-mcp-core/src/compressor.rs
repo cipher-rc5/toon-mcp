@@ -18,7 +18,6 @@ use crate::{
 ///
 /// Configurable at runtime via `TOON_MAX_INPUT_BYTES` (default: 10 MiB).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
-use toon_format::types::KeyFoldingMode;
 use toon_format::{Delimiter, EncodeOptions};
 
 /// Configuration for the compressor.
@@ -41,7 +40,7 @@ pub struct CompressConfig {
     /// Reject inputs larger than this byte count without processing.
     /// Prevents unbounded memory allocation on oversized payloads.
     pub max_input_bytes: usize,
-    /// Whether to enable TOON key folding for FoldChain shapes.
+    /// Legacy configuration field. TOON 4.4 preserves nested keys.
     pub key_folding: bool,
     /// The array delimiter used in TOON output.
     pub delimiter: Delimiter,
@@ -308,20 +307,20 @@ impl Compressor {
         let parse_result = match detected_fmt {
             InputFormat::Json => JsonParser.parse(input),
             InputFormat::Jsonl => JsonlParser.parse(input),
-            InputFormat::Csv => CsvParser::csv()
-                .with_numeric_coercion(config.csv_numeric_coercion)
-                .parse_with_coercion_metadata(input)
-                .map(|(v, meta)| {
-                    coercion = Some(meta);
-                    v
-                }),
-            InputFormat::Tsv => CsvParser::tsv()
-                .with_numeric_coercion(config.csv_numeric_coercion)
-                .parse_with_coercion_metadata(input)
-                .map(|(v, meta)| {
-                    coercion = Some(meta);
-                    v
-                }),
+            InputFormat::Csv | InputFormat::Tsv => {
+                let parser = if detected_fmt == InputFormat::Csv {
+                    CsvParser::csv()
+                } else {
+                    CsvParser::tsv()
+                };
+                parser
+                    .with_numeric_coercion(config.csv_numeric_coercion)
+                    .parse_with_coercion_metadata(input)
+                    .map(|(value, metadata)| {
+                        coercion = Some(metadata);
+                        value
+                    })
+            }
             InputFormat::Unknown => {
                 return CompressionResult {
                     decision: CompressDecision::PassedThrough {
@@ -384,16 +383,17 @@ impl Compressor {
         }
 
         // Step 5: TOON encode.
-        let key_folding = if config.key_folding {
-            KeyFoldingMode::Safe
-        } else {
-            KeyFoldingMode::Off
-        };
-        let opts = EncodeOptions::new()
-            .with_delimiter(config.delimiter)
-            .with_key_folding(key_folding);
+        let opts = EncodeOptions::new().with_delimiter(config.delimiter);
 
-        let toon = match toon_format::encode(&value, &opts) {
+        // The parser already produced a JSON tree. The typed encoders skip
+        // the generic serializer's extra serde_json::to_value allocation.
+        let value = toon_format::types::JsonValue::from(value);
+        let encoded = if value.is_array() {
+            toon_format::encode_array(value, &opts)
+        } else {
+            toon_format::encode_object(value, &opts)
+        };
+        let toon = match encoded {
             Ok(s) => s,
             Err(e) => {
                 return CompressionResult {
@@ -539,6 +539,22 @@ mod tests {
             CompressDecision::PassedThrough { .. } => {}
             other => panic!("expected PassedThrough, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_objects_and_literal_dotted_keys_round_trip() {
+        let value = serde_json::json!({"root": {"path": {"leaf": {"a.b": 1, "a": {"b": 2}}}}});
+        let input = serde_json::to_string_pretty(&value).unwrap();
+        let config = CompressConfig {
+            min_bytes: 0,
+            max_output_ratio: 1.0,
+            ..CompressConfig::default()
+        };
+        let CompressDecision::Compressed { toon, .. } = Compressor::decide(&input, &config) else {
+            panic!("expected nested input to compress");
+        };
+        let restored: serde_json::Value = toon_format::decode(&toon, &Default::default()).unwrap();
+        assert_eq!(restored, value);
     }
 
     #[test]

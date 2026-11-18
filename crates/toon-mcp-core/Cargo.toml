@@ -4,9 +4,12 @@ version.workspace = true
 authors.workspace = true
 categories = ["encoding", "parsing"]
 edition.workspace = true
+rust-version.workspace = true
 keywords = ["toon", "mcp", "compression", "json", "llm"]
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Pure detection, parsing, classification, and compression pipeline for toon-mcp"
 
 [dependencies]

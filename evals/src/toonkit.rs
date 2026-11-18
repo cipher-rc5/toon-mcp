@@ -3,7 +3,6 @@
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use toon_format::types::{KeyFoldingMode, PathExpansionMode};
 use toon_format::{DecodeOptions, Delimiter, EncodeOptions};
 use toon_mcp_core::parser::{Parser, csv::CsvParser, json::JsonParser, jsonl::JsonlParser};
 
@@ -24,21 +23,16 @@ pub fn parse_to_value(format: &str, payload: &str, numeric_coercion: bool) -> Re
     v.map_err(|e| anyhow!("parse failed: {e}"))
 }
 
-/// Encode with the default pipeline options (comma delimiter, safe key folding).
+/// Encode with the default pipeline options (comma delimiter).
 pub fn encode_pipeline(value: &Value) -> Result<String> {
     let opts = EncodeOptions::new()
-        .with_delimiter(Delimiter::Comma)
-        .with_key_folding(KeyFoldingMode::Safe);
+        .with_delimiter(Delimiter::Comma);
     toon_format::encode(value, &opts).map_err(|e| anyhow!("encode failed: {e}"))
 }
 
-/// Decode pipeline-encoded TOON back to a `Value`. Path expansion is enabled so
-/// keys folded by `KeyFoldingMode::Safe` are reconstructed into nested objects.
+/// Decode pipeline-encoded TOON back to a `Value`.
 pub fn decode_pipeline(toon: &str) -> Result<Value> {
-    let opts = DecodeOptions {
-        expand_paths: PathExpansionMode::Safe,
-        ..DecodeOptions::default()
-    };
+    let opts = DecodeOptions::default();
     toon_format::decode(toon, &opts).map_err(|e| anyhow!("decode failed: {e}"))
 }
 

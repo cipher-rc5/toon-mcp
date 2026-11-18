@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, ClientInfo},
+    model::{CallToolRequestParams, ClientConfig},
 };
 use toon_mcp_logging::NoopSink;
 use toon_mcp_server::config::Config;
@@ -29,8 +29,8 @@ use toon_mcp_server::server::ToonMcpServer;
 struct TestClient;
 
 impl ClientHandler for TestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
@@ -65,7 +65,7 @@ fn first_text(result: &rmcp::model::CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|c| c.raw.as_text())
+        .and_then(|c| c.as_text())
         .map(|t| t.text.as_str())
         .expect("expected text content in tool result")
 }
@@ -395,8 +395,9 @@ async fn compress_content_rejects_oversized_input() -> anyhow::Result<()> {
         )
         .await;
 
-    let err = result.expect_err("expected error for oversized input");
-    let msg = err.to_string();
+    let result = result?;
+    assert_eq!(result.is_error, Some(true));
+    let msg = first_text(&result);
     assert!(
         msg.contains("input_exceeds_limit"),
         "expected error to contain 'input_exceeds_limit', got: {msg}"
@@ -429,10 +430,9 @@ async fn compress_content_malformed_params_returns_error() -> anyhow::Result<()>
         )
         .await;
 
-    assert!(
-        result.is_err(),
-        "expected error for malformed params (missing input field), got: {result:?}"
-    );
+    let result = result?;
+    assert_eq!(result.is_error, Some(true));
+    assert!(first_text(&result).contains("missing field `input`"));
 
     client.cancel().await?;
     join_server(server_handle).await;
@@ -564,5 +564,61 @@ async fn pipeline_timeout_returns_internal_error() -> anyhow::Result<()> {
 
     client.cancel().await?;
     join_server(server_handle).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn discover_and_use_bundled_skill() -> anyhow::Result<()> {
+    use rmcp::model::{
+        GetSkillRequestParams, ProtocolVersion, ReadResourceRequestParams, ResourceContents,
+        SkillResources,
+    };
+    use rmcp::{ClientLifecycleMode, ClientServiceExt};
+
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+    let server = ToonMcpServer::new(test_config(), Arc::new(NoopSink));
+    let handle = tokio::spawn(async move {
+        server.serve(server_transport).await?.waiting().await?;
+        anyhow::Ok(())
+    });
+    let version = ProtocolVersion::V_2026_07_28;
+    let client = TestClient
+        .serve_with_lifecycle(
+            client_transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![version.clone()],
+            },
+        )
+        .await?;
+    let peer = client.peer_info().expect("discovery metadata");
+    assert_eq!(peer.protocol_version, version);
+    assert!(peer.capabilities.supports_skills());
+    let skills = client.list_all_skills().await?;
+    assert_eq!(skills.len(), 1);
+    let uri = &skills[0].uri;
+    assert_eq!(uri, "skill://toon-mcp/SKILL.md");
+    let manifest = client.get_skill(GetSkillRequestParams::new(uri)).await?;
+    assert_eq!(manifest.skill, skills[0]);
+    let SkillResources::Files(files) = manifest.skill.resources else {
+        panic!("expected skill files")
+    };
+    let resource = client
+        .read_resource(ReadResourceRequestParams::new(uri))
+        .await?;
+    let ResourceContents::TextResourceContents { text, .. } = &resource.contents[0] else {
+        panic!("expected markdown")
+    };
+    assert_eq!(files[0].verify(text.as_bytes()), Ok(()));
+    assert_eq!(text, include_str!("../skills/toon-mcp/SKILL.md"));
+    let args = serde_json::json!({"input": "{\"id\":1}"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("compress_content").with_arguments(args))
+        .await?;
+    assert_eq!(result.structured_content.unwrap()["output"], "{\"id\":1}");
+    client.cancel().await?;
+    join_server(handle).await;
     Ok(())
 }

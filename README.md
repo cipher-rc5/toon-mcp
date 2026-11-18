@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/cipher-rc5/toon-mcp/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/cipher-rc5/toon-mcp/actions/workflows/ci.yml)
 [![Release](https://github.com/cipher-rc5/toon-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/cipher-rc5/toon-mcp/actions/workflows/release.yml)
-[![Rust](https://img.shields.io/badge/rust-1.95.0-orange?logo=rust)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.100.0-orange?logo=rust)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](LICENSE)
 
-> A [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/) server that detects, classifies, and compresses structured payloads (JSON, JSONL, CSV, TSV) into the [TOON](https://github.com/toon-format/toon) format to reduce LLM context-window token consumption.
+> A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2026-07-28.md) server that detects, classifies, and compresses structured payloads (JSON, JSONL, CSV, TSV) into the [TOON](https://github.com/toon-format/toon) format to reduce LLM context-window token consumption.
 
 LLM tool calls often return large structured payloads — JSON API responses, CSV exports, JSONL logs — that consume context tokens without proportional informational value. `toon-mcp` sits between an MCP client and those data sources, transparently re-encoding eligible payloads before they reach the model.
 
@@ -65,7 +65,7 @@ After registering, the four tools (`compress_content`, `compression_stats`, `det
 
 ### Prerequisites
 
-- Rust toolchain `1.95.0` (managed by [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically).
+- Rust toolchain `1.100.0` (managed by [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically).
 - No Docker, no external services.
 
 ### Build from source
@@ -183,7 +183,6 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "env": {
         "TOON_COMPRESSION_THRESHOLD": "0.85",
         "TOON_MIN_BYTES": "256",
-        "TOON_KEY_FOLDING": "true",
         "TOON_DELIMITER": "comma",
         "TOON_LOG_ENABLED": "true",
         "TOON_LOG_DIR": "/absolute/path/to/toon-mcp/data/logs",
@@ -208,6 +207,10 @@ The web client at <https://claude.ai> connects to MCP servers via **Custom Conne
 A first-party HTTP transport is not currently on the roadmap. Open an issue if you need one.
 
 ---
+
+### Agent skill
+
+Connect the stdio server as described above. Clients using the MCP 2026-07-28 skills extension can discover `toon-mcp` through `skills/list` and load its instructions from `skill://toon-mcp/SKILL.md`. The binary embeds the skill. For filesystem-based agents, copy the [toon-mcp skill directory](crates/toon-mcp-server/skills/toon-mcp) into the host’s skills directory. Repository-local discovery is available under `.agents/skills/`.
 
 ## MCP tools
 
@@ -254,7 +257,7 @@ Compress a structured payload into TOON format. If the input does not meet the c
 | `shape_not_beneficial` | Classifier judged the shape unlikely to compress well.                                                                                                 |
 | `parse_failed`         | The format was detected but parsing failed (truncation, invalid escape, etc.).                                                                         |
 | `encode_failed`        | The input parsed successfully but TOON encoding failed; the original input is returned unchanged.                                                      |
-| `input_exceeds_limit`  | Library-only outcome reachable through `Compressor::decide`. The MCP server intercepts oversized inputs earlier and returns an `invalid_params` error. |
+| `input_exceeds_limit`  | Library-only outcome reachable through `Compressor::decide`. The MCP server intercepts oversized inputs earlier and returns a tool error with `isError: true`. |
 
 `detection_confidence` is `"certain"` for inputs validated by a full `serde_json` parse or for `unknown`, and `"heuristic"` for JSONL / CSV / TSV (which are probed without parsing the entire document). `detection_candidates` lists every format that matched, in detection-precedence order. `numeric_coercion_used` and `lossy_coercion_possible` are populated only for CSV / TSV inputs; see [Numeric coercion](#numeric-coercion-csv--tsv).
 
@@ -383,7 +386,7 @@ All configuration is via `TOON_*` environment variables, read once at startup. F
 | `TOON_COMPRESSION_THRESHOLD` | `0.85`     | Maximum output-to-input byte ratio accepted as compressed. `0.85` means output must be ≤ 85 % of input (≥ 15 % savings). |
 | `TOON_MIN_BYTES`             | `256`      | Inputs below this byte count are passed through immediately.                                                             |
 | `TOON_MAX_INPUT_BYTES`       | `10485760` | Hard upper bound (10 MiB by default). Larger inputs are rejected before parsing.                                         |
-| `TOON_KEY_FOLDING`           | `true`     | Enable TOON key folding for deeply nested objects.                                                                       |
+| `TOON_KEY_FOLDING`           | `true`     | Legacy setting accepted for compatibility. TOON 4.4 preserves nested keys. |
 | `TOON_DELIMITER`             | `comma`    | TOON array delimiter: `comma`, `tab`, or `pipe`.                                                                         |
 | `TOON_CSV_NUMERIC_COERCION`  | `true`     | Coerce numeric-looking CSV/TSV cells into JSON numbers. Set `false` for identifiers / leading-zero values.               |
 
@@ -489,7 +492,7 @@ INFO toon_mcp_server: toon-mcp-server ready status="ready" component="toon-mcp-s
 
 ## Compatibility & support
 
-- **Rust toolchain**: exactly the version pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (`1.95.0`).
+- **Rust toolchain**: exactly the version pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (`1.100.0`).
 - **Release binaries**: Linux (glibc 2.17 baseline) and macOS on `x86_64` and `aarch64`.
 - **MCP transport**: local stdio clients that can launch a binary and pass environment variables.
 - **Active branch**: `master`. CI also runs on `main` while both branch names exist.

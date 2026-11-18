@@ -27,7 +27,7 @@ Shell environment variables take precedence over `.env` values — `dotenvy` onl
 | `TOON_COMPRESSION_THRESHOLD` | `f64` (0.0–1.0) | `0.85`     | Maximum fraction of the original byte count that the TOON output may occupy. An input of 10,000 bytes with `threshold=0.85` must produce output ≤ 8,500 bytes to be considered compressed.                                    |
 | `TOON_MIN_BYTES`             | `usize`         | `256`      | Inputs shorter than this byte count are passed through without any processing. Avoids overhead on small strings that will never compress meaningfully.                                                                        |
 | `TOON_MAX_INPUT_BYTES`       | `usize`         | `10485760` | Hard upper bound on input size in bytes (default 10 MiB). Inputs larger than this are rejected immediately without parsing, preventing unbounded memory use.                                                                  |
-| `TOON_KEY_FOLDING`           | `bool`          | `true`     | Enable TOON key-folding mode. When enabled, deeply nested single-key objects are collapsed to dot-notation paths. Disable if your consumer of TOON output does not support key folding.                                       |
+| `TOON_KEY_FOLDING`           | `bool`          | `true`     | Legacy setting accepted for compatibility. TOON 4.4 preserves nested keys. |
 | `TOON_DELIMITER`             | `string`        | `comma`    | The delimiter character used between values in TOON tabular output. Accepted values: `comma`, `tab`, `pipe`.                                                                                                                  |
 | `TOON_CSV_NUMERIC_COERCION`  | `bool`          | `true`     | When enabled, CSV/TSV cells that parse as numbers become JSON numbers in the normalised intermediate. Set to `false` for inputs containing identifiers, postal codes, or leading-zero values that must round-trip as strings. |
 
@@ -228,7 +228,7 @@ pub struct Config {
     pub min_bytes: usize,
     /// Maximum input byte count. Larger inputs are rejected without parsing.
     pub max_input_bytes: usize,
-    /// Whether TOON key folding is enabled for FoldChain shapes.
+    /// Legacy configuration field. TOON 4.4 preserves nested keys.
     pub key_folding: bool,
     /// Array delimiter used in TOON output.
     pub delimiter: Delimiter,

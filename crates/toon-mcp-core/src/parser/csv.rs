@@ -6,13 +6,24 @@ use crate::{error::CoreError, parser::Parser};
 use serde_json::{Map, Number, Value};
 
 /// Metadata describing CSV/TSV numeric coercion for a specific parse request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CsvCoercionMetadata {
     /// Whether numeric-looking fields were eligible for coercion.
     pub numeric_coercion_used: bool,
     /// Whether at least one coerced field has syntax that may lose caller
     /// intent when represented as a JSON number, such as leading zeroes.
     pub lossy_coercion_possible: bool,
+}
+
+impl CsvCoercionMetadata {
+    fn parse_number(&mut self, field: &str) -> Option<Number> {
+        let value = field.parse::<f64>().ok()?;
+        let number = Number::from_f64(value)?;
+        self.numeric_coercion_used = true;
+        self.lossy_coercion_possible =
+            self.lossy_coercion_possible || numeric_text_may_be_lossy(field, value);
+        Some(number)
+    }
 }
 
 /// Parses CSV or TSV input into a `Value::Array` of uniform `Value::Object` rows.
@@ -97,33 +108,21 @@ impl CsvParser {
             .delimiter(self.delimiter)
             .from_reader(input.as_bytes());
 
-        let _headers = rdr.headers()?;
-        let mut numeric_coercion_used = false;
-        let mut lossy_coercion_possible = false;
-
-        if !self.numeric_coercion {
-            return Ok(CsvCoercionMetadata {
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            });
-        }
-
-        for result in rdr.records() {
-            let record = result?;
-            for field in &record {
-                if let Ok(n) = field.parse::<f64>()
-                    && Number::from_f64(n).is_some()
-                {
-                    numeric_coercion_used = true;
-                    lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
+        rdr.headers()?;
+        let mut metadata = CsvCoercionMetadata::default();
+        if self.numeric_coercion {
+            let mut record = csv::StringRecord::new();
+            while rdr.read_record(&mut record)? {
+                // Keep validating record widths after both flags are known.
+                for field in &record {
+                    if metadata.lossy_coercion_possible {
+                        break;
+                    }
+                    metadata.parse_number(field);
                 }
             }
         }
-
-        Ok(CsvCoercionMetadata {
-            numeric_coercion_used,
-            lossy_coercion_possible,
-        })
+        Ok(metadata)
     }
 }
 
@@ -157,62 +156,42 @@ impl CsvParser {
             .delimiter(self.delimiter)
             .from_reader(input.as_bytes());
 
-        // Headers must be owned `String`s: the `StringRecord` returned by
-        // `rdr.headers()` borrows `rdr`, but the row loop below needs its own
-        // mutable borrow of `rdr` via `records()`. Owning the header names
-        // decouples them from the reader. The per-row loop then zips
-        // `&str` slices, avoiding a second `Vec<&str>` collection.
-        let headers: Vec<String> = rdr.headers()?.iter().map(str::to_owned).collect();
+        let headers = rdr.headers()?.clone();
 
         // Reject duplicate headers up-front: `serde_json::Map` would otherwise
         // collapse duplicate columns into a single key, silently dropping data.
         // O(headers) — runs once before the row loop, not per-row.
         let mut seen = std::collections::HashSet::with_capacity(headers.len());
         for h in &headers {
-            if !seen.insert(h.as_str()) {
-                return Err(CoreError::DuplicateHeader { header: h.clone() });
+            if !seen.insert(h) {
+                return Err(CoreError::DuplicateHeader {
+                    header: h.to_owned(),
+                });
             }
         }
 
         let mut rows: Vec<Value> = Vec::new();
-        let mut numeric_coercion_used = false;
-        let mut lossy_coercion_possible = false;
+        let mut metadata = CsvCoercionMetadata::default();
 
-        for result in rdr.records() {
-            let record = result?;
+        let mut record = csv::StringRecord::new();
+        while rdr.read_record(&mut record)? {
             let mut map = Map::with_capacity(headers.len());
 
             for (key, field) in headers.iter().zip(record.iter()) {
-                let val = if self.numeric_coercion {
-                    if let Ok(n) = field.parse::<f64>()
-                        && let Some(num) = Number::from_f64(n)
-                    {
-                        // Finite f64: coerce to a JSON number. Infinite/NaN
-                        // fields fail `from_f64` and fall through to string.
-                        numeric_coercion_used = true;
-                        lossy_coercion_possible |= numeric_text_may_be_lossy(field, n);
-                        Value::Number(num)
-                    } else {
-                        Value::String(field.to_owned())
-                    }
+                let val = if self.numeric_coercion
+                    && let Some(number) = metadata.parse_number(field)
+                {
+                    Value::Number(number)
                 } else {
                     Value::String(field.to_owned())
                 };
-                // `to_owned()` allocates the single owned key that
-                // `serde_json::Map<String, Value>` requires.
                 map.insert(key.to_owned(), val);
             }
 
             rows.push(Value::Object(map));
         }
 
-        Ok((
-            Value::Array(rows),
-            CsvCoercionMetadata {
-                numeric_coercion_used,
-                lossy_coercion_possible,
-            },
-        ))
+        Ok((Value::Array(rows), metadata))
     }
 }
 

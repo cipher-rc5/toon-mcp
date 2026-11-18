@@ -15,7 +15,7 @@ toon-mcp is production-usable as a local stdio MCP server when operators treat i
 
 ## Compatibility
 
-- Rust: exactly the toolchain pinned in `rust-toolchain.toml` (`1.95.0`).
+- Rust: exactly the toolchain pinned in `rust-toolchain.toml` (`1.100.0`).
 - Release artifacts: Linux GNU and macOS for `x86_64` and `aarch64`.
 - MCP: local stdio clients that can launch a subprocess and pass environment variables.
 - Data formats: JSON, JSONL, CSV, TSV. XML, YAML, and TOML are out of scope for v1.

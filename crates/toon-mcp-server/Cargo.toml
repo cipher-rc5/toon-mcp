@@ -4,9 +4,12 @@ version.workspace = true
 authors.workspace = true
 categories = ["command-line-utilities"]
 edition.workspace = true
+rust-version.workspace = true
 keywords = ["toon", "mcp", "compression", "llm", "server"]
 license.workspace = true
 repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "MCP server binary for TOON-format compression of structured data"
 
 [[bin]]

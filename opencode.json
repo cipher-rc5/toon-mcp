@@ -37,7 +37,6 @@
         "TOON_COMPRESSION_THRESHOLD": "0.85",
         "TOON_MIN_BYTES": "256",
         "TOON_MAX_INPUT_BYTES": "10485760",
-        "TOON_KEY_FOLDING": "true",
         "TOON_DELIMITER": "comma",
         "TOON_LOG_ENABLED": "true",
         "TOON_LOG_DIR": "data/logs",

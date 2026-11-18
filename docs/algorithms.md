@@ -59,30 +59,15 @@ flowchart TD
 
 ### JSON Probe
 
-Attempts `serde_json::from_str::<Value>`. Succeeds only if the input is valid JSON — any leading/trailing whitespace is tolerated by `serde_json`.
+Inputs starting with `{` or `[` after whitespace are checked with `serde_json::from_str::<IgnoredAny>`. This probe skips construction of a JSON value tree.
 
 ### JSONL Probe
 
-Collects the first two non-empty lines (after trimming whitespace) and attempts to parse each as JSON. Both must succeed. A single-line input with valid JSON would have passed the JSON probe first, so JSONL only fires if the JSON probe failed — which in practice means the input has multiple lines where the first line is valid JSON but the full content is not.
-
-```rust
-fn probe_jsonl(input: &str) -> bool {
-    let lines: Vec<&str> = input
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .take(2)
-        .collect();
-    lines.len() >= 2
-        && lines
-            .iter()
-            .all(|l| serde_json::from_str::<Value>(l).is_ok())
-}
-```
+For multiline inputs that failed the JSON probe, the detector parses the first two non-empty lines individually. Both must parse for JSONL to be a candidate.
 
 ### CSV / TSV Probe
 
-The delimited probe reads the header row and checks two conditions:
+The detector skips single-record inputs. A delimiter can first appear on a later line when the first header field is quoted. Otherwise, the first header line must contain the candidate delimiter. For plausible candidates the CSV reader checks two conditions:
 
 1. The header row has at least two columns
 2. The first data record has the same column count as the header
@@ -117,7 +102,7 @@ fn probe_delimited(input: &str, delimiter: u8) -> bool {
 
 ### Probe Ordering Rationale
 
-CSV is probed before TSV because comma-delimited data is more common. JSON is probed before JSONL because a valid JSON array would also satisfy the JSONL probe (every line of a pretty-printed JSON array could be valid JSON fragments on its own — actually not true for most, but the strict probe ordering prevents ambiguity).
+Candidate order is JSON, JSONL, CSV, then TSV. The first match is the reported format. The detector includes other matching candidates in the metadata, so callers can inspect ambiguous input.
 
 ---
 
@@ -198,7 +183,7 @@ flowchart TD
 | Class            | TOON benefit                                            | Example                                           |
 | ---------------- | ------------------------------------------------------- | ------------------------------------------------- |
 | `Tabular`        | High — repeated keys eliminated, rows encoded compactly | JSON array of uniform objects, CSV, uniform JSONL |
-| `FoldChain`      | High — deeply nested single-key objects flattened       | `{ "a": { "b": { "c": { "d": "val" } } } }`       |
+| `FoldChain`      | Variable — savings depend on nesting and whitespace       | `{ "a": { "b": { "c": { "d": "val" } } } }`       |
 | `PrimitiveArray` | Moderate — dense numeric/string encoding                | `[1, 2, 3, 4, 5, 6, 7]`                           |
 | `Mixed`          | Low-moderate — partial structural benefit               | Heterogeneous arrays with some objects            |
 | `PassThrough`    | None — TOON would not reduce size                       | Single string, single number, scalar object       |
@@ -242,7 +227,7 @@ fn is_fold_chain(value: &Value, depth: usize, min_depth: usize) -> bool {
 }
 ```
 
-A chain of depth 6 (like `fixtures/deep_fold.json`) produces a path like `level_a.level_b.level_c.level_d.level_e.level_f` in TOON key-folding mode, which is far shorter than the nested JSON representation.
+Nested chains retain their hierarchy in TOON 4.4.
 
 ### Configuration Thresholds
 
@@ -260,12 +245,7 @@ All three numeric thresholds are configurable via environment variables and pass
 
 **Source:** `crates/toon-mcp-core/src/compressor.rs`, external `toon-format` crate
 
-TOON encoding is delegated to the `toon-format` crate via `toon_format::encode`. The server configures two parameters:
-
-**`KeyFoldingMode`** — controlled by `TOON_KEY_FOLDING`:
-
-- When enabled, nested single-key objects are collapsed into dot-notation paths: `{ "a": { "b": "val" } }` → `a.b: val`
-- Applied most aggressively to `FoldChain` shaped inputs
+The compressor moves the parsed JSON tree into the `toon-format` array or object encoder. TOON 4.4 preserves nested keys.
 
 **`Delimiter`** — controlled by `TOON_DELIMITER` (`comma`, `tab`, `pipe`):
 
